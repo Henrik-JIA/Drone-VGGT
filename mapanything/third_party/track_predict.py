@@ -30,6 +30,7 @@ def predict_tracks(
     max_points_num=163840,
     fine_tracking=True,
     complete_non_vis=True,
+    original_images=None,
 ):
     """
     Predict tracks for the given images and masks.
@@ -51,7 +52,9 @@ def predict_tracks(
         max_points_num: Maximum number of points to process at once. Default is 163840.
         fine_tracking: Whether to use fine tracking. Default is True.
         complete_non_vis: Whether to augment non-visible frames. Default is True.
-
+        original_images: Optional list of original images (numpy arrays [H_orig, W_orig, 3], uint8)
+                                for accurate color sampling. If None, colors will be sampled from 
+                                preprocessed images. Default is None.
     Returns:
         pred_tracks: Numpy array containing the predicted tracks.
         pred_vis_scores: Numpy array containing the visibility scores for the tracks.
@@ -105,6 +108,7 @@ def predict_tracks(
             max_points_num,
             fine_tracking,
             device,
+            original_images,
         )
 
         pred_tracks.append(pred_track)
@@ -147,6 +151,115 @@ def predict_tracks(
     return pred_tracks, pred_vis_scores, pred_confs, pred_points_3d, pred_colors
 
 
+# def _forward_on_query(
+#     query_index,
+#     images,
+#     conf,
+#     points_3d,
+#     fmaps_for_tracker,
+#     keypoint_extractors,
+#     tracker,
+#     max_points_num,
+#     fine_tracking,
+#     device,
+# ):
+#     """
+#     Process a single query frame for track prediction.
+
+#     Args:
+#         query_index: Index of the query frame
+#         images: Tensor of shape [S, 3, H, W] containing the input images
+#         conf: Confidence tensor
+#         points_3d: 3D points tensor
+#         fmaps_for_tracker: Feature maps for the tracker
+#         keypoint_extractors: Initialized feature extractors
+#         tracker: VGG-SFM tracker
+#         max_points_num: Maximum number of points to process at once
+#         fine_tracking: Whether to use fine tracking
+#         device: Device to use for computation
+
+#     Returns:
+#         pred_track: Predicted tracks
+#         pred_vis: Visibility scores for the tracks
+#         pred_conf: Confidence scores for the tracks
+#         pred_point_3d: 3D points for the tracks
+#         pred_color: Point colors for the tracks (0, 255)
+#     """
+#     frame_num, _, height, width = images.shape
+
+#     query_image = images[query_index]
+#     query_points = extract_keypoints(
+#         query_image, keypoint_extractors, round_keypoints=False
+#     )
+#     query_points = query_points[:, torch.randperm(query_points.shape[1], device=device)]
+
+#     # Extract the color at the keypoint locations
+#     query_points_long = query_points.squeeze(0).round().long()
+#     pred_color = images[query_index][
+#         :, query_points_long[:, 1], query_points_long[:, 0]
+#     ]
+#     pred_color = (pred_color.permute(1, 0).cpu().numpy() * 255).astype(np.uint8)
+
+#     # Query the confidence and points_3d at the keypoint locations
+#     if (conf is not None) and (points_3d is not None):
+#         assert height == width
+#         assert conf.shape[-2] == conf.shape[-1]
+#         assert conf.shape[:3] == points_3d.shape[:3]
+#         scale = conf.shape[-1] / width
+
+#         query_points_scaled = (query_points.squeeze(0) * scale).round().long()
+#         query_points_scaled = query_points_scaled.cpu().numpy()
+
+#         pred_conf = conf[query_index][
+#             query_points_scaled[:, 1], query_points_scaled[:, 0]
+#         ]
+#         pred_point_3d = points_3d[query_index][
+#             query_points_scaled[:, 1], query_points_scaled[:, 0]
+#         ]
+
+#         # heuristic to remove low confidence points
+#         # should I export this as an input parameter?
+#         valid_mask = pred_conf > 1.2
+#         if valid_mask.sum() > 512:
+#             query_points = query_points[:, valid_mask]  # Make sure shape is compatible
+#             pred_conf = pred_conf[valid_mask]
+#             pred_point_3d = pred_point_3d[valid_mask]
+#             pred_color = pred_color[valid_mask]
+#     else:
+#         pred_conf = None
+#         pred_point_3d = None
+
+#     reorder_index = calculate_index_mappings(query_index, frame_num, device=device)
+
+#     images_feed, fmaps_feed = switch_tensor_order(
+#         [images, fmaps_for_tracker], reorder_index, dim=0
+#     )
+#     images_feed = images_feed[None]  # add batch dimension
+#     fmaps_feed = fmaps_feed[None]  # add batch dimension
+
+#     all_points_num = images_feed.shape[1] * query_points.shape[1]
+
+#     # Don't need to be scared, this is just chunking to make GPU happy
+#     if all_points_num > max_points_num:
+#         num_splits = (all_points_num + max_points_num - 1) // max_points_num
+#         query_points = torch.chunk(query_points, num_splits, dim=1)
+#     else:
+#         query_points = [query_points]
+
+#     pred_track, pred_vis, _ = predict_tracks_in_chunks(
+#         tracker, images_feed, query_points, fmaps_feed, fine_tracking=fine_tracking
+#     )
+
+#     pred_track, pred_vis = switch_tensor_order(
+#         [pred_track, pred_vis], reorder_index, dim=1
+#     )
+
+#     pred_track = pred_track.squeeze(0).float().cpu().numpy()
+#     pred_vis = pred_vis.squeeze(0).float().cpu().numpy()
+
+#     return pred_track, pred_vis, pred_conf, pred_point_3d, pred_color
+
+
 def _forward_on_query(
     query_index,
     images,
@@ -158,6 +271,7 @@ def _forward_on_query(
     max_points_num,
     fine_tracking,
     device,
+    original_images=None,
 ):
     """
     Process a single query frame for track prediction.
@@ -173,6 +287,7 @@ def _forward_on_query(
         max_points_num: Maximum number of points to process at once
         fine_tracking: Whether to use fine tracking
         device: Device to use for computation
+        original_images: Optional list of original images for color sampling
 
     Returns:
         pred_track: Predicted tracks
@@ -191,20 +306,62 @@ def _forward_on_query(
 
     # Extract the color at the keypoint locations
     query_points_long = query_points.squeeze(0).round().long()
-    pred_color = images[query_index][
-        :, query_points_long[:, 1], query_points_long[:, 0]
-    ]
-    pred_color = (pred_color.permute(1, 0).cpu().numpy() * 255).astype(np.uint8)
 
+    if original_images is not None and query_index < len(original_images):
+        # 从原始图像采样颜色
+        original_img = original_images[query_index]  # numpy array [H_orig, W_orig, 3], uint8
+        
+        # 获取原始图像和预处理图像的尺寸
+        H_orig, W_orig = original_img.shape[:2]
+        H_proc, W_proc = height, width
+        
+        # 计算缩放比例
+        scale_x = W_orig / W_proc
+        scale_y = H_orig / H_proc
+        
+        # 将关键点坐标从预处理图像空间映射到原始图像空间
+        query_points_orig = query_points_long.cpu().numpy().astype(np.float32)
+        query_points_orig[:, 0] = query_points_orig[:, 0] * scale_x  # x坐标
+        query_points_orig[:, 1] = query_points_orig[:, 1] * scale_y  # y坐标
+        query_points_orig = np.round(query_points_orig).astype(np.int32)
+        
+        # 裁剪坐标到有效范围
+        query_points_orig[:, 0] = np.clip(query_points_orig[:, 0], 0, W_orig - 1)
+        query_points_orig[:, 1] = np.clip(query_points_orig[:, 1], 0, H_orig - 1)
+        
+        # 从原始图像采样颜色
+        pred_color = original_img[query_points_orig[:, 1], query_points_orig[:, 0]]  # [N, 3]
+        
+        if pred_color.dtype != np.uint8:
+            pred_color = pred_color.astype(np.uint8)
+    else:
+        # 回退到从预处理图像采样颜色（原有逻辑）
+        pred_color = images[query_index][
+            :, query_points_long[:, 1], query_points_long[:, 0]
+        ]
+        pred_color = (pred_color.permute(1, 0).cpu().numpy() * 255).astype(np.uint8)
+    
     # Query the confidence and points_3d at the keypoint locations
     if (conf is not None) and (points_3d is not None):
-        assert height == width
-        assert conf.shape[-2] == conf.shape[-1]
-        assert conf.shape[:3] == points_3d.shape[:3]
-        scale = conf.shape[-1] / width
+        # assert height == width
+        # assert conf.shape[-2] == conf.shape[-1]
+        # assert conf.shape[:3] == points_3d.shape[:3]
+        # scale = conf.shape[-1] / width
 
-        query_points_scaled = (query_points.squeeze(0) * scale).round().long()
-        query_points_scaled = query_points_scaled.cpu().numpy()
+        # query_points_scaled = (query_points.squeeze(0) * scale).round().long()
+        # query_points_scaled = query_points_scaled.cpu().numpy()
+
+        assert conf.shape[:3] == points_3d.shape[:3]
+        
+        # 分别计算 x 和 y 方向的缩放比例，支持非正方形
+        scale_x = conf.shape[-1] / width   # x 方向（宽度）缩放
+        scale_y = conf.shape[-2] / height  # y 方向（高度）缩放
+
+        # 应用不同的缩放比例
+        query_points_scaled = query_points.squeeze(0).clone()
+        query_points_scaled[:, 0] = query_points_scaled[:, 0] * scale_x  # x 坐标缩放
+        query_points_scaled[:, 1] = query_points_scaled[:, 1] * scale_y  # y 坐标缩放
+        query_points_scaled = query_points_scaled.round().long().cpu().numpy()  # 和原来一样转为 numpy
 
         pred_conf = conf[query_index][
             query_points_scaled[:, 1], query_points_scaled[:, 0]
@@ -215,12 +372,24 @@ def _forward_on_query(
 
         # heuristic to remove low confidence points
         # should I export this as an input parameter?
-        valid_mask = pred_conf > 1.2
-        if valid_mask.sum() > 512:
-            query_points = query_points[:, valid_mask]  # Make sure shape is compatible
-            pred_conf = pred_conf[valid_mask]
-            pred_point_3d = pred_point_3d[valid_mask]
-            pred_color = pred_color[valid_mask]
+        
+        if isinstance(pred_conf, np.ndarray):
+            pred_conf = torch.from_numpy(pred_conf)
+            valid_mask = pred_conf > 1.2
+            if valid_mask.sum() > 512:
+                valid_mask = valid_mask.cpu().numpy()
+                query_points = query_points[:, valid_mask]  # Make sure shape is compatible
+                pred_conf = pred_conf[valid_mask].cpu()
+                pred_point_3d = pred_point_3d[valid_mask]
+                pred_color = pred_color[valid_mask]
+        else:
+            valid_mask = pred_conf > 1.2
+            if valid_mask.sum() > 512:
+                valid_mask = valid_mask.cpu().numpy()
+                query_points = query_points[:, valid_mask]  # Make sure shape is compatible
+                pred_conf = pred_conf[valid_mask].cpu()
+                pred_point_3d = pred_point_3d[valid_mask].cpu()
+                pred_color = pred_color[valid_mask]
     else:
         pred_conf = None
         pred_point_3d = None
@@ -254,7 +423,6 @@ def _forward_on_query(
     pred_vis = pred_vis.squeeze(0).float().cpu().numpy()
 
     return pred_track, pred_vis, pred_conf, pred_point_3d, pred_color
-
 
 def _augment_non_visible_frames(
     pred_tracks: list,  # ← running list of np.ndarrays

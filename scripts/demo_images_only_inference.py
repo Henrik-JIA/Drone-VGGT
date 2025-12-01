@@ -258,7 +258,7 @@ def main():
         output_dir = os.path.dirname(args.ply_output_path)
         if output_dir and not os.path.exists(output_dir):
             os.makedirs(output_dir, exist_ok=True)
-            scene_3d_ply.export(args.ply_output_path, encoding='ascii')
+        scene_3d_ply.export(args.ply_output_path, encoding='ascii')
         print(f"Successfully saved PLY file: {args.ply_output_path}")
 
     if not args.save_glb and not args.save_ply:
