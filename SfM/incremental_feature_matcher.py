@@ -3385,39 +3385,96 @@ class IncrementalFeatureMatcherSfM:
             prev_image = prev_recon.images[prev_image_id]
             curr_image = curr_recon.images[curr_image_id]
             
-            # 为curr图像建立空间索引（使用取整后的坐标作为键）
-            curr_spatial_index = {}  # {(int_x, int_y): [(point3D_id, xy)]}
-            for point2D in curr_image.points2D:
-                if point2D.point3D_id != -1:
-                    grid_key = (int(round(point2D.xy[0])), int(round(point2D.xy[1])))
-                    if grid_key not in curr_spatial_index:
-                        curr_spatial_index[grid_key] = []
-                    curr_spatial_index[grid_key].append((point2D.point3D_id, point2D.xy))
+            # 获取影像大小（用于建立格网）
+            prev_camera = prev_recon.cameras[prev_image.camera_id]
+            curr_camera = curr_recon.cameras[curr_image.camera_id]
+            prev_width, prev_height = prev_camera.width, prev_camera.height
+            curr_width, curr_height = curr_camera.width, curr_camera.height
+            if prev_width != curr_width or prev_height != curr_height:
+                print(f"  Warning: Image size mismatch between prev and curr ({prev_width}x{prev_height} and {curr_width}x{curr_height})")
+                return False
+            # 使用较大的尺寸作为格网范围
+            max_width = max(prev_width, curr_width)
+            max_height = max(prev_height, curr_height)
+
+            # 定义格网大小（可以根据需要调整，比如10像素一个格网）
+            grid_size = 10.0  # 每个格网的像素大小
             
-            # 对prev图像的每个特征点，在curr的对应位置附近查找匹配
-            for point2D in prev_image.points2D:
+            # 将2D点映射到格网索引
+            def get_grid_index(x, y, grid_size):
+                """将2D坐标映射到格网索引"""
+                grid_x = int(x / grid_size)
+                grid_y = int(y / grid_size)
+                return (grid_x, grid_y)
+
+            # 为prev图像建立格网索引
+            prev_grid_index = {}  # {(grid_x, grid_y): [(point2D_id, xy, point3D_id, xyz), ...]}
+            for point2D_idx, point2D in enumerate(prev_image.points2D):
                 if point2D.point3D_id != -1:
-                    prev_xy = point2D.xy
-                    center_grid = (int(round(prev_xy[0])), int(round(prev_xy[1])))
-                    
-                    # 在3x3网格范围内搜索（覆盖1像素范围）
-                    found_match = False
-                    for dx in [-1, 0, 1]:
-                        if found_match:
-                            break
-                        for dy in [-1, 0, 1]:
-                            search_grid = (center_grid[0] + dx, center_grid[1] + dy)
-                            if search_grid in curr_spatial_index:
-                                for curr_pt3d_id, curr_xy in curr_spatial_index[search_grid]:
-                                    # 计算实际像素距离
-                                    dist = np.linalg.norm(prev_xy - curr_xy)
-                                    if dist < 1.0:  # 1像素阈值
-                                        prev_pt3d_id = point2D.point3D_id
-                                        if prev_pt3d_id not in point_correspondences:
-                                            point_correspondences[prev_pt3d_id] = []
-                                        point_correspondences[prev_pt3d_id].append(curr_pt3d_id)
-                                        found_match = True
-                                        break
+                    grid_key = get_grid_index(point2D.xy[0], point2D.xy[1], grid_size)
+                    if grid_key not in prev_grid_index:
+                        prev_grid_index[grid_key] = []
+                    xyz = prev_recon.points3D[point2D.point3D_id].xyz
+                    prev_grid_index[grid_key].append((point2D_idx, point2D.xy, point2D.point3D_id, xyz))
+            
+            # 为curr图像建立格网索引
+            curr_grid_index = {}  # {(grid_x, grid_y): [(point2D_id, xy, point3D_id, xyz), ...]}
+            for point2D_idx, point2D in enumerate(curr_image.points2D):
+                if point2D.point3D_id != -1:
+                    grid_key = get_grid_index(point2D.xy[0], point2D.xy[1], grid_size)
+                    if grid_key not in curr_grid_index:
+                        curr_grid_index[grid_key] = []
+                    xyz = curr_recon.points3D[point2D.point3D_id].xyz
+                    curr_grid_index[grid_key].append((point2D_idx, point2D.xy, point2D.point3D_id, xyz))
+
+            # 基于格网进行2D-2D匹配：落入相同格网的点可以配对（可搜索邻域格网）
+            matches_2d = []  # [(prev_point2D_id, curr_point2D_id, prev_point3D_id, curr_point3D_id, dist)]
+            used_curr_ids = set()  # 避免重复匹配
+            search_neighbors = True  # 是否搜索邻域格网
+            neighbor_radius = 1 if search_neighbors else 0  # 邻域搜索半径
+            
+            # 遍历所有有prev点的格网
+            for grid_key, prev_points in prev_grid_index.items():
+                grid_x, grid_y = grid_key
+                
+                # 搜索当前格网及邻域格网
+                for dx in range(-neighbor_radius, neighbor_radius + 1):
+                    for dy in range(-neighbor_radius, neighbor_radius + 1):
+                        search_grid_key = (grid_x + dx, grid_y + dy)
+                        if search_grid_key not in curr_grid_index:
+                            continue
+                        
+                        curr_points = curr_grid_index[search_grid_key]
+                        
+                        # 对同一格网内的点进行匹配
+                        for prev_point2D_id, prev_xy, prev_pt3d_id, prev_xyz in prev_points:
+                            best_curr_idx = None
+                            best_curr_pt3d_id = None
+                            best_dist = float('inf')
+                            
+                            # 在同一格网内找最近的curr点
+                            for curr_point2D_id, curr_xy, curr_pt3d_id, curr_xyz in curr_points:
+                                if curr_point2D_id in used_curr_ids:
+                                    continue
+                                
+                                dist = float(np.linalg.norm(np.asarray(prev_xy, dtype=np.float64) - 
+                                                            np.asarray(curr_xy, dtype=np.float64)))
+                                if dist < best_dist:
+                                    best_dist = dist
+                                    best_curr_idx = curr_point2D_id
+                                    best_curr_pt3d_id = curr_pt3d_id
+                            
+                            # 如果距离在阈值内，记录匹配
+                            if best_curr_idx is not None and best_dist < grid_size * 1.5:  # 允许跨格网匹配
+                                matches_2d.append((prev_point2D_id, best_curr_idx, prev_pt3d_id, best_curr_pt3d_id, best_dist))
+                                used_curr_ids.add(best_curr_idx)
+                                break  # 每个prev点只匹配一次
+            
+            # 将2D-2D匹配结果转换为3D点对应关系
+            for prev_point2D_id, curr_point2D_id, prev_pt3d_id, curr_pt3d_id, dist in matches_2d:
+                if prev_pt3d_id not in point_correspondences:
+                    point_correspondences[prev_pt3d_id] = []
+                point_correspondences[prev_pt3d_id].append(curr_pt3d_id)
 
         if len(point_correspondences) == 0:
             print("  Warning: No point correspondences found between overlapping regions")
@@ -3426,7 +3483,6 @@ class IncrementalFeatureMatcherSfM:
         if self.verbose:
             print(f"    Found {len(point_correspondences)} 3D point correspondences in overlap region")
 
-        # 3. 计算curr到prev的Sim3变换
         prev_pts3d = []
         curr_pts3d = []
         for prev_pt3d_id, curr_pt3d_ids in point_correspondences.items():
@@ -3764,7 +3820,7 @@ class IncrementalFeatureMatcherSfM:
 def run_incremental_feature_matching(
     image_paths: List[Path],
     output_dir: Path,
-    reconstruction_type: str = 'each_pixel_feature_points', # 'dense_feature_points' | 'each_pixel_feature_points'
+    reconstruction_type: str = 'dense_feature_points', # 'dense_feature_points' | 'each_pixel_feature_points'
     image_interval: int = 2,
     min_images_for_scale: int = 6,
     overlap: int = 2,
