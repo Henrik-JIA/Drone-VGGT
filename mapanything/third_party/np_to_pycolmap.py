@@ -371,7 +371,7 @@ def batch_np_matrix_to_pycolmap_wo_track(
     if points_to_remove:
         print(f"Removed {len(points_to_remove)} points without 2D associations")
 
-    return reconstruction
+    return reconstruction, valid_mask
 
 
 def _build_pycolmap_intri(fidx, intrinsics, camera_type, extra_params=None):
