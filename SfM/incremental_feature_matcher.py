@@ -16,6 +16,7 @@ import pycolmap
 import torch
 import torch.nn.functional as F
 from PIL import Image
+import laspy
 from scipy.spatial.transform import Rotation as R
 from collections import defaultdict
 import viser
@@ -85,6 +86,7 @@ class IncrementalFeatureMatcherSfM:
         max_points3D_val: int = 5000,
         min_inlier_per_frame: int = 32,
         pred_vis_scores_thres_value: float = 0.3, 
+        filter_edge_margin: float = 10.0,  # 边缘过滤范围（像素），默认10，设为0禁用
         enable_visualization: bool = True,
         verbose: bool = False,
     ):
@@ -103,6 +105,7 @@ class IncrementalFeatureMatcherSfM:
             max_points3D_val: Per-component absolute-value threshold for 3D points (a point is kept only if |x|, |y|, and |z| are all less than this value).
             min_inlier_per_frame: Minimum inlier count per frame for valid BA
             pred_vis_scores_thres_value: Visibility confidence threshold for tracks
+            filter_edge_margin: Edge margin for filtering points (in pixels), default 10, set to 0 to disable
             enable_visualization: Whether to start viser server for visualization
             verbose: Enable verbose logging
         """
@@ -127,6 +130,7 @@ class IncrementalFeatureMatcherSfM:
         self.max_reproj_error = max_reproj_error
         self.max_points3D_val = max_points3D_val
         self.min_inlier_per_frame = min_inlier_per_frame
+        self.filter_edge_margin = filter_edge_margin
 
         # Create output directory
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -3350,6 +3354,7 @@ class IncrementalFeatureMatcherSfM:
             temp_path.mkdir(parents=True, exist_ok=True)
             merged_recon.write_text(str(temp_path))
             merged_recon.export_PLY(str(temp_path / "points3D.ply"))
+            self.export_reconstruction_to_las(merged_recon, str(temp_path / "points3D.las"))
             return True
 
         # 获取前一个已合并的reconstruction和当前新的reconstruction
@@ -3397,8 +3402,8 @@ class IncrementalFeatureMatcherSfM:
             max_width = max(prev_width, curr_width)
             max_height = max(prev_height, curr_height)
 
-            # 定义格网大小（可以根据需要调整，比如10像素一个格网）
-            grid_size = 10.0  # 每个格网的像素大小
+            # 定义格网大小（可以根据需要调整，比如15像素一个格网）
+            grid_size = 15.0  # 每个格网的像素大小
             
             # 将2D点映射到格网索引
             def get_grid_index(x, y, grid_size):
@@ -3410,17 +3415,17 @@ class IncrementalFeatureMatcherSfM:
             # 为prev图像建立格网索引
             prev_grid_index = {}  # {(grid_x, grid_y): [(point2D_id, xy, point3D_id, xyz), ...]}
             for point2D_idx, point2D in enumerate(prev_image.points2D):
-                if point2D.point3D_id != -1:
+                if point2D.point3D_id != -1 and point2D.point3D_id in prev_recon.points3D:
                     grid_key = get_grid_index(point2D.xy[0], point2D.xy[1], grid_size)
                     if grid_key not in prev_grid_index:
                         prev_grid_index[grid_key] = []
                     xyz = prev_recon.points3D[point2D.point3D_id].xyz
                     prev_grid_index[grid_key].append((point2D_idx, point2D.xy, point2D.point3D_id, xyz))
-            
+
             # 为curr图像建立格网索引
             curr_grid_index = {}  # {(grid_x, grid_y): [(point2D_id, xy, point3D_id, xyz), ...]}
             for point2D_idx, point2D in enumerate(curr_image.points2D):
-                if point2D.point3D_id != -1:
+                if point2D.point3D_id != -1 and point2D.point3D_id in curr_recon.points3D:
                     grid_key = get_grid_index(point2D.xy[0], point2D.xy[1], grid_size)
                     if grid_key not in curr_grid_index:
                         curr_grid_index[grid_key] = []
@@ -3561,25 +3566,58 @@ class IncrementalFeatureMatcherSfM:
         
         # 3.4.1 添加prev_recon的所有影像
         merged_image_id = 1
+        edge_margin = self.filter_edge_margin  # 边缘过滤范围（像素），默认50
+        
         for image_id in sorted(prev_recon.images.keys()):
             prev_image = prev_recon.images[image_id]
+            camera = merged_recon.cameras[prev_image.camera_id]
+            img_width = camera.width
+            img_height = camera.height
             
-            # 重新创建points2D，更新point3D_id映射
+            # 计算有效区域边界
+            min_x = edge_margin
+            max_x = img_width - edge_margin
+            min_y = edge_margin
+            max_y = img_height - edge_margin
+            
+            # 重新创建points2D，更新point3D_id映射并过滤边缘点
             new_points2D = []
             point2D_idx = 0  # 记录2D点在列表中的索引
             
             for point2D in prev_image.points2D:
+                x, y = point2D.xy[0], point2D.xy[1]
+                
+                # 检查点是否在边缘范围内
+                is_edge_point = (x < min_x or x >= max_x or y < min_y or y >= max_y)
+                
                 if point2D.point3D_id != -1 and point2D.point3D_id in prev_to_merged_point3D_map:
-                    new_point3D_id = prev_to_merged_point3D_map[point2D.point3D_id]
-                    new_points2D.append(pycolmap.Point2D(point2D.xy, new_point3D_id))
-                    
-                    # 【关键】更新3D点的track信息
-                    track = merged_recon.points3D[new_point3D_id].track
-                    track.add_element(merged_image_id, point2D_idx)
-                    point2D_idx += 1
+                    if not is_edge_point:
+                        # 点在有效区域内，保留3D点关联
+                        new_point3D_id = prev_to_merged_point3D_map[point2D.point3D_id]
+                        # 确保xy格式正确：转换为numpy数组，形状为(2,1)或(2,)
+                        xy_array = np.asarray(point2D.xy, dtype=np.float64)
+                        if xy_array.ndim == 1:
+                            xy_array = xy_array.reshape(2, 1)
+                        new_points2D.append(pycolmap.Point2D(xy=xy_array, point3D_id=new_point3D_id))
+                        
+                        # 【关键】更新3D点的track信息
+                        track = merged_recon.points3D[new_point3D_id].track
+                        track.add_element(merged_image_id, point2D_idx)
+                        point2D_idx += 1
+                    else:
+                        # 点在边缘范围内，移除3D点关联
+                        xy_array = np.asarray(point2D.xy, dtype=np.float64)
+                        if xy_array.ndim == 1:
+                            xy_array = xy_array.reshape(2, 1)
+                        new_points2D.append(pycolmap.Point2D(xy=xy_array))
+                        point2D_idx += 1
                 else:
-                    # 没有对应的3D点
-                    new_points2D.append(pycolmap.Point2D(point2D.xy, -1))
+                    # 没有对应的3D点，无论是否在边缘都保留（但point3D_id为-1）
+                    xy_array = np.asarray(point2D.xy, dtype=np.float64)
+                    if xy_array.ndim == 1:
+                        xy_array = xy_array.reshape(2, 1)
+                    # 不传 point3D_id 参数，使用默认无效值
+                    new_points2D.append(pycolmap.Point2D(xy=xy_array))
                     point2D_idx += 1
             
             # 创建新Image对象
@@ -3599,22 +3637,56 @@ class IncrementalFeatureMatcherSfM:
         for image_id in curr_non_overlap_image_ids:
             if image_id in curr_recon.images:
                 curr_image = curr_recon.images[image_id]
+                camera = merged_recon.cameras[curr_image.camera_id]
+                img_width = camera.width
+                img_height = camera.height
                 
-                # 重新创建points2D，更新point3D_id映射
+                # 计算有效区域边界
+                min_x = edge_margin
+                max_x = img_width - edge_margin
+                min_y = edge_margin
+                max_y = img_height - edge_margin
+                
+                # 重新创建points2D，更新point3D_id映射并过滤边缘点
                 new_points2D = []
                 point2D_idx = 0
                 
                 for point2D in curr_image.points2D:
+                    x, y = point2D.xy[0], point2D.xy[1]
+                    
+                    # 检查点是否在边缘范围内
+                    is_edge_point = (x < min_x or x >= max_x or y < min_y or y >= max_y)
+                    
+                    # 确保xy格式正确
+                    xy_array = np.asarray(point2D.xy, dtype=np.float64)
+                    if xy_array.ndim == 1:
+                        xy_array = xy_array.reshape(2, 1)
+                    
                     if point2D.point3D_id != -1 and point2D.point3D_id in curr_to_merged_point3D_map:
-                        new_point3D_id = curr_to_merged_point3D_map[point2D.point3D_id]
-                        new_points2D.append(pycolmap.Point2D(point2D.xy, new_point3D_id))
-                        
-                        # 【关键】更新3D点的track信息
-                        track = merged_recon.points3D[new_point3D_id].track
-                        track.add_element(merged_image_id, point2D_idx)
-                        point2D_idx += 1
+                        if not is_edge_point:
+                            # 点在有效区域内，保留3D点关联
+                            new_point3D_id = curr_to_merged_point3D_map[point2D.point3D_id]
+                            new_points2D.append(pycolmap.Point2D(xy=xy_array, point3D_id=new_point3D_id))
+                            
+                            # 【关键】更新3D点的track信息
+                            track = merged_recon.points3D[new_point3D_id].track
+                            track.add_element(merged_image_id, point2D_idx)
+                            point2D_idx += 1
+                        else:
+                            # 点在边缘范围内，移除3D点关联
+                            xy_array = np.asarray(point2D.xy, dtype=np.float64)
+                            if xy_array.ndim == 1:
+                                xy_array = xy_array.reshape(2, 1)
+                            # 不传 point3D_id 参数，使用默认无效值
+                            new_points2D.append(pycolmap.Point2D(xy=xy_array))
+                            point2D_idx += 1
                     else:
-                        new_points2D.append(pycolmap.Point2D(point2D.xy, -1))
+                        # 没有对应的3D点，无论是否在边缘都保留（但point3D_id为-1）
+                        xy_array = np.asarray(point2D.xy, dtype=np.float64)
+                        if xy_array.ndim == 1:
+                            xy_array = xy_array.reshape(2, 1)
+                        # 不传 point3D_id 参数，使用默认无效值
+                        new_points2D.append(pycolmap.Point2D(xy=xy_array))
                         point2D_idx += 1
                 
                 # 创建新Image对象
@@ -3640,11 +3712,27 @@ class IncrementalFeatureMatcherSfM:
         #     pycolmap.bundle_adjustment(merged_recon, ba_options)
         #     self.merged_reconstruction = merged_recon
 
+        # 4.0 清理没有观测或观测数量不足的3D点（边缘过滤后可能产生）
+        points3d_to_remove = []
+        for point3d_id in list(merged_recon.points3D.keys()):
+            point3d = merged_recon.points3D[point3d_id]
+            if len(point3d.track.elements) < 2:  # 至少需要2个观测
+                points3d_to_remove.append(point3d_id)
+        
+        for point3d_id in points3d_to_remove:
+            del merged_recon.points3D[point3d_id]
+        
+        if self.verbose and len(points3d_to_remove) > 0:
+            print(f"    移除了 {len(points3d_to_remove)} 个观测不足的3D点（边缘过滤后）")
+        
+        self.merged_reconstruction = merged_recon
+
         # 4.1 保存merged_reconstruction
         temp_path = self.output_dir / "temp_merged" / f"merged_reconstruction_{len(self.inference_reconstructions)}"
         temp_path.mkdir(parents=True, exist_ok=True)
         merged_recon.write_text(str(temp_path))
         merged_recon.export_PLY(str(temp_path / "points3D.ply"))
+        self.export_reconstruction_to_las(merged_recon, str(temp_path / "points3D.las"))
 
         if self.verbose:
             print(f"    Merged reconstruction: {len(merged_recon.images)} images, {len(merged_recon.points3D)} 3D points")
@@ -3816,11 +3904,50 @@ class IncrementalFeatureMatcherSfM:
         }
         
         return stats
+    
+    def export_reconstruction_to_las(self, reconstruction: pycolmap.Reconstruction, output_path: str):
+        """
+        将pycolmap Reconstruction导出为LAS格式
+        
+        Args:
+            reconstruction: pycolmap重建对象
+            output_path: 输出的.las文件路径
+        """
+        # 提取所有3D点的坐标和颜色
+        points = []
+        colors = []
+        
+        for point3D_id, point3D in reconstruction.points3D.items():
+            points.append(point3D.xyz)
+            colors.append(point3D.color)
+        
+        points = np.array(points)
+        colors = np.array(colors)
+        
+        # 创建LAS文件
+        header = laspy.LasHeader(point_format=3, version="1.2")
+        header.offsets = np.min(points, axis=0)
+        header.scales = np.array([0.001, 0.001, 0.001])  # 1mm精度
+        
+        las = laspy.LasData(header)
+        
+        # 设置坐标
+        las.x = points[:, 0]
+        las.y = points[:, 1]
+        las.z = points[:, 2]
+        
+        # 设置颜色 (LAS使用16位颜色值)
+        las.red = (colors[:, 0] * 256).astype(np.uint16)
+        las.green = (colors[:, 1] * 256).astype(np.uint16)
+        las.blue = (colors[:, 2] * 256).astype(np.uint16)
+        
+        # 写入文件
+        las.write(output_path)
 
 def run_incremental_feature_matching(
     image_paths: List[Path],
     output_dir: Path,
-    reconstruction_type: str = 'dense_feature_points', # 'dense_feature_points' | 'each_pixel_feature_points'
+    reconstruction_type: str = 'each_pixel_feature_points', # 'dense_feature_points' | 'each_pixel_feature_points'
     image_interval: int = 2,
     min_images_for_scale: int = 6,
     overlap: int = 2,
@@ -3829,6 +3956,7 @@ def run_incremental_feature_matching(
     max_points3D_val: int = 5000,
     min_inlier_per_frame: int = 32,
     run_global_sfm_first: bool = True,
+    filter_edge_margin: float = 150.0,
     verbose: bool = False,
 ) -> bool:
     """Run incremental image initialization pipeline.
@@ -3844,6 +3972,7 @@ def run_incremental_feature_matching(
         max_points3D_val: Maximum number of 3D points in the reconstruction
         min_inlier_per_frame: Minimum number of inliers per frame for feature matching
         run_global_sfm_first: Whether to run global SfM first
+        filter_edge_margin: Edge margin for filtering points (in pixels), default 10, set to 0 to disable
         verbose: Enable verbose logging
     
     Returns:
@@ -3889,6 +4018,7 @@ def run_incremental_feature_matching(
         max_reproj_error=max_reproj_error,
         max_points3D_val=max_points3D_val,
         min_inlier_per_frame=min_inlier_per_frame,
+        filter_edge_margin=filter_edge_margin,
         verbose=verbose,
     )
 
