@@ -3404,19 +3404,12 @@ class IncrementalFeatureMatcherSfM:
 
             # 定义格网大小（可以根据需要调整，比如15像素一个格网）
             grid_size = 15.0  # 每个格网的像素大小
-            
-            # 将2D点映射到格网索引
-            def get_grid_index(x, y, grid_size):
-                """将2D坐标映射到格网索引"""
-                grid_x = int(x / grid_size)
-                grid_y = int(y / grid_size)
-                return (grid_x, grid_y)
 
             # 为prev图像建立格网索引
             prev_grid_index = {}  # {(grid_x, grid_y): [(point2D_id, xy, point3D_id, xyz), ...]}
             for point2D_idx, point2D in enumerate(prev_image.points2D):
                 if point2D.point3D_id != -1 and point2D.point3D_id in prev_recon.points3D:
-                    grid_key = get_grid_index(point2D.xy[0], point2D.xy[1], grid_size)
+                    grid_key = (int(point2D.xy[0] / grid_size), int(point2D.xy[1] / grid_size))
                     if grid_key not in prev_grid_index:
                         prev_grid_index[grid_key] = []
                     xyz = prev_recon.points3D[point2D.point3D_id].xyz
@@ -3426,7 +3419,7 @@ class IncrementalFeatureMatcherSfM:
             curr_grid_index = {}  # {(grid_x, grid_y): [(point2D_id, xy, point3D_id, xyz), ...]}
             for point2D_idx, point2D in enumerate(curr_image.points2D):
                 if point2D.point3D_id != -1 and point2D.point3D_id in curr_recon.points3D:
-                    grid_key = get_grid_index(point2D.xy[0], point2D.xy[1], grid_size)
+                    grid_key = (int(point2D.xy[0] / grid_size), int(point2D.xy[1] / grid_size))
                     if grid_key not in curr_grid_index:
                         curr_grid_index[grid_key] = []
                     xyz = curr_recon.points3D[point2D.point3D_id].xyz
