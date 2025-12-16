@@ -963,6 +963,7 @@ class IncrementalFeatureMatcherSfM:
                 reconstruction.write_text(str(temp_path))
                 reconstruction.export_PLY(str(temp_path / "points3D.ply"))
                 
+                # 对齐到前一个重建reconstruction，且只调整平移，不旋转和缩放。
                 if len(self.inference_reconstructions) < 1:
                     aligned_recon = reconstruction
                 else:
@@ -4147,7 +4148,7 @@ class IncrementalFeatureMatcherSfM:
                     })
 
         # 多尺度匹配：从小 cell 到大 cell
-        cell_sizes = [1, 5, 10, 15, 20, 25, 30]  # 逐步扩大
+        cell_sizes = [1, 3, 5, 10, 15, 20, 25, 30, 50, 100, 500, 1000]  # 逐步扩大
         matched_pairs = {}
         matched_prev_ids = set()
         matched_curr_ids = set()
@@ -4318,7 +4319,7 @@ class IncrementalFeatureMatcherSfM:
 
         # 使用匹配的3D点对估计 Sim3 变换（curr → prev 坐标系）
         # 只使用 cell_size=1 的高精度匹配点
-        high_precision_pairs = {k: v for k, v in matched_pairs.items() if v['cell_size'] == 1}
+        high_precision_pairs = {k: v for k, v in matched_pairs.items() if v['cell_size'] < 5}
         sim3_transform = None
         src_pts3d = None
         tgt_pts3d = None
@@ -4365,13 +4366,30 @@ class IncrementalFeatureMatcherSfM:
                 residuals = np.linalg.norm(transformed_src - tgt_pts3d, axis=1)
                 print(f"    变换后残差: 均值={residuals.mean():.4f}m, 最大={residuals.max():.4f}m")
             
-            # 只使用平移，不旋转不缩放
-            translation_only = tgt_pts3d.mean(axis=0) - src_pts3d.mean(axis=0)
-            identity_rotation = pycolmap.Rotation3d(np.eye(3))
-            sim3_translation_only = pycolmap.Sim3d(1.0, identity_rotation, translation_only)
+            # # 只使用平移，不旋转不缩放
+            # translation_only = tgt_pts3d.mean(axis=0) - src_pts3d.mean(axis=0)
+            # identity_rotation = pycolmap.Rotation3d(np.eye(3))
+            # sim3_translation_only = pycolmap.Sim3d(1.0, identity_rotation, translation_only)
             
+            # 使用缩放加平移，不旋转
+            src_centroid = src_pts3d.mean(axis=0)
+            tgt_centroid = tgt_pts3d.mean(axis=0)
+
+            # 计算缩放因子：使用到质心的平均距离比值
+            src_dists = np.linalg.norm(src_pts3d - src_centroid, axis=1)
+            tgt_dists = np.linalg.norm(tgt_pts3d - tgt_centroid, axis=1)
+            scale = np.mean(tgt_dists) / (np.mean(src_dists) + 1e-8)
+
+            # 平移量：先缩放再平移，所以 tgt = scale * src + translation
+            # translation = tgt_centroid - scale * src_centroid
+            translation = tgt_centroid - scale * src_centroid
+
+            identity_rotation = pycolmap.Rotation3d(np.eye(3))
+            sim3_scale_translation = pycolmap.Sim3d(scale, identity_rotation, translation)
+
             # 方案1：直接变换 curr_recon 到 prev 坐标系
-            curr_recon.transform(sim3_translation_only)
+            # curr_recon.transform(sim3_translation_only)
+            curr_recon.transform(sim3_scale_translation)
             # 保存 Sim3 变换后的 curr_recon
             curr_recon_data = self.inference_reconstructions[-1]
             start_idx = curr_recon_data['start_idx']
@@ -4644,6 +4662,7 @@ class IncrementalFeatureMatcherSfM:
             if point3D_id in prev_to_average:
                 xyz = prev_to_average[point3D_id]['xyz']
                 color = prev_to_average[point3D_id]['color']
+                # color = np.array([255,0,0], dtype=np.uint8) # 红色
             else:
                 xyz = np.array(point3D.xyz, dtype=np.float64)
                 color = np.array(point3D.color, dtype=np.uint8)
