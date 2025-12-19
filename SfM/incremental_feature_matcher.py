@@ -38,7 +38,8 @@ from mapanything.third_party.np_to_pycolmap import (
     batch_np_matrix_to_pycolmap,
     batch_np_matrix_to_pycolmap_wo_track,
 )
-            
+from mapanything.utils.image import rgb
+
 def cam_from_enu_transform(roll, pitch, yaw):
     """
     Returns the transformation matrix from ENU to camera coordinates.
@@ -723,7 +724,6 @@ class IncrementalFeatureMatcherSfM:
                     K_tensors.append(output['intrinsics'][0])
                 
                 # 批量 stack 后一次性传输到 CPU
-                import torch
                 pts3d_batch = torch.stack(pts3d_tensors).cpu().numpy()  # (n, H, W, 3)
                 conf_batch = torch.stack(conf_tensors).cpu().numpy()    # (n, H, W)
                 cam_batch = torch.stack(cam_tensors).cpu().numpy()      # (n, 4, 4)
@@ -760,8 +760,6 @@ class IncrementalFeatureMatcherSfM:
                 )
 
                 model = self._load_model()
-
-                from mapanything.utils.image import rgb
                 
                 # RGB处理
                 points_rgb_list = [rgb(points_rgb_images[i], model.encoder.data_norm_type) 
