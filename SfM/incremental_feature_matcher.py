@@ -27,6 +27,7 @@ if str(current_dir) not in sys.path:
     sys.path.insert(0, str(current_dir))
 
 from feature_matcher import FeatureMatcherSfM
+from merge_construction import merge_reconstructions
 from utils.gps import extract_gps_from_image, lat_lon_to_enu
 from utils.xmp import parse_xmp_tags
 from mapanything.utils.image import preprocess_inputs
@@ -88,6 +89,7 @@ class IncrementalFeatureMatcherSfM:
         pred_vis_scores_thres_value: float = 0.3, 
         filter_edge_margin: float = 10.0,  # 边缘过滤范围（像素），默认10，设为0禁用
         enable_visualization: bool = True,
+        visualization_mode: str = 'merged',  # 'aligned' | 'merged'，点云可视化模式
         verbose: bool = False,
     ):
         """Initialize incremental feature matcher.
@@ -107,6 +109,7 @@ class IncrementalFeatureMatcherSfM:
             pred_vis_scores_thres_value: Visibility confidence threshold for tracks
             filter_edge_margin: Edge margin for filtering points (in pixels), default 10, set to 0 to disable
             enable_visualization: Whether to start viser server for visualization
+            visualization_mode: Point cloud visualization mode, 'aligned' (per batch) or 'merged' (unified)
             verbose: Enable verbose logging
         """
         # Model (lazy loading)
@@ -131,6 +134,11 @@ class IncrementalFeatureMatcherSfM:
         self.max_points3D_val = max_points3D_val
         self.min_inlier_per_frame = min_inlier_per_frame
         self.filter_edge_margin = filter_edge_margin
+        
+        # Visualization mode: 'aligned' (每个batch单独点云) or 'merged' (合并后整体点云)
+        if visualization_mode not in ['aligned', 'merged']:
+            raise ValueError(f"visualization_mode must be 'aligned' or 'merged', got: {visualization_mode}")
+        self.visualization_mode = visualization_mode
 
         # Create output directory
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -160,7 +168,11 @@ class IncrementalFeatureMatcherSfM:
         self.enable_visualization = enable_visualization
         self.viser_server = None
         self.viser_frustum_handles = []
-        self.viser_point_handles = []
+        self.viser_point_handles = []  # 每个 batch 的点云 handle 列表（aligned_recon 模式）
+        self.unified_point_clouds = []  # 每个 batch 的整体点云数据列表 [{'points': ndarray, 'colors': ndarray}, ...]
+        self.merged_point_cloud_handle = None  # merged 点云的 handle（merged 模式）
+        self.merged_point_cloud = None  # merged 点云数据 {'points': ndarray, 'colors': ndarray}
+        self.merged_point_cloud_version = 0  # merged 点云版本号
 
         # Setup visualization if enabled
         if self.enable_visualization:
@@ -220,13 +232,24 @@ class IncrementalFeatureMatcherSfM:
 
         @self.gui_point_size.on_update
         def _(_):
-            for handle in self.viser_point_handles:
-                handle.point_size = self.gui_point_size.value
+            # 根据 visualization_mode 更新相应点云的大小
+            if self.visualization_mode == 'aligned':
+                for handle in self.viser_point_handles:
+                    handle.point_size = self.gui_point_size.value
+            else:  # merged
+                if self.merged_point_cloud_handle is not None:
+                    self.merged_point_cloud_handle.point_size = self.gui_point_size.value
         
         @self.gui_show_points.on_update
         def _(_):
-            for handle in self.viser_point_handles:
-                handle.visible = self.gui_show_points.value
+            show = self.gui_show_points.value
+            # 根据 visualization_mode 更新相应点云的可见性
+            if self.visualization_mode == 'aligned':
+                for handle in self.viser_point_handles:
+                    handle.visible = show
+            else:  # merged
+                if self.merged_point_cloud_handle is not None:
+                    self.merged_point_cloud_handle.visible = show
         
         @self.gui_frustum_scale.on_update
         def _(_):
@@ -337,40 +360,91 @@ class IncrementalFeatureMatcherSfM:
     def _update_visualization(self):
         """Update viser visualization with latest data.
         
-        This function adds only NEW images that haven't been visualized yet.
+        This function:
+        1. For 'aligned' mode: Incrementally adds NEW batch point clouds (from aligned_recon.points3D)
+        2. For 'merged' mode: Updates merged point cloud (from merged_reconstruction)
+        3. Adds only NEW camera frustums that haven't been visualized yet
+        
+        Point cloud mode is controlled by self.visualization_mode ('aligned' or 'merged')
         """
         if not hasattr(self, 'viser_server') or self.viser_server is None:
             return
         
-        # Get number of images to visualize
-        num_images = len(self.recovered_inference_outputs)
-        num_visualized = len(self.viser_point_handles)  # 已经可视化的数量
+        show_points = self.gui_show_points.value
         
-        # 只添加新的图像（增量添加）
+        # ==================== 1. aligned 模式：增量添加每个 batch 的整体点云 ====================
+        if self.visualization_mode == 'aligned':
+            num_point_clouds = len(self.unified_point_clouds)
+            num_visualized_point_clouds = len(self.viser_point_handles)  # 已可视化的点云数量
+            
+            if num_point_clouds > num_visualized_point_clouds:
+                if self.verbose:
+                    print(f"  Adding {num_point_clouds - num_visualized_point_clouds} new batch point clouds...")
+                
+                # 只添加新的 batch 点云
+                for i in range(num_visualized_point_clouds, num_point_clouds):
+                    unified_pc = self.unified_point_clouds[i]
+                    points = unified_pc['points']
+                    colors = unified_pc['colors']
+                    
+                    if len(points) > 0:
+                        point_handle = self.viser_server.scene.add_point_cloud(
+                            f"/reconstruction/points_batch_{i:03d}",
+                            points=points,
+                            colors=colors,
+                            point_size=self.gui_point_size.value,
+                            point_shape="rounded",
+                        )
+                        point_handle.visible = show_points
+                        self.viser_point_handles.append(point_handle)
+                        
+                        if self.verbose:
+                            print(f"  ✓ Added point cloud for batch {i}: {len(points)} points")
+        
+        # ==================== 2. merged 模式：更新整体合并点云 ====================
+        elif self.visualization_mode == 'merged' and self.merged_point_cloud is not None:
+            current_version = self.merged_point_cloud_version
+            visualized_version = getattr(self, '_visualized_merged_version', 0)
+            
+            if current_version > visualized_version:
+                points = self.merged_point_cloud['points']
+                colors = self.merged_point_cloud['colors']
+                
+                if len(points) > 0:
+                    # 移除旧的 merged 点云（如果存在）
+                    if self.merged_point_cloud_handle is not None:
+                        try:
+                            self.merged_point_cloud_handle.remove()
+                        except:
+                            pass
+                    
+                    # 添加新的 merged 点云
+                    self.merged_point_cloud_handle = self.viser_server.scene.add_point_cloud(
+                        "/reconstruction/points_merged",
+                        points=points,
+                        colors=colors,
+                        point_size=self.gui_point_size.value,
+                        point_shape="rounded",
+                    )
+                    self.merged_point_cloud_handle.visible = show_points
+                    
+                    if self.verbose:
+                        print(f"  ✓ Merged point cloud updated: {len(points)} points")
+                    
+                    self._visualized_merged_version = current_version
+        
+        # ==================== 2. 增量添加相机 frustum ====================
+        num_images = len(self.recovered_inference_outputs)
+        num_visualized = len(self.viser_frustum_handles)  # 已经可视化的 frustum 数量
+        
+        # 只添加新的图像的 frustum（增量添加）
         if num_images > num_visualized:
             if self.verbose:
-                print(f"  Adding {num_images - num_visualized} new images to visualization...")
+                print(f"  Adding {num_images - num_visualized} new camera frustums...")
             
-            # Visualize only NEW images
+            # Visualize only NEW images' frustums
             for i in range(num_visualized, num_images):
                 recovered_output = self.recovered_inference_outputs[i]
-
-                pts3d_recovered = recovered_output['pts3d']  # (1, H, W, 3) tensor
-                pts3d_np = pts3d_recovered[0].cpu().numpy()  # (H, W, 3)
-
-                H, W, _ = pts3d_np.shape
-                
-                pts_recovered = pts3d_np.reshape(-1, 3)
-                
-                # Get colors from original image (from input_views)
-                if i < len(self.input_views):
-                    img_array = self.input_views[i]['img'].cpu().numpy()  # (H_orig, W_orig, 3)
-                    # Resize colors to match point cloud resolution
-                    img_resized = np.array(Image.fromarray(img_array).resize((W, H), Image.BILINEAR))
-                    colors = img_resized.reshape(-1, 3).astype(np.uint8)
-                else:
-                    # Default gray color if no image available
-                    colors = np.full((pts_recovered.shape[0], 3), 128, dtype=np.uint8)
                 
                 # ==================== Add camera frustum =====================
                 camera_pose = recovered_output['camera_poses'][0].cpu().numpy()  # (4, 4)
@@ -408,24 +482,46 @@ class IncrementalFeatureMatcherSfM:
                         position=t_cam,
                     )
                     self.viser_frustum_handles.append(frustum_handle)
-                
-                # ==================== Add point cloud =====================
-                if self.gui_show_points.value:
-                    point_handle = self.viser_server.scene.add_point_cloud(
-                        f"/reconstruction/points_{i:03d}",
-                        points=pts_recovered,
-                        colors=colors,
-                        point_size=self.gui_point_size.value,
-                        point_shape="rounded",
-                    )
-                    self.viser_point_handles.append(point_handle)
             
             if self.verbose:
-                print(f"  ✓ Visualization updated: {num_images} cameras and point clouds total")
-                print(f"    Total points: {sum([h.points.shape[0] for h in self.viser_point_handles])}")
+                if self.visualization_mode == 'aligned':
+                    total_points = sum(len(pc['points']) for pc in self.unified_point_clouds)
+                    print(f"  ✓ Visualization updated: {num_images} cameras, {len(self.unified_point_clouds)} batches, {total_points} points (aligned mode)")
+                else:
+                    total_points = len(self.merged_point_cloud['points']) if self.merged_point_cloud else 0
+                    print(f"  ✓ Visualization updated: {num_images} cameras, {total_points} points (merged mode)")
         else:
             if self.verbose:
-                print(f"  No new images to visualize")
+                print(f"  No new cameras to visualize")
+
+    def _update_merged_point_cloud_for_visualization(self, reconstruction: pycolmap.Reconstruction):
+        """从 merged_reconstruction 提取整体点云用于可视化（merged 模式）
+        
+        每次合并后调用此函数更新 merged 点云数据。
+        
+        Args:
+            reconstruction: 合并后的 pycolmap.Reconstruction 对象
+        """
+        if reconstruction is None or len(reconstruction.points3D) == 0:
+            return
+        
+        num_points = len(reconstruction.points3D)
+        merged_points = np.empty((num_points, 3), dtype=np.float32)
+        merged_colors = np.empty((num_points, 3), dtype=np.uint8)
+        
+        for i, (point3D_id, point3D) in enumerate(reconstruction.points3D.items()):
+            merged_points[i] = point3D.xyz
+            merged_colors[i] = point3D.color  # RGB
+        
+        # 更新 merged 点云数据
+        self.merged_point_cloud = {
+            'points': merged_points,
+            'colors': merged_colors,
+        }
+        self.merged_point_cloud_version += 1  # 更新版本号触发可视化更新
+        
+        if self.verbose:
+            print(f"  ✓ Updated merged point cloud for visualization: {num_points} points")
 
     def _prepare_visualization_data(self, image_path: Path) -> bool:
         """Prepare and update visualization after adding a new image.
@@ -584,16 +680,10 @@ class IncrementalFeatureMatcherSfM:
                 width = self.inference_outputs[-1]['current_output']['pts3d'].shape[2]
 
                 conf_thres_value = 0.3
-                max_points_for_colmap = 100000  # randomly sample 3D points
-                shared_camera = (
-                    False  # in the feedforward manner, we do not support shared camera
-                )
-                camera_type = (
-                    "PINHOLE"  # in the feedforward manner, we only support PINHOLE camera
-                )
-                image_size = np.array(
-                    [height, width]
-                )
+                max_points_for_colmap = 100000
+                shared_camera = False
+                camera_type = "PINHOLE"
+                image_size = np.array([height, width])
 
                 latest_inference = self.inference_outputs[-1]
                 latest_outputs = latest_inference['outputs']
@@ -604,96 +694,64 @@ class IncrementalFeatureMatcherSfM:
                 
                 use_latest_outputs = (latest_start_idx == start_idx and latest_end_idx == end_idx)
                 
-                batch_points_3d = []
-                batch_depth_conf = []
-                batch_images = []
-                batch_extrinsics = []
-                batch_intrinsics = []
-                original_coords_list = []
-
+                # 统一数据源，消除代码重复
                 if use_latest_outputs:
-                    # 直接从最新的outputs列表中提取数据（推荐方式）
-                    for i, output in enumerate(latest_outputs):
-                        idx = start_idx + i
-                        
-                        # 提取 3D 点 (1, H, W, 3) -> (H, W, 3)
-                        pts3d = output['pts3d'][0].cpu().numpy()  # (H, W, 3)
-                        batch_points_3d.append(pts3d)
-                        
-                        # 提取置信度 (1, H, W) -> (H, W)
-                        conf = output['conf'][0].cpu().numpy()  # (H, W)
-                        batch_depth_conf.append(conf)
-                        
-                        # 从 preprocessed_views 获取图像
-                        if idx < len(self.preprocessed_views):
-                            img = self.preprocessed_views[idx]['img']  # [1, 3, H, W] tensor
-                            if img.dim() == 4 and img.shape[0] == 1:
-                                img = img.squeeze(0)  # [3, H, W]
-                            batch_images.append(img)
-                        
-                        # 提取相机参数
-                        cam2world = output['camera_poses'][0].cpu().numpy()  # (4, 4)
-                        # 转换为 world2cam (extrinsic)
-                        world2cam = np.linalg.inv(cam2world)
-                        batch_extrinsics.append(world2cam[:3, :])  # (3, 4)
-                        
-                        K = output['intrinsics'][0].cpu().numpy()  # (3, 3)
-                        batch_intrinsics.append(K)
-                        
-                        # 构建 original_coords [x1, y1, x2, y2, width, height]
-                        scale_info = self.scale_info[idx]
-                        ori_w, ori_h = scale_info['original_size']
-                        # 由于使用 fixed_mapping，没有裁剪，所以 x1=0, y1=0, x2=ori_w, y2=ori_h
-                        original_coords_list.append(np.array([0, 0, ori_w, ori_h, ori_w, ori_h], dtype=np.float32))
+                    outputs_list = latest_outputs
+                    indices = list(range(start_idx, start_idx + len(latest_outputs)))
                 else:
-                    # 范围不匹配，从各个 inference_outputs[idx]['current_output'] 获取
-                    # 注意：这种情况下，不同图像的点可能不在同一个坐标系中
                     if self.verbose:
                         print(f"  Warning: Using outputs from different inference batches, points may be in different coordinate systems")
+                    outputs_list = [self.inference_outputs[idx]['current_output'] for idx in range(start_idx, end_idx)]
+                    indices = list(range(start_idx, end_idx))
+                
+                n = len(outputs_list)
+                
+                # 预分配数组（避免列表追加）
+                original_coords = np.empty((n, 6), dtype=np.float32)
+                batch_images = []
+                
+                # 批量收集 tensor，减少 GPU-CPU 传输次数
+                pts3d_tensors = []
+                conf_tensors = []
+                cam_tensors = []
+                K_tensors = []
+                
+                for i, output in enumerate(outputs_list):
+                    pts3d_tensors.append(output['pts3d'][0])
+                    conf_tensors.append(output['conf'][0])
+                    cam_tensors.append(output['camera_poses'][0])
+                    K_tensors.append(output['intrinsics'][0])
+                
+                # 批量 stack 后一次性传输到 CPU
+                import torch
+                pts3d_batch = torch.stack(pts3d_tensors).cpu().numpy()  # (n, H, W, 3)
+                conf_batch = torch.stack(conf_tensors).cpu().numpy()    # (n, H, W)
+                cam_batch = torch.stack(cam_tensors).cpu().numpy()      # (n, 4, 4)
+                K_batch = torch.stack(K_tensors).cpu().numpy()          # (n, 3, 3)
+                
+                # 直接使用批量结果
+                points_3d = pts3d_batch.astype(np.float32)  # (n, H, W, 3)
+                depth_conf = conf_batch.astype(np.float32)  # (n, H, W)
+                intrinsic = K_batch.astype(np.float32)      # (n, 3, 3)
+                
+                # 批量矩阵求逆
+                extrinsic = np.linalg.inv(cam_batch)[:, :3, :]  # (n, 3, 4)
+                
+                # 处理图像和 original_coords
+                for i, idx in enumerate(indices):
+                    if idx < len(self.preprocessed_views):
+                        img = self.preprocessed_views[idx]['img']
+                        if img.dim() == 4 and img.shape[0] == 1:
+                            img = img.squeeze(0)
+                        batch_images.append(img)
                     
-                    for idx in range(start_idx, end_idx):
-                        inference_data = self.inference_outputs[idx]
-                        inference_output = inference_data['current_output']
-                        
-                        # 提取 3D 点 (1, H, W, 3) -> (H, W, 3)
-                        pts3d = inference_output['pts3d'][0].cpu().numpy()  # (H, W, 3)
-                        batch_points_3d.append(pts3d)
-                        
-                        # 提取置信度 (1, H, W) -> (H, W)
-                        conf = inference_output['conf'][0].cpu().numpy()  # (H, W)
-                        batch_depth_conf.append(conf)
-                        
-                        # 从 preprocessed_views 获取图像
-                        if idx < len(self.preprocessed_views):
-                            img = self.preprocessed_views[idx]['img']  # [1, 3, H, W] tensor
-                            if img.dim() == 4 and img.shape[0] == 1:
-                                img = img.squeeze(0)  # [3, H, W]
-                            batch_images.append(img)
-                        
-                        # 提取相机参数
-                        cam2world = inference_output['camera_poses'][0].cpu().numpy()  # (4, 4)
-                        # 转换为 world2cam (extrinsic)
-                        world2cam = np.linalg.inv(cam2world)
-                        batch_extrinsics.append(world2cam[:3, :])  # (3, 4)
-                        
-                        K = inference_output['intrinsics'][0].cpu().numpy()  # (3, 3)
-                        batch_intrinsics.append(K)
-                        
-                        # 构建 original_coords [x1, y1, x2, y2, width, height]
-                        scale_info = self.scale_info[idx]
-                        ori_w, ori_h = scale_info['original_size']
-                        # 由于使用 fixed_mapping，没有裁剪，所以 x1=0, y1=0, x2=ori_w, y2=ori_h
-                        original_coords_list.append(np.array([0, 0, ori_w, ori_h, ori_w, ori_h], dtype=np.float32))
+                    scale_info = self.scale_info[idx]
+                    ori_w, ori_h = scale_info['original_size']
+                    original_coords[i] = [0, 0, ori_w, ori_h, ori_w, ori_h]
                 
-                # 堆叠为数组
-                points_3d = np.stack(batch_points_3d)  # (num_frames, H, W, 3)
-                depth_conf = np.stack(batch_depth_conf)  # (num_frames, H, W)
                 images = torch.stack(batch_images)  # (num_frames, 3, H_preprocessed, W_preprocessed)
-                extrinsic = np.stack(batch_extrinsics)  # (num_frames, 3, 4)
-                intrinsic = np.stack(batch_intrinsics)  # (num_frames, 3, 3)
-                original_coords = np.stack(original_coords_list)  # (num_frames, 6)
                 
-                # 将图像插值到推理输出的尺寸 (height, width)
+                # 将图像插值到推理输出的尺寸
                 points_rgb_images = F.interpolate(
                     images,
                     size=(height, width),
@@ -705,37 +763,20 @@ class IncrementalFeatureMatcherSfM:
 
                 from mapanything.utils.image import rgb
                 
-                points_rgb_list = []
-                for i in range(points_rgb_images.shape[0]):
-                    # rgb function expects single image tensor and returns numpy array in [0,1] range
-                    rgb_img = rgb(points_rgb_images[i], model.encoder.data_norm_type)
-                    points_rgb_list.append(rgb_img)
-
-                # Stack and convert to uint8
-                points_rgb = np.stack(points_rgb_list)  # Shape: (N, H, W, 3)
-                points_rgb = (points_rgb * 255).astype(np.uint8)
+                # RGB处理
+                points_rgb_list = [rgb(points_rgb_images[i], model.encoder.data_norm_type) 
+                                   for i in range(points_rgb_images.shape[0])]
+                points_rgb = (np.stack(points_rgb_list) * 255).astype(np.uint8)  # Shape: (N, H, W, 3)
+                
                 # (S, H, W, 3), with x, y coordinates and frame indices
                 points_xyf = self.create_pixel_coordinate_grid(num_frames, height, width)
 
-                # ========== 构建像素与3D点的映射关系（在过滤之前）==========
-                # 创建完整的映射：每个像素位置对应一个3D点
-                # 格式: pixel_to_point3d[frame_idx][y, x] = point3d_index
-                # 注意：这里的索引是在过滤之前的索引
-                pixel_to_point3d_mapping = []
-                for frame_idx in range(num_frames):
-                    # 使用numpy的arange和reshape创建索引，避免循环
-                    flat_indices = np.arange(frame_idx * height * width, 
-                                            (frame_idx + 1) * height * width, 
-                                            dtype=np.int32)
-                    frame_mapping = flat_indices.reshape(height, width)
-                    pixel_to_point3d_mapping.append(frame_mapping)
-                
-                # 也可以创建一个反向映射：point3d_index -> (frame_idx, y, x)
-                # 这个在过滤后会更有用
-                # ====================================================
+                # 构建像素与3D点的映射关系（一次性向量化）
+                total_pixels = num_frames * height * width
+                all_indices = np.arange(total_pixels, dtype=np.int32).reshape(num_frames, height, width)
+                pixel_to_point3d_mapping = [all_indices[i] for i in range(num_frames)]
 
                 conf_mask = depth_conf >= conf_thres_value
-
                 combined_mask = self.randomly_limit_trues(conf_mask, max_points_for_colmap)
                 
                 # 应用mask过滤点云
@@ -743,35 +784,28 @@ class IncrementalFeatureMatcherSfM:
                 points_xyf_filtered = points_xyf[combined_mask]
                 points_rgb_filtered = points_rgb[combined_mask]
 
-                # ========== 更新过滤后的像素到3D点映射 ==========
-                # 创建过滤后的映射：point3d_id -> (frame_idx, pixel_y, pixel_x)
-                # 这个映射在后续对齐等操作中可能有用
-                point3d_to_pixel_mapping = {}
-                # 向量化处理，避免循环
-                point3d_ids = np.arange(1, len(points_3d_filtered) + 1)  # COLMAP中point3D_id从1开始
+                # 构建point3d_to_pixel_mapping（字典推导式）
+                num_filtered = len(points_3d_filtered)
+                point3d_ids = np.arange(1, num_filtered + 1)  # COLMAP中point3D_id从1开始
                 frame_indices = points_xyf_filtered[:, 2].astype(np.int32)
                 pixel_xs = points_xyf_filtered[:, 0].astype(np.int32)
                 pixel_ys = points_xyf_filtered[:, 1].astype(np.int32)
                 
-                for i in range(len(points_3d_filtered)):
-                    point3d_to_pixel_mapping[point3d_ids[i]] = {
+                point3d_to_pixel_mapping = {
+                    point3d_ids[i]: {
                         'frame_idx': frame_indices[i],
                         'pixel': (pixel_xs[i], pixel_ys[i]),
                         'point3d': points_3d_filtered[i],
                         'rgb': points_rgb_filtered[i],
                     }
+                    for i in range(num_filtered)
+                }
                 
-                # ========== 构建3D点到多视图2D位置的映射（向量化优化）==========
-                point3d_to_multiview_pixels = {}
-
-                # 准备所有3D点的坐标 (N, 3)
+                # 3D点投影到多视图（向量化）
                 all_points_3d = points_3d_filtered  # (N, 3)
                 num_points = len(all_points_3d)
 
                 # 将每个3D点投影到所有影像
-                # project_3D_points_np 返回: (points2D, points_cam)
-                # points2D: (num_frames, N, 2) - 每张影像中每个3D点的2D投影坐标
-                # points_cam: (num_frames, 3, N) - 每张影像中每个3D点的相机坐标系坐标
                 projected_points2d, points_cam = project_3D_points_np(
                     all_points_3d,  # (N, 3)
                     extrinsic,      # (num_frames, 3, 4)
@@ -782,109 +816,70 @@ class IncrementalFeatureMatcherSfM:
                 img_height, img_width = image_size[0], image_size[1]
 
                 # 向量化检查所有点的可见性
-                # points_cam: (num_frames, 3, N) -> depths: (num_frames, N)
                 depths = points_cam[:, 2, :]  # (num_frames, N)
-                
-                # 检查深度是否为正（点在相机前方）
                 valid_depth_mask = depths > 0  # (num_frames, N)
                 
                 # 检查投影点是否在图像范围内
-                # projected_points2d: (num_frames, N, 2)
-                valid_x_mask = (projected_points2d[:, :, 0] >= 0) & (projected_points2d[:, :, 0] < img_width)  # (num_frames, N)
-                valid_y_mask = (projected_points2d[:, :, 1] >= 0) & (projected_points2d[:, :, 1] < img_height)  # (num_frames, N)
-                valid_bounds_mask = valid_x_mask & valid_y_mask  # (num_frames, N)
+                valid_x_mask = (projected_points2d[:, :, 0] >= 0) & (projected_points2d[:, :, 0] < img_width)
+                valid_y_mask = (projected_points2d[:, :, 1] >= 0) & (projected_points2d[:, :, 1] < img_height)
                 
                 # 综合可见性mask
-                visible_mask = valid_depth_mask & valid_bounds_mask  # (num_frames, N)
+                visible_mask = valid_depth_mask & valid_x_mask & valid_y_mask  # (num_frames, N)
                 
-                # 预先准备RGB值映射（避免在循环中重复查找）
-                rgb_map = {}
-                for point3d_id, info in point3d_to_pixel_mapping.items():
-                    rgb_map[point3d_id] = info['rgb']
-                
-                # 对于每个3D点，收集它在所有影像中的投影位置
-                for point_idx in range(num_points):
-                    point3d_id = point_idx + 1  # COLMAP中point3D_id从1开始
-                    point3d = all_points_3d[point_idx]
-                    
-                    # 获取该点在所有影像中的可见性
-                    point_visible = visible_mask[:, point_idx]  # (num_frames,)
-                    
-                    # 获取该点在所有影像中的投影坐标
-                    point_proj_2d = projected_points2d[:, point_idx, :]  # (num_frames, 2)
-                    
-                    # 获取该点在所有影像中的深度
-                    point_depths = depths[:, point_idx]  # (num_frames,)
-                    
-                    # 获取该点的RGB值（预先查找，避免重复）
-                    rgb_value = rgb_map.get(point3d_id, points_rgb_filtered[point_idx])
-                    
-                    # 只处理可见的影像
-                    visible_frame_indices = np.where(point_visible)[0]
-                    
-                    observations = []
-                    for frame_idx in visible_frame_indices:
-                        pixel_x, pixel_y = point_proj_2d[frame_idx, 0], point_proj_2d[frame_idx, 1]
-                        depth = point_depths[frame_idx]
-                        
-                        observations.append({
-                            'frame_idx': int(frame_idx),
-                            'pixel': (int(pixel_x), int(pixel_y)),
-                            'pixel_float': (float(pixel_x), float(pixel_y)),
-                            'point3d': point3d,
-                            'rgb': rgb_value,
-                            'depth': float(depth),
-                        })
-                    
-                    # 存储该3D点的所有观测
-                    point3d_to_multiview_pixels[point3d_id] = observations
-
-                # ========== 从point3d_to_multiview_pixels构建tracks和masks ==========
-                # 用于支持batch_np_matrix_to_pycolmap函数
-                # 只处理有观测的点（过滤掉observations为空的点）
-                valid_point3d_ids = [
-                    pid for pid, observations in point3d_to_multiview_pixels.items()
-                    if len(observations) > 0
-                ]
-                num_tracks = len(valid_point3d_ids)
+                # ========== 核心: 完全向量化构建tracks和masks ==========
+                # 计算每个点的可见帧数，筛选有效点
+                points_visible_count = visible_mask.sum(axis=0)  # (N,)
+                valid_points_mask = points_visible_count > 0  # 至少在一帧中可见
+                valid_point_indices = np.where(valid_points_mask)[0]
+                num_tracks = len(valid_point_indices)
                 
                 if num_tracks == 0:
                     print("  Warning: No valid tracks found, skipping COLMAP conversion")
                     reconstruction = None
                     valid_track_mask = None
+                    point3d_to_multiview_pixels = {}
                 else:
-                    # 初始化tracks和masks数组
-                    tracks = np.full((num_frames, num_tracks, 2), np.nan, dtype=np.float32)
-                    masks = np.zeros((num_frames, num_tracks), dtype=bool)
+                    # 直接构建tracks和masks（完全向量化）
+                    tracks = projected_points2d[:, valid_point_indices, :].astype(np.float32).copy()  # (num_frames, num_tracks, 2)
+                    masks = visible_mask[:, valid_point_indices].copy()  # (num_frames, num_tracks)
                     
-                    # 构建point3d_id到track索引的映射
-                    point3d_id_to_track_idx = {pid: idx for idx, pid in enumerate(valid_point3d_ids)}
+                    # 将不可见位置设为 NaN
+                    tracks[~masks] = np.nan
                     
-                    # 从point3d_to_multiview_pixels填充tracks和masks
-                    for point3d_id, observations in point3d_to_multiview_pixels.items():
-                        if len(observations) == 0:
-                            continue
-                        track_idx = point3d_id_to_track_idx[point3d_id]
+                    # 向量化提取3D点和RGB
+                    points3d_for_tracks = all_points_3d[valid_point_indices].astype(np.float64)  # (num_tracks, 3)
+                    points_rgb_for_tracks = points_rgb_filtered[valid_point_indices].astype(np.uint8)  # (num_tracks, 3)
+                    
+                    # 构建 valid_point3d_ids 列表
+                    valid_point3d_ids = (valid_point_indices + 1).tolist()  # COLMAP中point3D_id从1开始
+                    
+                    # 构建 point3d_to_multiview_pixels（如果后续需要）
+                    # 使用预提取的数据，减少重复索引
+                    point3d_to_multiview_pixels = {}
+                    valid_depths = depths[:, valid_point_indices]  # (num_frames, num_tracks)
+                    valid_projected = projected_points2d[:, valid_point_indices, :]  # (num_frames, num_tracks, 2)
+                    valid_visible = masks  # 复用已有的 masks
+                    
+                    for track_idx, point_idx in enumerate(valid_point_indices):
+                        point3d_id = point_idx + 1
+                        point3d = all_points_3d[point_idx]
+                        rgb_value = points_rgb_filtered[point_idx]
                         
-                        for obs in observations:
-                            frame_idx = obs['frame_idx']
-                            pixel_x, pixel_y = obs['pixel_float']
-                            
-                            tracks[frame_idx, track_idx, 0] = pixel_x
-                            tracks[frame_idx, track_idx, 1] = pixel_y
-                            masks[frame_idx, track_idx] = True
-                    
-                    # 提取对应的3D点坐标和RGB（按point3d_id顺序）
-                    # 现在可以安全访问[0]，因为已经过滤掉了空列表
-                    points3d_for_tracks = np.array([
-                        point3d_to_multiview_pixels[pid][0]['point3d'] 
-                        for pid in valid_point3d_ids
-                    ], dtype=np.float64)  # (num_tracks, 3)
-                    
-                    points_rgb_for_tracks = np.array([
-                        point3d_to_multiview_pixels[pid][0]['rgb'] 
-                        for pid in valid_point3d_ids
-                    ], dtype=np.uint8)  # (num_tracks, 3)
+                        # 获取该点可见的帧索引
+                        visible_frame_indices = np.where(valid_visible[:, track_idx])[0]
+                        
+                        observations = [{
+                            'frame_idx': int(frame_idx),
+                            'pixel': (int(valid_projected[frame_idx, track_idx, 0]), 
+                                     int(valid_projected[frame_idx, track_idx, 1])),
+                            'pixel_float': (float(valid_projected[frame_idx, track_idx, 0]), 
+                                           float(valid_projected[frame_idx, track_idx, 1])),
+                            'point3d': point3d,
+                            'rgb': rgb_value,
+                            'depth': float(valid_depths[frame_idx, track_idx]),
+                        } for frame_idx in visible_frame_indices]
+                        
+                        point3d_to_multiview_pixels[point3d_id] = observations
                 # ====================================================
 
                 # print("Converting to COLMAP format")
@@ -1051,6 +1046,88 @@ class IncrementalFeatureMatcherSfM:
                     'reconstruction': aligned_recon,
                     'valid_track_mask': valid_track_mask,
                 })
+
+                # ==================== 填充 recovered_inference_outputs 用于可视化 ====================
+                # 使用 aligned_recon.points3D 中的整体稀疏点云，而不是每个影像单独的密集点云
+                
+                # 获取 scale_ratio（从最新的 inference_outputs 中获取）
+                latest_inference_data = self.inference_outputs[-1]
+                scale_ratio = latest_inference_data.get('scale_ratio', 1.0)
+                if self.verbose:
+                    print(f"  Using scale_ratio: {scale_ratio:.6f} for visualization")
+                
+                # ==================== 1. 从 aligned_recon 提取整体稀疏点云（增量添加）====================
+                if len(aligned_recon.points3D) > 0:
+                    num_points = len(aligned_recon.points3D)
+                    unified_points = np.empty((num_points, 3), dtype=np.float32)
+                    unified_colors = np.empty((num_points, 3), dtype=np.uint8)
+                    
+                    for i, (point3D_id, point3D) in enumerate(aligned_recon.points3D.items()):
+                        unified_points[i] = point3D.xyz
+                        unified_colors[i] = point3D.color  # RGB
+                    
+                    # 将当前 batch 的整体点云添加到列表（增量添加，不覆盖之前的）
+                    self.unified_point_clouds.append({
+                        'points': unified_points,
+                        'colors': unified_colors,
+                        'batch_idx': len(self.inference_reconstructions) - 1,  # 记录 batch 索引
+                    })
+                    
+                    if self.verbose:
+                        print(f"  ✓ Added unified point cloud for batch {len(self.unified_point_clouds)}: {num_points} points")
+                
+                # ==================== 2. 为每个图像存储相机位姿信息（用于显示 frustum）====================
+                for local_idx, global_idx in enumerate(indices):
+                    # 获取推理输出
+                    output = outputs_list[local_idx]
+                    
+                    # 获取原图尺寸
+                    real_w = int(original_coords[local_idx, 4])
+                    real_h = int(original_coords[local_idx, 5])
+                    
+                    # 从 aligned_recon 获取对齐后的相机位姿
+                    colmap_image_id = local_idx + 1  # COLMAP ID 从1开始
+                    if colmap_image_id in aligned_recon.images:
+                        pyimage = aligned_recon.images[colmap_image_id]
+                        pycamera = aligned_recon.cameras[pyimage.camera_id]
+                        
+                        # 从 pycolmap 提取相机位姿 (cam_from_world 是 world2cam)
+                        R_w2c = np.array(pyimage.cam_from_world.rotation.matrix())
+                        t_w2c = np.array(pyimage.cam_from_world.translation)
+                        
+                        # 构建 world2cam 变换矩阵 (4x4)
+                        T_cam_world_aligned = np.eye(4, dtype=np.float32)
+                        T_cam_world_aligned[:3, :3] = R_w2c
+                        T_cam_world_aligned[:3, 3] = t_w2c
+                        
+                        # 构建 cam2world 变换矩阵
+                        T_world_cam_aligned = np.linalg.inv(T_cam_world_aligned).astype(np.float32)
+                        
+                        # 获取内参
+                        K_aligned = pycamera.calibration_matrix().astype(np.float32)
+                    else:
+                        # 如果图像不在重建中，使用原始推理输出的位姿
+                        T_world_cam_infer = output['camera_poses'][0].cpu().numpy()
+                        T_world_cam_aligned = T_world_cam_infer.copy()
+                        K_aligned = output['intrinsics'][0].cpu().numpy()
+                    
+                    # 创建 recovered_inference_output 字典（只包含相机信息，不包含点云）
+                    device = output['pts3d'].device if hasattr(output['pts3d'], 'device') else 'cpu'
+                    recovered_inference_output = {
+                        'image_path': str(self.image_paths[global_idx]),
+                        'image_width': real_w,
+                        'image_height': real_h,
+                        'camera_K': K_aligned,  # (3, 3)
+                        'camera_poses': torch.from_numpy(T_world_cam_aligned).unsqueeze(0).float().to(device),  # (1, 4, 4)
+                        'scale_ratio': scale_ratio,  # 保存尺度信息
+                        # 注意：不再存储单独的 pts3d，使用整体点云代替
+                    }
+                    
+                    # 添加到列表
+                    self.recovered_inference_outputs.append(recovered_inference_output)
+                
+                if self.verbose:
+                    print(f"  ✓ Added {len(indices)} images to recovered_inference_outputs for visualization")
 
                 # ==================== 合并reconstruction中间结果 ====================
                 merge_reconstruction_success = self._merge_reconstruction_intermediate_results()
@@ -2426,6 +2503,93 @@ class IncrementalFeatureMatcherSfM:
             traceback.print_exc()
             return False
 
+    # def rename_colmap_recons_and_rescale_camera(
+    #     self,
+    #     reconstruction,
+    #     image_paths,
+    #     original_coords,
+    #     img_size,
+    #     shift_point2d_to_original_res=False,
+    #     shared_camera=False,
+    # ):
+    #     # 规范化 original_coords 到 numpy
+    #     if "torch" in sys.modules and isinstance(original_coords, torch.Tensor):
+    #         original_coords_np = original_coords.detach().cpu().numpy()
+    #     else:
+    #         original_coords_np = np.asarray(original_coords)
+            
+    #     if isinstance(img_size, (list, tuple, np.ndarray)) and len(img_size) == 2:
+    #         proc_w = float(img_size[0])
+    #         proc_h = float(img_size[1])
+    #     else:
+    #         # 兼容旧逻辑：若传入标量，则假定等比缩放
+    #         proc_w = float(img_size)
+    #         proc_h = float(img_size)
+            
+    #     rescale_camera = True
+
+    #     for pyimageid in reconstruction.images:
+    #         # Reshaped the padded & resized image to the original size
+    #         # Rename the images to the original names
+    #         pyimage = reconstruction.images[pyimageid]
+    #         pycamera = reconstruction.cameras[pyimage.camera_id]
+    #         pyimage.name = image_paths[pyimageid - 1]
+
+    #         # 读取该帧原图尺寸
+    #         real_image_size = original_coords_np[pyimageid - 1, -2:]  # [W_orig, H_orig]
+    #         real_w = float(real_image_size[0])
+    #         real_h = float(real_image_size[1])
+
+    #         # 宽高方向缩放因子
+    #         # 注意：如果 preprocess 是非等比缩放，这两个值不同
+    #         sx = real_w / max(1e-8, proc_w)
+    #         sy = real_h / max(1e-8, proc_h)
+
+    #         if rescale_camera:
+    #             pred_params = copy.deepcopy(pycamera.params)
+    #             num_params = len(pred_params)
+    #             # 尝试读取模型名（可能无此属性）
+    #             model_name = getattr(pycamera, "model", "UNKNOWN")
+
+    #             # 优先处理 PINHOLE（我们在构建时使用 camera_type="PINHOLE"）
+    #             #   PINHOLE: [fx, fy, cx, cy]
+    #             if str(model_name) == "PINHOLE" or num_params == 4:
+    #                 pred_params[0] *= sx  # fx
+    #                 pred_params[1] *= sy  # fy
+    #                 pred_params[2] *= sx  # cx
+    #                 pred_params[3] *= sy  # cy
+    #             else:
+    #                 # 其他模型做近似处理：
+    #                 #   - 前两位当 fx、fy
+    #                 #   - 若存在最后两位，当 cx、cy
+    #                 if num_params >= 2:
+    #                     pred_params[0] *= sx
+    #                     pred_params[1] *= sy
+    #                 if num_params >= 4:
+    #                     pred_params[-2] *= sx
+    #                     pred_params[-1] *= sy
+    #                 # 畸变参数保持不变
+
+    #             pycamera.params = pred_params
+    #             pycamera.width = real_image_size[0]
+    #             pycamera.height = real_image_size[1]
+
+    #         if shift_point2d_to_original_res:
+    #             # 将 points2D 从 (裁剪+缩放) 坐标恢复到原图坐标
+    #             top_left = original_coords_np[pyimageid - 1, :2].astype(np.float32)  # [x1, y1]
+    #             for p2d in pyimage.points2D:
+    #                 # 先去掉裁剪偏移，再按轴缩放
+    #                 shifted = np.array([p2d.xy[0] - top_left[0],
+    #                                     p2d.xy[1] - top_left[1]], dtype=np.float32)
+    #                 p2d.xy = shifted * np.array([sx, sy], dtype=np.float32)
+
+    #         if shared_camera:
+    #             # If shared_camera, all images share the same camera
+    #             # No need to rescale any more
+    #             rescale_camera = False
+
+    #     return reconstruction
+
     def rename_colmap_recons_and_rescale_camera(
         self,
         reconstruction,
@@ -2445,73 +2609,448 @@ class IncrementalFeatureMatcherSfM:
             proc_w = float(img_size[0])
             proc_h = float(img_size[1])
         else:
-            # 兼容旧逻辑：若传入标量，则假定等比缩放
             proc_w = float(img_size)
             proc_h = float(img_size)
-            
+        
+        # ========== 优化1: 预计算所有帧参数（向量化）==========
+        real_sizes = original_coords_np[:, -2:].astype(np.float64)  # (N, 2) [W_orig, H_orig]
+        inv_proc_size = np.array([1.0 / max(1e-8, proc_w), 1.0 / max(1e-8, proc_h)])
+        scale_factors = real_sizes * inv_proc_size  # (N, 2) [sx, sy]
+        
+        # 预提取 top_left 并转换为 float32（用于 shift_point2d）
+        if shift_point2d_to_original_res:
+            top_lefts = original_coords_np[:, :2].astype(np.float32)  # (N, 2) [x1, y1]
+            # 预计算 scale_xy 数组（float32），避免循环内创建
+            scale_factors_f32 = scale_factors.astype(np.float32)  # (N, 2)
+        
         rescale_camera = True
+        processed_camera_ids = set()
+        
+        # ========== 优化2: 缓存字典引用 ==========
+        images_dict = reconstruction.images
+        cameras_dict = reconstruction.cameras
 
-        for pyimageid in reconstruction.images:
-            # Reshaped the padded & resized image to the original size
-            # Rename the images to the original names
-            pyimage = reconstruction.images[pyimageid]
-            pycamera = reconstruction.cameras[pyimage.camera_id]
-            pyimage.name = image_paths[pyimageid - 1]
+        for pyimageid in images_dict:
+            pyimage = images_dict[pyimageid]
+            idx = pyimageid - 1
+            
+            # Rename image
+            pyimage.name = image_paths[idx]
+            
+            # 获取预计算的缩放因子
+            sx, sy = scale_factors[idx]
+            real_w, real_h = real_sizes[idx]
 
-            # 读取该帧原图尺寸
-            real_image_size = original_coords_np[pyimageid - 1, -2:]  # [W_orig, H_orig]
-            real_w = float(real_image_size[0])
-            real_h = float(real_image_size[1])
-
-            # 宽高方向缩放因子
-            # 注意：如果 preprocess 是非等比缩放，这两个值不同
-            sx = real_w / max(1e-8, proc_w)
-            sy = real_h / max(1e-8, proc_h)
-
-            if rescale_camera:
-                pred_params = copy.deepcopy(pycamera.params)
+            # ========== 优化3: 相机参数处理 ==========
+            camera_id = pyimage.camera_id
+            if rescale_camera and camera_id not in processed_camera_ids:
+                pycamera = cameras_dict[camera_id]
+                pred_params = list(pycamera.params)
                 num_params = len(pred_params)
-                # 尝试读取模型名（可能无此属性）
                 model_name = getattr(pycamera, "model", "UNKNOWN")
 
-                # 优先处理 PINHOLE（我们在构建时使用 camera_type="PINHOLE"）
-                #   PINHOLE: [fx, fy, cx, cy]
                 if str(model_name) == "PINHOLE" or num_params == 4:
                     pred_params[0] *= sx  # fx
                     pred_params[1] *= sy  # fy
                     pred_params[2] *= sx  # cx
                     pred_params[3] *= sy  # cy
                 else:
-                    # 其他模型做近似处理：
-                    #   - 前两位当 fx、fy
-                    #   - 若存在最后两位，当 cx、cy
                     if num_params >= 2:
                         pred_params[0] *= sx
                         pred_params[1] *= sy
                     if num_params >= 4:
                         pred_params[-2] *= sx
                         pred_params[-1] *= sy
-                    # 畸变参数保持不变
 
                 pycamera.params = pred_params
-                pycamera.width = real_image_size[0]
-                pycamera.height = real_image_size[1]
+                pycamera.width = int(real_w)
+                pycamera.height = int(real_h)
+                
+                processed_camera_ids.add(camera_id)
+                
+                if shared_camera:
+                    rescale_camera = False
 
+            # ========== 优化4: points2D 坐标变换 ==========
             if shift_point2d_to_original_res:
-                # 将 points2D 从 (裁剪+缩放) 坐标恢复到原图坐标
-                top_left = original_coords_np[pyimageid - 1, :2].astype(np.float32)  # [x1, y1]
-                for p2d in pyimage.points2D:
-                    # 先去掉裁剪偏移，再按轴缩放
-                    shifted = np.array([p2d.xy[0] - top_left[0],
-                                        p2d.xy[1] - top_left[1]], dtype=np.float32)
-                    p2d.xy = shifted * np.array([sx, sy], dtype=np.float32)
-
-            if shared_camera:
-                # If shared_camera, all images share the same camera
-                # No need to rescale any more
-                rescale_camera = False
+                points2D_list = pyimage.points2D
+                num_points = len(points2D_list)
+                
+                if num_points > 0:
+                    # 使用预计算的参数（避免循环内创建数组）
+                    top_left = top_lefts[idx]
+                    scale_xy = scale_factors_f32[idx]
+                    
+                    # ========== 优化5: 更高效的坐标提取 ==========
+                    # 预分配数组，使用索引访问
+                    coords = np.empty((num_points, 2), dtype=np.float32)
+                    for i in range(num_points):
+                        coords[i] = points2D_list[i].xy
+                    
+                    # 向量化变换（原地操作）
+                    coords -= top_left
+                    coords *= scale_xy
+                    
+                    # ========== 优化6: 使用索引而非 enumerate ==========
+                    for i in range(num_points):
+                        points2D_list[i].xy = coords[i]
 
         return reconstruction
+
+    # def _rescale_reconstruction_to_original_size(
+    #     self,
+    #     reconstruction: pycolmap.Reconstruction,
+    #     start_idx: int,
+    #     end_idx: int,
+    #     alignment_mode: str = 'auto',  # 'auto' | 'pcl_alignment' | 'image_alignment'
+    #     image_alignment_max_error: float = 5.0,
+    #     image_alignment_min_inlier_ratio: float = 0.3,
+    # ) -> pycolmap.Reconstruction:
+    #     """
+    #     将reconstruction对齐到已知的影像pose位置
+
+    #     对齐方法：
+    #         - 方法1（点云对齐）：使用与最新SfM重建的3D点对应关系估计Sim3变换
+    #         - 方法2（影像位置对齐）：使用RANSAC将重建对齐到已知相机中心位置
+
+    #     Args:
+    #         reconstruction: pycolmap重建结果
+    #         start_idx: 起始影像索引
+    #         end_idx: 结束影像索引
+    #         image_alignment_max_error: 影像对齐RANSAC最大误差（米）
+    #         image_alignment_min_inlier_ratio: 影像对齐RANSAC最小内点比例
+    #         alignment_mode: 对齐方式，'auto' | 'pcl_alignment' | 'image_alignment'
+    #                         - 'auto': 先用方法1，失败再用方法2（默认）
+    #                         - 'pcl_alignment': 仅用方法1
+    #                         - 'image_alignment' : 仅用方法2
+
+    #     Returns:
+    #         对齐后的reconstruction
+    #     """
+    #     # 参数校验
+    #     if alignment_mode not in ('auto', 'pcl_alignment', 'image_alignment'):
+    #         raise ValueError(f"alignment_mode 必须是 'auto', 'pcl_alignment', 'image_alignment' 之一")
+
+    #     alignment_success = False
+
+    #     # ==================== 方法1：点云对齐 ====================
+    #     if alignment_mode in ('auto', 'pcl_alignment') and self.sfm_reconstructions:
+    #         if self.verbose:
+    #             print("  Attempting alignment via 3D point cloud (pcl_alignment)...")
+
+    #         tgt_recon = self.sfm_reconstructions[-1]['reconstruction']
+    #         src_recon = reconstruction
+    #         num_images = len(tgt_recon.images)
+            
+    #         # 检查影像数量是否匹配
+    #         if num_images > 0 and num_images == len(src_recon.images):
+    #             # 选择关键影像索引：首、中、尾（最多3张）
+    #             if num_images <= 3:
+    #                 sel_indices = list(range(1, num_images + 1))
+    #             else:
+    #                 sel_indices = [1, (num_images + 1) // 2, num_images]
+                
+    #             # 预先为所有选中的src影像构建空间索引
+    #             pixel_threshold = 3.0
+    #             src_spatial_indices = {}
+    #             for idx in sel_indices:
+    #                 src_image = src_recon.images[idx]
+    #                 spatial_index = {}
+    #                 for pt2d in src_image.points2D:
+    #                     if pt2d.point3D_id != -1:
+    #                         key = (int(round(pt2d.xy[0])), int(round(pt2d.xy[1])))
+    #                         if key not in spatial_index:
+    #                             spatial_index[key] = []
+    #                         spatial_index[key].append((int(pt2d.point3D_id), np.asarray(pt2d.xy, dtype=np.float64)))
+    #                 src_spatial_indices[idx] = spatial_index
+                
+    #             # 批量查找匹配点
+    #             point_correspondences = []
+    #             for idx in sel_indices:
+    #                 correspondences = self._find_single_images_pair_matches(
+    #                     tgt_recon.images[idx],
+    #                     src_recon.images[idx],
+    #                     src_spatial_indices[idx],
+    #                     pixel_threshold
+    #                 )
+    #                 point_correspondences.extend(correspondences)
+                
+    #             # 收集有效的3D点对
+    #             if point_correspondences:
+    #                 tgt_points3D = tgt_recon.points3D
+    #                 src_points3D = src_recon.points3D
+                    
+    #                 # 使用列表推导式一次性收集所有有效点对
+    #                 valid_pairs = [
+    #                     (tgt_points3D[tgt_id].xyz, src_points3D[src_id].xyz)
+    #                     for tgt_id, src_id, _ in point_correspondences
+    #                     if tgt_id in tgt_points3D and src_id in src_points3D
+    #                 ]
+                    
+    #                 if len(valid_pairs) >= 3:
+    #                     tgt_pts3d = np.array([p[0] for p in valid_pairs], dtype=np.float64)
+    #                     src_pts3d = np.array([p[1] for p in valid_pairs], dtype=np.float64)
+                        
+    #                     try:
+    #                         sim3_transform = self._estimate_sim3_transform(src_pts3d, tgt_pts3d)
+    #                         if sim3_transform is not None:
+    #                             reconstruction.transform(sim3_transform)
+    #                             alignment_success = True
+    #                             if self.verbose:
+    #                                 print(f"  ✓ Aligned via 3D point cloud")
+    #                                 print(f"    Scale: {sim3_transform.scale:.6f}, Points: {len(src_pts3d)}")
+    #                     except Exception as e:
+    #                         if self.verbose:
+    #                             print(f"  Warning: Sim3 estimation failed: {e}")
+    #                 elif self.verbose:
+    #                     print(f"  Warning: Not enough 3D points ({len(valid_pairs)} < 3)")
+    #             elif self.verbose:
+    #                 print("  Warning: No point correspondences found")
+
+    #     # ==================== 方法2：GPS位置对齐 ====================
+    #     if not alignment_success and alignment_mode in ('auto', 'image_alignment'):
+    #         if self.verbose:
+    #             print("  Using GPS-based alignment...")
+            
+    #         num_images = end_idx - start_idx
+            
+    #         # 预分配数组，避免多次append
+    #         valid_names = [f"image_{i + 1}" for i in range(num_images)]
+    #         tgt_locations = np.empty((num_images, 3), dtype=np.float64)
+            
+    #         for i, idx in enumerate(range(start_idx, end_idx)):
+    #             extrinsic = self.ori_extrinsic[idx]
+    #             R_camera = np.asarray(extrinsic['R_camera'], dtype=np.float64)
+    #             tvec = np.asarray(extrinsic['tvec'], dtype=np.float64)
+    #             # 相机位置 = -R^T @ t
+    #             tgt_locations[i] = -R_camera.T @ tvec
+            
+    #         if num_images > 0:
+    #             ransac_options = pycolmap.RANSACOptions()
+    #             ransac_options.max_error = image_alignment_max_error
+    #             ransac_options.min_inlier_ratio = image_alignment_min_inlier_ratio
+
+    #             try:
+    #                 sim3d = pycolmap.align_reconstruction_to_locations(
+    #                     src=reconstruction,
+    #                     tgt_image_names=valid_names,
+    #                     tgt_locations=tgt_locations,
+    #                     min_common_points=3,
+    #                     ransac_options=ransac_options
+    #                 )
+    #                 if sim3d is not None:
+    #                     reconstruction.transform(sim3d)
+    #                     if self.verbose:
+    #                         print(f"  ✓ Aligned via GPS poses")
+    #                         print(f"    Scale: {sim3d.scale:.6f}, Images: {num_images}")
+    #                 elif self.verbose:
+    #                     print("  Warning: Failed to align reconstruction")
+    #             except Exception as e:
+    #                 if self.verbose:
+    #                     print(f"  Error aligning reconstruction: {e}")
+    #         else:
+    #             if self.verbose:
+    #                 print("  Warning: No images for alignment")
+            
+    #     return reconstruction
+
+    # def _rescale_reconstruction_to_original_size(
+    #     self,
+    #     reconstruction: pycolmap.Reconstruction,
+    #     start_idx: int,
+    #     end_idx: int,
+    #     alignment_mode: str = 'auto',  # 'auto' | 'pcl_alignment' | 'image_alignment'
+    #     image_alignment_max_error: float = 5.0,
+    #     image_alignment_min_inlier_ratio: float = 0.3,
+    # ) -> pycolmap.Reconstruction:
+    #     """
+    #     将reconstruction对齐到已知的影像pose位置
+
+    #     对齐方法：
+    #         - 方法1（点云对齐）：使用与最新SfM重建的3D点对应关系估计Sim3变换
+    #         - 方法2（影像位置对齐）：使用RANSAC将重建对齐到已知相机中心位置
+
+    #     Args:
+    #         reconstruction: pycolmap重建结果
+    #         start_idx: 起始影像索引
+    #         end_idx: 结束影像索引
+    #         image_alignment_max_error: 影像对齐RANSAC最大误差（米）
+    #         image_alignment_min_inlier_ratio: 影像对齐RANSAC最小内点比例
+    #         alignment_mode: 对齐方式，'auto' | 'pcl_alignment' | 'image_alignment'
+    #                         - 'auto': 先用方法1，失败再用方法2（默认）
+    #                         - 'pcl_alignment': 仅用方法1
+    #                         - 'image_alignment' : 仅用方法2
+
+    #     Returns:
+    #         对齐后的reconstruction
+    #     """
+    #     # 参数校验
+    #     valid_modes = {'auto', 'pcl_alignment', 'image_alignment'}
+    #     if alignment_mode not in valid_modes:
+    #         raise ValueError(f"alignment_mode 必须是 {valid_modes} 之一，当前为: {alignment_mode}")
+
+    #     alignment_success = False
+    #     use_method1 = alignment_mode in ('auto', 'pcl_alignment')
+    #     use_method2 = alignment_mode in ('auto', 'image_alignment')
+
+    #     # 方法1：直接通过3D点云配准到最新的SfM重建（简化版）
+    #     if use_method1:
+    #         if len(self.sfm_reconstructions) > 0:
+    #             if self.verbose:
+    #                 print("  Attempting alignment to latest SfM via 3D point cloud (pcl_alignment)...")
+
+    #             sfm_result = self.sfm_reconstructions[-1]  # 直接使用最新的重建
+    #             tgt_reconstruction = sfm_result['reconstruction']
+    #             src_reconstruction = reconstruction
+    #             num_tgt_images = len(tgt_reconstruction.images)
+    #             num_src_images = len(src_reconstruction.images)
+    #             sel_image_idx = 0
+    #             if num_tgt_images != 0 and num_src_images != 0 and num_tgt_images == num_src_images:
+    #                 if num_tgt_images <=2:
+    #                     sel_image_idx = list(range(1, num_tgt_images + 1))
+    #                 elif num_tgt_images == 3:
+    #                     sel_image_idx = [1, 2, 3]
+    #                 else:
+    #                     sel_image_idx = [1]
+    #                     sel_image_idx.append((num_tgt_images + 1) // 2)
+    #                     sel_image_idx. append(num_tgt_images)
+
+    #             point_correspondences = []
+    #             pixel_threshold = 3.0
+    #             if sel_image_idx != 0:
+    #                 for index in sel_image_idx:
+    #                     tgt_image_obj = tgt_reconstruction.images[index]
+    #                     src_image_obj = src_reconstruction.images[index]
+
+    #                     # 为src图像建立空间索引
+    #                     src_spatial_index = {}
+    #                     for point2D in src_image_obj.points2D:
+    #                         if point2D.point3D_id != -1:
+    #                             grid_key = (int(round(point2D.xy[0])), int(round(point2D.xy[1])))
+    #                             if grid_key not in src_spatial_index:
+    #                                 src_spatial_index[grid_key] = []
+    #                             # 保存浮点坐标便于距离计算
+    #                             src_spatial_index[grid_key].append(
+    #                                 (int(point2D.point3D_id), np.asarray(point2D.xy, dtype=np.float64))
+    #                             )
+
+    #                     correspondences = self._find_single_images_pair_matches(
+    #                         tgt_image_obj, 
+    #                         src_image_obj, 
+    #                         src_spatial_index, 
+    #                         pixel_threshold, 
+    #                     )
+    #                     point_correspondences.extend(correspondences)
+
+    #             if len(point_correspondences) == 0:
+    #                 print("  Warning: No point correspondences found between overlapping regions")
+    #                 return False
+
+    #             tgt_pts3d = []
+    #             src_pts3d = []
+    #             for tgt_pt3d_id, src_pt3d_id, _ in point_correspondences:
+    #                 if tgt_pt3d_id in tgt_reconstruction.points3D and src_pt3d_id in src_reconstruction.points3D:
+    #                     tgt_pts3d.append(tgt_reconstruction.points3D[tgt_pt3d_id].xyz)
+    #                     src_pts3d.append(src_reconstruction.points3D[src_pt3d_id].xyz)
+                
+    #             # 需要至少3个点来估计Sim3变换
+    #             if len(src_pts3d) >= 3 and len(tgt_pts3d) >= 3:
+    #                 # 取两个点云中较少的数量，进行配准
+    #                 min_points = min(len(src_pts3d), len(tgt_pts3d))
+    #                 src_pts3d = np.asarray(src_pts3d[:min_points], dtype=np.float64)
+    #                 tgt_pts3d = np.asarray(tgt_pts3d[:min_points], dtype=np.float64)
+
+    #                 # 估计 Sim3（src → tgt）
+    #                 try:
+    #                     sim3_transform = self._estimate_sim3_transform(src_pts3d, tgt_pts3d)
+    #                     if sim3_transform is not None:
+    #                         reconstruction.transform(sim3_transform)
+    #                         alignment_success = True
+    #                         if self.verbose:
+    #                             print(f"  ✓ Reconstruction aligned to latest SfM via 3D point cloud")
+    #                             print(f"    Scale: {sim3_transform.scale:.6f}")
+    #                             print(f"    Used 3D points: {len(src_pts3d)}")
+    #                     else:
+    #                         if self.verbose:
+    #                             print("  Warning: Failed to compute Sim3 transform")
+    #                 except Exception as e:
+    #                     if self.verbose:
+    #                         print(f"  Warning: Sim3 estimation failed: {e}")
+    #                         import traceback; traceback.print_exc()
+    #             else:
+    #                 if self.verbose:
+    #                     print(f"  Warning: Not enough 3D points for Sim3 estimation (src={len(src_pts3d)}, tgt={len(tgt_pts3d)})")
+
+    #     if not alignment_success and self.verbose:
+    #         print("  No successful alignment with SfM reconstructions, falling back to GPS-based alignment...")
+
+    #     # 方法2：如果重投影对齐失败或不可用，使用GPS位置对齐（原有方法）
+    #     if use_method2 and not alignment_success:
+    #         if self.verbose:
+    #             print(f"  Using GPS-based alignment...")
+        
+    #         # 1. 提取reconstruction中的影像名称
+    #         tgt_image_names = []
+    #         for image_id, image in reconstruction.images.items():
+    #             tgt_image_names.append(image.name)
+            
+    #         # 2. 从已知pose中提取对应的相机位置（世界坐标）
+    #         tgt_locations = []
+    #         valid_names = []
+
+    #         for fidx, idx in enumerate(range(start_idx, end_idx)):
+    #             extrinsic_info = self.ori_extrinsic[idx]
+    #             # image_name = extrinsic_info['image_name']  # ← 不再使用这个实际文件名
+
+    #             # 使用 reconstruction 中的影像名称格式
+    #             image_name_in_reconstruction = f"image_{fidx + 1}"
+
+    #             # 计算相机在世界坐标系中的位置
+    #             R_camera = np.array(extrinsic_info['R_camera'])
+    #             tvec = np.array(extrinsic_info['tvec'])
+
+    #             # 相机位置 = -R^T @ t
+    #             camera_center = -R_camera.T @ tvec
+                
+    #             tgt_locations.append(camera_center)
+    #             valid_names.append(image_name_in_reconstruction)  
+            
+    #         if len(valid_names) == 0:
+    #             print("  Warning: No matching images found for alignment")
+    #             return reconstruction
+            
+    #         tgt_locations = np.array(tgt_locations, dtype=np.float64)
+
+    #         # 添加 ransac_options 定义
+    #         ransac_options = pycolmap.RANSACOptions()
+    #         ransac_options.max_error = image_alignment_max_error  # 最大误差阈值（米）
+    #         ransac_options.min_inlier_ratio = image_alignment_min_inlier_ratio  # 最小内点比例
+
+    #         try:
+    #             sim3d = pycolmap.align_reconstruction_to_locations(
+    #                 src=reconstruction,
+    #                 tgt_image_names=valid_names,
+    #                 tgt_locations=tgt_locations,
+    #                 min_common_points=3,  # ✓ 参数名是正确的
+    #                 ransac_options=ransac_options  # ✓ 添加这个必需的参数
+    #             )
+    #             if sim3d is not None:
+    #                 # 应用变换
+    #                 reconstruction.transform(sim3d)
+                    
+    #                 if self.verbose:
+    #                     print(f"  ✓ Reconstruction aligned to known poses")
+    #                     print(f"    Scale: {sim3d.scale}")
+    #                     print(f"    Number of aligned images: {len(valid_names)}")
+    #             else:
+    #                 print("  Warning: Failed to align reconstruction")
+                    
+    #         except Exception as e:
+    #             print(f"  Error aligning reconstruction: {e}")
+    #             import traceback
+    #             traceback.print_exc()
+            
+    #     return reconstruction
 
     def _rescale_reconstruction_to_original_size(
         self,
@@ -2536,9 +3075,6 @@ class IncrementalFeatureMatcherSfM:
             image_alignment_max_error: 影像对齐RANSAC最大误差（米）
             image_alignment_min_inlier_ratio: 影像对齐RANSAC最小内点比例
             alignment_mode: 对齐方式，'auto' | 'pcl_alignment' | 'image_alignment'
-                            - 'auto': 先用方法1，失败再用方法2（默认）
-                            - 'pcl_alignment': 仅用方法1
-                            - 'image_alignment' : 仅用方法2
 
         Returns:
             对齐后的reconstruction
@@ -2552,72 +3088,70 @@ class IncrementalFeatureMatcherSfM:
         use_method1 = alignment_mode in ('auto', 'pcl_alignment')
         use_method2 = alignment_mode in ('auto', 'image_alignment')
 
-        # 方法1：直接通过3D点云配准到最新的SfM重建（简化版）
-        if use_method1:
-            if len(self.sfm_reconstructions) > 0:
-                if self.verbose:
-                    print("  Attempting alignment to latest SfM via 3D point cloud (pcl_alignment)...")
+        # 方法1：直接通过3D点云配准到最新的SfM重建
+        if use_method1 and len(self.sfm_reconstructions) > 0:
+            if self.verbose:
+                print("  Attempting alignment to latest SfM via 3D point cloud (pcl_alignment)...")
 
-                sfm_result = self.sfm_reconstructions[-1]  # 直接使用最新的重建
-                tgt_reconstruction = sfm_result['reconstruction']
-                src_reconstruction = reconstruction
-                num_tgt_images = len(tgt_reconstruction.images)
-                num_src_images = len(src_reconstruction.images)
-                sel_image_idx = 0
-                if num_tgt_images != 0 and num_src_images != 0 and num_tgt_images == num_src_images:
-                    if num_tgt_images <=2:
-                        sel_image_idx = list(range(1, num_tgt_images + 1))
-                    elif num_tgt_images == 3:
-                        sel_image_idx = [1, 2, 3]
-                    else:
-                        sel_image_idx = [1]
-                        sel_image_idx.append((num_tgt_images + 1) // 2)
-                        sel_image_idx. append(num_tgt_images)
+            sfm_result = self.sfm_reconstructions[-1]
+            tgt_reconstruction = sfm_result['reconstruction']
+            src_reconstruction = reconstruction
+            num_tgt_images = len(tgt_reconstruction.images)
+            num_src_images = len(src_reconstruction.images)
+            
+            if num_tgt_images != 0 and num_src_images != 0 and num_tgt_images == num_src_images:
+                # 优化：直接生成选择的图像索引列表
+                if num_tgt_images <= 2:
+                    sel_image_idx = list(range(1, num_tgt_images + 1))
+                elif num_tgt_images == 3:
+                    sel_image_idx = [1, 2, 3]
+                else:
+                    sel_image_idx = [1, (num_tgt_images + 1) // 2, num_tgt_images]
 
                 point_correspondences = []
                 pixel_threshold = 3.0
-                if sel_image_idx != 0:
-                    for index in sel_image_idx:
-                        tgt_image_obj = tgt_reconstruction.images[index]
-                        src_image_obj = src_reconstruction.images[index]
+                
+                for index in sel_image_idx:
+                    tgt_image_obj = tgt_reconstruction.images[index]
+                    src_image_obj = src_reconstruction.images[index]
 
-                        # 为src图像建立空间索引
-                        src_spatial_index = {}
-                        for point2D in src_image_obj.points2D:
-                            if point2D.point3D_id != -1:
-                                grid_key = (int(round(point2D.xy[0])), int(round(point2D.xy[1])))
-                                if grid_key not in src_spatial_index:
-                                    src_spatial_index[grid_key] = []
-                                # 保存浮点坐标便于距离计算
-                                src_spatial_index[grid_key].append(
-                                    (int(point2D.point3D_id), np.asarray(point2D.xy, dtype=np.float64))
-                                )
+                    # 优化：使用defaultdict简化空间索引构建
+                    src_spatial_index = defaultdict(list)
+                    
+                    for point2D in src_image_obj.points2D:
+                        if point2D.point3D_id != -1:
+                            grid_key = (int(round(point2D.xy[0])), int(round(point2D.xy[1])))
+                            src_spatial_index[grid_key].append(
+                                (int(point2D.point3D_id), np.asarray(point2D.xy, dtype=np.float64))
+                            )
 
-                        correspondences = self._find_single_images_pair_matches(
-                            tgt_image_obj, 
-                            src_image_obj, 
-                            src_spatial_index, 
-                            pixel_threshold, 
-                        )
-                        point_correspondences.extend(correspondences)
+                    correspondences = self._find_single_images_pair_matches(
+                        tgt_image_obj, 
+                        src_image_obj, 
+                        src_spatial_index, 
+                        pixel_threshold, 
+                    )
+                    point_correspondences.extend(correspondences)
 
                 if len(point_correspondences) == 0:
                     print("  Warning: No point correspondences found between overlapping regions")
                     return False
 
-                tgt_pts3d = []
-                src_pts3d = []
-                for tgt_pt3d_id, src_pt3d_id, _ in point_correspondences:
-                    if tgt_pt3d_id in tgt_reconstruction.points3D and src_pt3d_id in src_reconstruction.points3D:
-                        tgt_pts3d.append(tgt_reconstruction.points3D[tgt_pt3d_id].xyz)
-                        src_pts3d.append(src_reconstruction.points3D[src_pt3d_id].xyz)
+                # 优化：批量提取3D点坐标
+                tgt_points3D = tgt_reconstruction.points3D
+                src_points3D = src_reconstruction.points3D
                 
-                # 需要至少3个点来估计Sim3变换
-                if len(src_pts3d) >= 3 and len(tgt_pts3d) >= 3:
-                    # 取两个点云中较少的数量，进行配准
-                    min_points = min(len(src_pts3d), len(tgt_pts3d))
-                    src_pts3d = np.asarray(src_pts3d[:min_points], dtype=np.float64)
-                    tgt_pts3d = np.asarray(tgt_pts3d[:min_points], dtype=np.float64)
+                # 使用列表推导式一次性过滤和提取
+                valid_pairs = [
+                    (tgt_pt3d_id, src_pt3d_id)
+                    for tgt_pt3d_id, src_pt3d_id, _ in point_correspondences
+                    if tgt_pt3d_id in tgt_points3D and src_pt3d_id in src_points3D
+                ]
+                
+                if len(valid_pairs) >= 3:
+                    # 批量提取坐标
+                    tgt_pts3d = np.array([tgt_points3D[pid].xyz for pid, _ in valid_pairs], dtype=np.float64)
+                    src_pts3d = np.array([src_points3D[pid].xyz for _, pid in valid_pairs], dtype=np.float64)
 
                     # 估计 Sim3（src → tgt）
                     try:
@@ -2638,63 +3172,67 @@ class IncrementalFeatureMatcherSfM:
                             import traceback; traceback.print_exc()
                 else:
                     if self.verbose:
-                        print(f"  Warning: Not enough 3D points for Sim3 estimation (src={len(src_pts3d)}, tgt={len(tgt_pts3d)})")
+                        print(f"  Warning: Not enough 3D points for Sim3 estimation ({len(valid_pairs)} pairs)")
 
         if not alignment_success and self.verbose:
             print("  No successful alignment with SfM reconstructions, falling back to GPS-based alignment...")
 
-        # 方法2：如果重投影对齐失败或不可用，使用GPS位置对齐（原有方法）
+        # 方法2：GPS位置对齐
         if use_method2 and not alignment_success:
             if self.verbose:
                 print(f"  Using GPS-based alignment...")
         
-            # 1. 提取reconstruction中的影像名称
-            tgt_image_names = []
-            for image_id, image in reconstruction.images.items():
-                tgt_image_names.append(image.name)
+            # 优化：使用列表推导式提取影像名称
+            tgt_image_names = [image.name for image in reconstruction.images.values()]
             
-            # 2. 从已知pose中提取对应的相机位置（世界坐标）
-            tgt_locations = []
-            valid_names = []
-
-            for fidx, idx in enumerate(range(start_idx, end_idx)):
+            # 优化：向量化计算相机位置
+            num_images = end_idx - start_idx
+            indices = range(start_idx, end_idx)
+            
+            # 预提取所有外参数据
+            R_cameras = []
+            tvecs = []
+            for idx in indices:
                 extrinsic_info = self.ori_extrinsic[idx]
-                # image_name = extrinsic_info['image_name']  # ← 不再使用这个实际文件名
-
-                # 使用 reconstruction 中的影像名称格式
-                image_name_in_reconstruction = f"image_{fidx + 1}"
-
-                # 计算相机在世界坐标系中的位置
-                R_camera = np.array(extrinsic_info['R_camera'])
-                tvec = np.array(extrinsic_info['tvec'])
-
-                # 相机位置 = -R^T @ t
-                camera_center = -R_camera.T @ tvec
-                
-                tgt_locations.append(camera_center)
-                valid_names.append(image_name_in_reconstruction)  
+                R_cameras.append(extrinsic_info['R_camera'])
+                tvecs.append(extrinsic_info['tvec'])
+            
+            # 转为numpy数组进行向量化计算
+            R_cameras = np.array(R_cameras, dtype=np.float64)  # (N, 3, 3)
+            tvecs = np.array(tvecs, dtype=np.float64)  # (N, 3) or (N, 3, 1)
+            
+            # 确保 tvecs 形状正确
+            if tvecs.ndim == 2:
+                tvecs = tvecs[..., np.newaxis]  # (N, 3, 1)
+            
+            # 向量化计算：camera_center = -R^T @ t
+            # 使用 einsum 或 matmul 进行批量矩阵乘法
+            R_cameras_T = np.transpose(R_cameras, (0, 2, 1))  # (N, 3, 3)
+            camera_centers = -np.matmul(R_cameras_T, tvecs).squeeze(-1)  # (N, 3)
+            
+            tgt_locations = camera_centers
+            
+            # 生成有效名称列表
+            valid_names = [f"image_{fidx + 1}" for fidx in range(num_images)]
             
             if len(valid_names) == 0:
                 print("  Warning: No matching images found for alignment")
                 return reconstruction
-            
-            tgt_locations = np.array(tgt_locations, dtype=np.float64)
 
-            # 添加 ransac_options 定义
+            # RANSAC 对齐
             ransac_options = pycolmap.RANSACOptions()
-            ransac_options.max_error = image_alignment_max_error  # 最大误差阈值（米）
-            ransac_options.min_inlier_ratio = image_alignment_min_inlier_ratio  # 最小内点比例
+            ransac_options.max_error = image_alignment_max_error
+            ransac_options.min_inlier_ratio = image_alignment_min_inlier_ratio
 
             try:
                 sim3d = pycolmap.align_reconstruction_to_locations(
                     src=reconstruction,
                     tgt_image_names=valid_names,
                     tgt_locations=tgt_locations,
-                    min_common_points=3,  # ✓ 参数名是正确的
-                    ransac_options=ransac_options  # ✓ 添加这个必需的参数
+                    min_common_points=3,
+                    ransac_options=ransac_options
                 )
                 if sim3d is not None:
-                    # 应用变换
                     reconstruction.transform(sim3d)
                     
                     if self.verbose:
@@ -3868,8 +4406,6 @@ class IncrementalFeatureMatcherSfM:
         
     #     return True
 
-
-
     def _merge_reconstruction_intermediate_results(self) -> bool:
         """
         合并reconstruction中间结果
@@ -3877,13 +4413,18 @@ class IncrementalFeatureMatcherSfM:
         将最新的reconstruction与之前已合并的reconstruction合并，
         通过重叠影像进行对齐。合并结果存储在 self.merged_reconstruction 中。
         
+        直接使用 merge_construction.py 中的 merge_reconstructions 函数实现。
+        
         Returns:
             True if successful, False otherwise
         """
+        
         # 如果这是第一个reconstruction，直接设置为merged
         if len(self.inference_reconstructions) == 1:
             self.merged_reconstruction = self.inference_reconstructions[0]['reconstruction']
             merged_recon = self.merged_reconstruction
+            # 提取 merged 点云用于可视化
+            self._update_merged_point_cloud_for_visualization(merged_recon)
             # 保存merged_reconstruction
             temp_path = self.output_dir / "temp_merged" / f"merged_{len(self.inference_reconstructions)}"
             temp_path.mkdir(parents=True, exist_ok=True)
@@ -3892,1493 +4433,87 @@ class IncrementalFeatureMatcherSfM:
             self.export_reconstruction_to_las(merged_recon, str(temp_path / "points3D.las"))
             return True
 
-        # 获取前一个已合并的reconstruction和当前新的reconstruction
-        prev_recon = self.merged_reconstruction
-        # prev_recon_data = self.inference_reconstructions[-2]
-        # prev_recon = prev_recon_data['reconstruction']
-
+        # 获取当前reconstruction信息
         curr_recon_data = self.inference_reconstructions[-1]
-        curr_recon = curr_recon_data['reconstruction']
-
-        # 1. 获取重叠区域的影像ID（Reconstruction中影像ID是从1开始的）
-        # prev_recon中倒数overlap个影像
-        prev_overlap_image_ids = list(range(
-            len(prev_recon.images) - self.overlap + 1,
-            len(prev_recon.images) + 1
-        ))
-        # curr_recon中前overlap个影像
-        curr_overlap_image_ids = list(range(
-            1, self.overlap + 1
-        ))
-
-        # 检查重叠影像数量是否匹配
-        if len(prev_overlap_image_ids) != len(curr_overlap_image_ids):
+        
+        # 1. 临时保存两个reconstruction到磁盘
+        temp_base = self.output_dir / "temp_merge_input"
+        temp_base.mkdir(parents=True, exist_ok=True)
+        
+        # 保存prev_recon (已合并的)
+        prev_dir = temp_base / "prev"
+        prev_dir.mkdir(parents=True, exist_ok=True)
+        self.merged_reconstruction.write_text(str(prev_dir))
+        
+        # 保存curr_recon (当前的)
+        curr_dir = temp_base / "curr"
+        curr_dir.mkdir(parents=True, exist_ok=True)
+        curr_recon_data['reconstruction'].write_text(str(curr_dir))
+        
+        # 输出目录
+        output_dir = self.output_dir / "temp_merged" / f"merged_{len(self.inference_reconstructions)}"
+        
+        if self.verbose:
+            print(f"\n=== 使用 merge_reconstructions 进行合并 ===")
+            print(f"  prev_dir: {prev_dir}")
+            print(f"  curr_dir: {curr_dir}")
+            print(f"  output_dir: {output_dir}")
+        
+        # 2. 调用 merge_reconstructions 函数
+        merged_recon = merge_reconstructions(
+            model_dir1=str(prev_dir),
+            model_dir2=str(curr_dir),
+            output_dir=str(output_dir),
+            overlap_count=self.overlap,
+            translation_only=True,  # 初始对齐只做平移
+            use_ransac=False,
+            # 点云融合参数
+            point_fusion=True,
+            fusion_method="2d_matching",
+            cell_sizes=[1, 3, 5, 10],
+            keep_unmatched_overlap=True,  # 保留重叠区未匹配点
+            spatial_dedup_threshold=0.1,
+            # 精化对齐参数
+            refine_alignment=True,
+            refine_cell_range=(1, 3),
+            refine_stages=[
+                (None, "translation"),       # 第1阶段：不筛选距离，只平移
+                (10.0, "scale_translation"), # 第2阶段：dist<=10m
+                (5.0, "scale_translation"),  # 第3阶段：dist<=5m
+                (2.0, "scale_translation"),  # 第4阶段：dist<=2m
+                (1.0, "scale_translation"),  # 第5阶段：dist<=1m
+                (0.5, "scale_translation"),  # 第6阶段：dist<=0.5m
+            ],
+            voxel_size=4,
+            statistical_filter=False,
+            min_track_length=2,
+            boundary_filter=True,
+            filter_edge_margin=50,
+            verbose=self.verbose
+        )
+        
+        # 3. 检查合并结果
+        if merged_recon is None:
             if self.verbose:
-                print(f"  Warning: Overlapping image count mismatch")
+                print(f"  ✗ 合并失败")
             return False
-
-        # 2. 构建prev重叠区的3D-2D对应关系
-        # {
-        #     3d_point_id: {
-        #         'xyz': np.array([x, y, z]),           # 3D点坐标（世界坐标系）
-        #         'color': np.array([r, g, b]),         # 3D点颜色（RGB，0-255）
-        #         'mean_reproj_error': float,           # 该3D点所有观测的平均重投影误差（像素）
-        #         'observations': [                      # 所有观测到该3D点的2D点
-        #             {
-        #                 'image_id': 1,                 # 影像ID（在reconstruction中的ID）
-        #                 '2d_idx': 123,                 # 2D点在该影像points2D列表中的索引
-        #                 '2d_xy': np.array([x, y]),     # 2D像素坐标（观测值）
-        #                 'reproj_error': float          # 该观测的重投影误差（像素）
-        #                                                # -1.0表示计算失败（如点在相机后面）
-        #             },
-        #             {
-        #                 'image_id': 2,
-        #                 '2d_idx': 456,
-        #                 '2d_xy': np.array([x, y]),
-        #                 'reproj_error': float
-        #             },
-        #             # ... 更多观测
-        #         ]
-        #     },
-        #     # ... 更多3D点
-        # }
-
-        # 优化版本 - 使用 track 信息，并计算重投影误差
-        prev_3d_to_2d_map = {}
-        # 直接从3D点的track中提取信息，只保留重叠区影像的观测
-        prev_overlap_image_set = set(prev_overlap_image_ids)
-
-        for point3D_id, point3D in prev_recon.points3D.items():
-            observations = []
-            point3D_xyz = np.array(point3D.xyz, dtype=np.float64)
-            
-            # 遍历该3D点的所有track元素
-            for track_element in point3D.track.elements:
-                # 只保留重叠区影像的观测
-                if track_element.image_id in prev_overlap_image_set:
-                    image_id = track_element.image_id
-                    point2D_idx = track_element.point2D_idx
-                    
-                    # 获取影像和相机信息
-                    image = prev_recon.images[image_id]
-                    camera = prev_recon.cameras[image.camera_id]
-                    
-                    # 获取观测到的2D坐标
-                    point2D_xy = np.array(image.points2D[point2D_idx].xy, dtype=np.float64)
-                    
-                    # 计算重投影误差
-                    try:
-                        # 将3D点从世界坐标系转到相机坐标系
-                        point3D_cam = image.cam_from_world * point3D_xyz
-                        
-                        # 投影到像素坐标
-                        point2D_proj = camera.img_from_cam(point3D_cam)
-                        
-                        # 计算重投影误差（欧氏距离）
-                        reproj_error = float(np.linalg.norm(point2D_xy - point2D_proj))
-                    except Exception as e:
-                        # 如果计算失败，标记为无效
-                        reproj_error = -1.0
-                    
-                    observations.append({
-                        'image_id': image_id,
-                        '2d_idx': point2D_idx,
-                        '2d_xy': point2D_xy,
-                        'reproj_error': reproj_error  # 新增：重投影误差
-                    })
-            
-            # 只保留在重叠区有观测的3D点
-            if len(observations) > 0:
-                # 计算该3D点的平均重投影误差
-                valid_errors = [obs['reproj_error'] for obs in observations if obs['reproj_error'] >= 0]
-                mean_reproj_error = float(np.mean(valid_errors)) if valid_errors else -1.0
-                
-                prev_3d_to_2d_map[point3D_id] = {
-                    'xyz': np.array(point3D.xyz, dtype=np.float64),
-                    'color': np.array(point3D.color, dtype=np.uint8),
-                    'observations': observations,
-                    'mean_reproj_error': mean_reproj_error  # 新增：平均重投影误差
-                }
-
-        if self.verbose:
-            print(f"  Prev重叠区: {len(prev_3d_to_2d_map)} 个3D点")
-            total_prev_obs = sum(len(v['observations']) for v in prev_3d_to_2d_map.values())
-            print(f"  Prev重叠区: {total_prev_obs} 个2D观测")
-            
-            # 统计重投影误差
-            all_prev_errors = []
-            for data in prev_3d_to_2d_map.values():
-                for obs in data['observations']:
-                    if obs['reproj_error'] >= 0:
-                        all_prev_errors.append(obs['reproj_error'])
-            
-            if all_prev_errors:
-                print(f"  Prev重投影误差统计:")
-                print(f"    平均: {np.mean(all_prev_errors):.6f} 像素")
-                print(f"    中位数: {np.median(all_prev_errors):.6f} 像素")
-                print(f"    最大: {np.max(all_prev_errors):.6f} 像素")
-                good_obs = sum(e < 1.0 for e in all_prev_errors)
-                print(f"    <1像素: {good_obs}/{len(all_prev_errors)} ({100*good_obs/len(all_prev_errors):.1f}%)")
-
-        # curr同理
-        curr_overlap_image_set = set(curr_overlap_image_ids)
-        curr_3d_to_2d_map = {}
-
-        for point3D_id, point3D in curr_recon.points3D.items():
-            observations = []
-            point3D_xyz = np.array(point3D.xyz, dtype=np.float64)
-            
-            for track_element in point3D.track.elements:
-                if track_element.image_id in curr_overlap_image_set:
-                    image_id = track_element.image_id
-                    point2D_idx = track_element.point2D_idx
-                    
-                    # 获取影像和相机信息
-                    image = curr_recon.images[image_id]
-                    camera = curr_recon.cameras[image.camera_id]
-                    
-                    # 获取观测到的2D坐标
-                    point2D_xy = np.array(image.points2D[point2D_idx].xy, dtype=np.float64)
-                    
-                    # 计算重投影误差
-                    try:
-                        # 将3D点从世界坐标系转到相机坐标系
-                        point3D_cam = image.cam_from_world * point3D_xyz
-                        
-                        # 投影到像素坐标
-                        point2D_proj = camera.img_from_cam(point3D_cam)
-                        
-                        # 计算重投影误差（欧氏距离）
-                        reproj_error = float(np.linalg.norm(point2D_xy - point2D_proj))
-                    except Exception as e:
-                        reproj_error = -1.0
-                    
-                    observations.append({
-                        'image_id': image_id,
-                        '2d_idx': point2D_idx,
-                        '2d_xy': point2D_xy,
-                        'reproj_error': reproj_error
-                    })
-            
-            if len(observations) > 0:
-                # 计算该3D点的平均重投影误差
-                valid_errors = [obs['reproj_error'] for obs in observations if obs['reproj_error'] >= 0]
-                mean_reproj_error = float(np.mean(valid_errors)) if valid_errors else -1.0
-                
-                curr_3d_to_2d_map[point3D_id] = {
-                    'xyz': np.array(point3D.xyz, dtype=np.float64),
-                    'color': np.array(point3D.color, dtype=np.uint8),
-                    'observations': observations,
-                    'mean_reproj_error': mean_reproj_error
-                }
-                
-        if self.verbose:
-            print(f"  Curr重叠区: {len(curr_3d_to_2d_map)} 个3D点")
-            total_curr_obs = sum(len(v['observations']) for v in curr_3d_to_2d_map.values())
-            print(f"  Curr重叠区: {total_curr_obs} 个2D观测")
-            
-            # 统计重投影误差
-            all_curr_errors = []
-            for data in curr_3d_to_2d_map.values():
-                for obs in data['observations']:
-                    if obs['reproj_error'] >= 0:
-                        all_curr_errors.append(obs['reproj_error'])
-            
-            if all_curr_errors:
-                print(f"  Curr重投影误差统计:")
-                print(f"    平均: {np.mean(all_curr_errors):.6f} 像素")
-                print(f"    中位数: {np.median(all_curr_errors):.6f} 像素")
-                print(f"    最大: {np.max(all_curr_errors):.6f} 像素")
-                good_obs = sum(e < 1.0 for e in all_curr_errors)
-                print(f"    <1像素: {good_obs}/{len(all_curr_errors)} ({100*good_obs/len(all_curr_errors):.1f}%)")
         
-
-        # 3. 基于2D坐标建立对应关系
-        # 建立影像ID的对应关系
-        # prev的第i个重叠影像 对应 curr的第i个重叠影像（它们是同一张原始影像）
-        image_id_mapping = {}  # {prev_image_id: curr_image_id}
-        for i in range(len(prev_overlap_image_ids)):
-            prev_img_id = prev_overlap_image_ids[i]
-            curr_img_id = curr_overlap_image_ids[i]
-            image_id_mapping[prev_img_id] = curr_img_id
-
-        # 获取影像尺寸，构建standard格网
-        sample_image = prev_recon.images[prev_overlap_image_ids[0]]
-        camera = prev_recon.cameras[sample_image.camera_id]
-        # 原始影像尺寸（reconstruction中的尺寸）
-        img_width = int(camera.width)
-        img_height = int(camera.height)
-
-        # 结构: prev_grid[(y, x)][image_id] = [points]
-        prev_image_grids = defaultdict(lambda: defaultdict(list))
-
-        for point3D_id, data in prev_3d_to_2d_map.items():
-            for obs in data['observations']:
-                x, y = obs['2d_xy']
-                grid_x = int(round(x))
-                grid_y = int(round(y))
-                if 0 <= grid_x < img_width and 0 <= grid_y < img_height:
-                    image_id = obs['image_id']
-                    prev_image_grids[image_id][(grid_y, grid_x)].append({
-                        'point3D_id': point3D_id,
-                        'xyz': data['xyz'],
-                        'color': data['color'],
-                        '2d_xy': obs['2d_xy'],
-                        'reproj_error': obs['reproj_error'],
-                        'mean_reproj_error': data['mean_reproj_error']
-                    })
-
-        # curr网格同理
-        curr_image_grids = defaultdict(lambda: defaultdict(list))
-
-        for point3D_id, data in curr_3d_to_2d_map.items():
-            for obs in data['observations']:
-                x, y = obs['2d_xy']
-                grid_x = int(round(x))
-                grid_y = int(round(y))
-                if 0 <= grid_x < img_width and 0 <= grid_y < img_height:
-                    image_id = obs['image_id']
-                    curr_image_grids[image_id][(grid_y, grid_x)].append({
-                        'point3D_id': point3D_id,
-                        'xyz': data['xyz'],
-                        'color': data['color'],
-                        '2d_xy': obs['2d_xy'],
-                        'reproj_error': obs['reproj_error'],
-                        'mean_reproj_error': data['mean_reproj_error']
-                    })
-
-        # 多尺度匹配：从小 cell 到大 cell
-        cell_sizes = [1, 3, 5, 10, 15, 20, 25, 30, 50, 100, 500, 1000]  # 逐步扩大
-        matched_pairs = {}
-        matched_prev_ids = set()
-        matched_curr_ids = set()
-        
-        for cell_size in cell_sizes:
-            # # 模型输入尺寸（预处理后）
-            # curr_recon_data = self.inference_reconstructions[-1]
-            # start_idx = curr_recon_data['start_idx']
-            # model_input_width, model_input_height = self.scale_info[start_idx]['output_size']
-            # # 计算缩放比例
-            # scale_x = img_width / model_input_width    # X方向：原始/模型输入
-            # scale_y = img_height / model_input_height  # Y方向：原始/模型输入
-            # # 基于缩放比例定义长方形格网参数
-            # # cell_width = max(1, int(round(scale_x)))   # X方向的单元格宽度
-            # # cell_height = max(1, int(round(scale_y)))  # Y方向的单元格高度
-            # cell_width = 20   # X方向的单元格宽度
-            # cell_height = 20  # Y方向的单元格高度
-            
-            cell_width = cell_size
-            cell_height = cell_size
-            grid_cols = int(np.ceil(img_width / cell_width))
-            grid_rows = int(np.ceil(img_height / cell_height))
-            actual_cell_width = img_width / grid_cols
-            actual_cell_height = img_height / grid_rows
-            
-            # 初始化格网
-            standard_grid = defaultdict(lambda: {
-                'prev': [], 'curr': [],
-                'prev_count': 0, 'curr_count': 0
-            })
-            
-            # 只投影未匹配的点
-            for image_id, grid_data in prev_image_grids.items():
-                for (pixel_y, pixel_x), points in grid_data.items():
-                    cell_x = min(int(pixel_x / actual_cell_width), grid_cols - 1)
-                    cell_y = min(int(pixel_y / actual_cell_height), grid_rows - 1)
-                    cell = standard_grid[(cell_y, cell_x)]
-                    
-                    for pt in points:
-                        # 跳过已匹配的点
-                        if pt['point3D_id'] in matched_prev_ids:
-                            continue
-                        cell['prev'].append({
-                            'image_id': image_id,
-                            'pixel_xy': (pixel_x, pixel_y),
-                            **pt
-                        })
-                        cell['prev_count'] += 1
-
-            for image_id, grid_data in curr_image_grids.items():
-                for (pixel_y, pixel_x), points in grid_data.items():
-                    cell_x = min(int(pixel_x / actual_cell_width), grid_cols - 1)
-                    cell_y = min(int(pixel_y / actual_cell_height), grid_rows - 1)
-                    cell = standard_grid[(cell_y, cell_x)]
-                    
-                    for pt in points:
-                        # 跳过已匹配的点
-                        if pt['point3D_id'] in matched_curr_ids:
-                            continue
-                        cell['curr'].append({
-                            'image_id': image_id,
-                            'pixel_xy': (pixel_x, pixel_y),
-                            **pt
-                        })
-                        cell['curr_count'] += 1
-            
-            # 在当前尺度下匹配
-            for cell_key, cell in standard_grid.items():
-                if not cell['prev'] or not cell['curr']:
-                    continue
-                
-                # 按影像 ID 组织 curr 点
-                curr_by_image = defaultdict(list)
-                for curr_pt in cell['curr']:
-                    curr_by_image[curr_pt['image_id']].append(curr_pt)
-                
-                # 按影像对分组，收集候选匹配
-                image_pair_candidates = defaultdict(list)  # {(prev_img, curr_img): [(prev_pt, curr_pt, distance), ...]}
-                
-                for prev_pt in cell['prev']:
-                    if prev_pt['point3D_id'] in matched_prev_ids:
-                        continue
-                    
-                    curr_img_id = image_id_mapping.get(prev_pt['image_id'])
-                    if curr_img_id is None:
-                        continue
-                    
-                    for curr_pt in curr_by_image.get(curr_img_id, []):
-                        if curr_pt['point3D_id'] in matched_curr_ids:
-                            continue
-                        
-                        # 计算 2D 距离
-                        prev_xy = np.array(prev_pt['pixel_xy'])
-                        curr_xy = np.array(curr_pt['pixel_xy'])
-                        distance_2d = np.linalg.norm(prev_xy - curr_xy)
-                        
-                        pair_key = (prev_pt['image_id'], curr_img_id)
-                        image_pair_candidates[pair_key].append({
-                            'prev_pt': prev_pt,
-                            'curr_pt': curr_pt,
-                            'distance_2d': distance_2d
-                        })
-                
-                # 对每个影像对，贪心选择最近的匹配（保证一对一）
-                for pair_key, candidates in image_pair_candidates.items():
-                    # 按 2D 距离排序
-                    candidates.sort(key=lambda x: x['distance_2d'])
-                    
-                    # 记录这轮已使用的点
-                    used_prev = set()
-                    used_curr = set()
-                    
-                    for cand in candidates:
-                        prev_pt = cand['prev_pt']
-                        curr_pt = cand['curr_pt']
-                        prev_id = prev_pt['point3D_id']
-                        curr_id = curr_pt['point3D_id']
-                        
-                        # 跳过已使用的点（保证一对一）
-                        if prev_id in used_prev or curr_id in used_curr:
-                            continue
-                        if prev_id in matched_prev_ids or curr_id in matched_curr_ids:
-                            continue
-                        
-                        # 添加匹配
-                        key = (prev_id, curr_id)
-                        matched_pairs[key] = {
-                            'prev': {
-                                'point3D_id': prev_id,
-                                'xyz': prev_pt['xyz'].copy(),
-                                'color': prev_pt['color'].copy(),
-                                'mean_reproj_error': prev_pt['mean_reproj_error'],
-                            },
-                            'curr': {
-                                'point3D_id': curr_id,
-                                'xyz': curr_pt['xyz'].copy(),
-                                'color': curr_pt['color'].copy(),
-                                'mean_reproj_error': curr_pt['mean_reproj_error'],
-                            },
-                            'cell_size': cell_size,
-                            'distance_2d': cand['distance_2d'],
-                            'observations': []
-                        }
-                        
-                        matched_prev_ids.add(prev_id)
-                        matched_curr_ids.add(curr_id)
-                        used_prev.add(prev_id)
-                        used_curr.add(curr_id)
-            
-            if self.verbose:
-                print(f"    cell_size={cell_size}: 累计匹配 {len(matched_pairs)} 对")
-
-        # 计算 prev 和 curr 之间的均值（现在是严格一对一匹配，不需要累加）
-        for key, data in matched_pairs.items():
-            prev_data = data['prev']
-            curr_data = data['curr']
-            
-            prev_xyz = prev_data['xyz']
-            prev_color = prev_data['color']
-            
-            curr_xyz = curr_data['xyz']
-            curr_color = curr_data['color']
-            
-            # 计算 prev 和 curr 之间的最终均值
-            data['average_xyz'] = (prev_xyz + curr_xyz) / 2.0
-            data['average_color'] = ((prev_color.astype(float) + curr_color.astype(float)) / 2.0).astype(np.uint8)
-            data['xyz_diff'] = np.linalg.norm(prev_xyz - curr_xyz)
-
-        # 使用匹配的3D点对估计 Sim3 变换（curr → prev 坐标系）
-        # 只使用 cell_size=1 的高精度匹配点
-        high_precision_pairs = {k: v for k, v in matched_pairs.items() if v['cell_size'] < 5}
-        sim3_transform = None
-        src_pts3d = None
-        tgt_pts3d = None
-
-        if self.verbose:
-            print(f"  高精度匹配点 (cell_size=1): {len(high_precision_pairs)} 对")
-            print(f"  总匹配点: {len(matched_pairs)} 对")
-        
-        if len(high_precision_pairs) >= 3:
-            # 收集匹配的3D点对
-            src_pts3d = []  # curr 的点
-            tgt_pts3d = []  # prev 的点
-            for key, data in high_precision_pairs.items():
-                src_pts3d.append(data['curr']['xyz'])
-                tgt_pts3d.append(data['prev']['xyz'])
-            src_pts3d = np.array(src_pts3d, dtype=np.float64)
-            tgt_pts3d = np.array(tgt_pts3d, dtype=np.float64)
-            sim3_transform = self._estimate_sim3_transform(src_pts3d, tgt_pts3d)
-            if self.verbose:
-                print(f"  使用 {len(src_pts3d)} 对高精度匹配点估计 Sim3")
-        elif len(matched_pairs) >= 3:
-            # 如果高精度点不足，回退到使用所有匹配点
-            if self.verbose:
-                print(f"  ⚠ 高精度点不足，回退到使用全部 {len(matched_pairs)} 对匹配点")
-            src_pts3d = []
-            tgt_pts3d = []
-            for key, data in matched_pairs.items():
-                src_pts3d.append(data['curr']['xyz'])
-                tgt_pts3d.append(data['prev']['xyz'])
-            src_pts3d = np.array(src_pts3d, dtype=np.float64)
-            tgt_pts3d = np.array(tgt_pts3d, dtype=np.float64)
-            sim3_transform = self._estimate_sim3_transform(src_pts3d, tgt_pts3d)
-        else:
-            if self.verbose:
-                print(f"  ⚠ 匹配点对不足（高精度={len(high_precision_pairs)}, 总计={len(matched_pairs)} < 3），无法估计 Sim3")
-        
-        if sim3_transform is not None:
-            if self.verbose:
-                print(f"  ✓ Sim3 变换估计成功")
-                print(f"    尺度 (scale): {sim3_transform.scale:.6f}")
-                # 计算变换后的误差
-                scale, rotation, translation = sim3_transform.scale, sim3_transform.rotation.matrix(), sim3_transform.translation
-                transformed_src = scale * (src_pts3d @ rotation.T) + translation
-                residuals = np.linalg.norm(transformed_src - tgt_pts3d, axis=1)
-                print(f"    变换后残差: 均值={residuals.mean():.4f}m, 最大={residuals.max():.4f}m")
-            
-            # # 只使用平移，不旋转不缩放
-            # translation_only = tgt_pts3d.mean(axis=0) - src_pts3d.mean(axis=0)
-            # identity_rotation = pycolmap.Rotation3d(np.eye(3))
-            # sim3_translation_only = pycolmap.Sim3d(1.0, identity_rotation, translation_only)
-            
-            # 使用缩放加平移，不旋转
-            src_centroid = src_pts3d.mean(axis=0)
-            tgt_centroid = tgt_pts3d.mean(axis=0)
-
-            # 计算缩放因子：使用到质心的平均距离比值
-            src_dists = np.linalg.norm(src_pts3d - src_centroid, axis=1)
-            tgt_dists = np.linalg.norm(tgt_pts3d - tgt_centroid, axis=1)
-            scale = np.mean(tgt_dists) / (np.mean(src_dists) + 1e-8)
-
-            # 平移量：先缩放再平移，所以 tgt = scale * src + translation
-            # translation = tgt_centroid - scale * src_centroid
-            translation = tgt_centroid - scale * src_centroid
-
-            identity_rotation = pycolmap.Rotation3d(np.eye(3))
-            sim3_scale_translation = pycolmap.Sim3d(scale, identity_rotation, translation)
-
-            # 方案1：直接变换 curr_recon 到 prev 坐标系
-            # curr_recon.transform(sim3_translation_only)
-            curr_recon.transform(sim3_scale_translation)
-            # 保存 Sim3 变换后的 curr_recon
-            curr_recon_data = self.inference_reconstructions[-1]
-            start_idx = curr_recon_data['start_idx']
-            end_idx = curr_recon_data['end_idx']
-            temp_path = self.output_dir / "temp_sim3_transformed" / f"{start_idx}_{end_idx}"
-            temp_path.mkdir(parents=True, exist_ok=True)
-            curr_recon.write_text(str(temp_path))
-            curr_recon.export_PLY(str(temp_path / "points3D.ply"))
-            if self.verbose:
-                print(f"  ✓ Sim3 变换后的 curr_recon 已保存到: {temp_path}")
-            
-            
-            # # 方案2：更新 matched_pairs 中的坐标（使用变换后的 curr 坐标）
-            # for key, data in matched_pairs.items():
-            #     curr_xyz = data['curr']['xyz']
-            #     # 应用 Sim3 变换
-            #     transformed_xyz = sim3_transform.scale * (sim3_transform.rotation.matrix() @ curr_xyz) + sim3_transform.translation
-                
-            #     # 更新均值坐标（现在在同一坐标系下取均值更有意义）
-            #     prev_xyz = data['prev']['xyz']
-            #     data['average_xyz'] = (prev_xyz + transformed_xyz) / 2.0
-            #     data['xyz_diff'] = np.linalg.norm(prev_xyz - transformed_xyz)
-            #     data['curr']['transformed_xyz'] = transformed_xyz
-            
-        else:
-            if self.verbose:
-                print("  ⚠ Sim3 变换估计失败，使用原始坐标均值")
-
-        # # 4. 合并两个reconstruction
-        # # 4.1 创建新的merged reconstruction
-        # merged_recon = pycolmap.Reconstruction()
-
-        # # 4.2 复制prev的所有cameras
-        # for camera_id, camera in prev_recon.cameras.items():
-        #     merged_recon.add_camera(camera)
-        
-        # # 4.3 统计匹配信息
-        # matched_prev_point3D_ids = set(key[0] for key in matched_pairs.keys())
-        # matched_curr_point3D_ids = set(key[1] for key in matched_pairs.keys())
-        
-        # # 建立 prev_point3D_id -> matched average 的映射
-        # prev_to_average = {}
-        # for key, data in matched_pairs.items():
-        #     prev_point3D_id = key[0]
-        #     prev_to_average[prev_point3D_id] = {
-        #         'xyz': data['average_xyz'],
-        #         'color': data['average_color']
-        #     }
-        
-        # # 建立 curr_point3D_id -> prev_point3D_id 的映射（用于后续查找merged ID）
-        # curr_to_prev_point3D_id = {}
-        # for key in matched_pairs.keys():
-        #     prev_id, curr_id = key
-        #     curr_to_prev_point3D_id[curr_id] = prev_id
-        
-        # if self.verbose:
-        #     print(f"  匹配统计:")
-        #     print(f"    matched_pairs数量: {len(matched_pairs)}")
-        #     print(f"    prev中被匹配的3D点: {len(matched_prev_point3D_ids)}")
-        #     print(f"    curr中被匹配的3D点: {len(matched_curr_point3D_ids)}")
-
-        # # 4.4 先添加所有3D点（使用空track）
-        # # 4.4.1 复制prev的3D点（匹配的用均值坐标）
-        # prev_to_merged_point3D_id = {}
-        # for point3D_id, point3D in prev_recon.points3D.items():
-        #     if point3D_id in prev_to_average:
-        #         xyz = prev_to_average[point3D_id]['xyz']
-        #         color = prev_to_average[point3D_id]['color']
-        #     else:
-        #         xyz = np.array(point3D.xyz, dtype=np.float64)
-        #         color = np.array(point3D.color, dtype=np.uint8)
-            
-        #     new_point3D_id = merged_recon.add_point3D(
-        #         xyz=xyz,
-        #         track=pycolmap.Track(),
-        #         color=color
-        #     )
-        #     prev_to_merged_point3D_id[point3D_id] = new_point3D_id
-
-        # # 4.4.2 建立 curr_to_merged_point3D_id 映射
-        # # 已匹配的curr点 -> 对应prev点的merged ID
-        # curr_to_merged_point3D_id = {}
-        # for curr_id, prev_id in curr_to_prev_point3D_id.items():
-        #     curr_to_merged_point3D_id[curr_id] = prev_to_merged_point3D_id[prev_id]
-        
-        # # 4.4.3 添加curr中未匹配的、但在非重叠区有观测的3D点
-        # curr_overlap_image_set = set(curr_overlap_image_ids)
-        # new_point3D_count = 0
-        
-        # for point3D_id, point3D in curr_recon.points3D.items():
-        #     # 跳过已匹配的点（它们已经通过prev添加，会在后面更新track）
-        #     if point3D_id in matched_curr_point3D_ids:
-        #         continue
-            
-        #     # 检查是否在非重叠区有观测
-        #     has_non_overlap_obs = False
-        #     for track_elem in point3D.track.elements:
-        #         if track_elem.image_id not in curr_overlap_image_set:
-        #             has_non_overlap_obs = True
-        #             break
-            
-        #     if not has_non_overlap_obs:
-        #         continue
-            
-        #     new_point3D_id = merged_recon.add_point3D(
-        #         xyz=np.array(point3D.xyz, dtype=np.float64),
-        #         track=pycolmap.Track(),
-        #         color=np.array(point3D.color, dtype=np.uint8)
-        #     )
-        #     curr_to_merged_point3D_id[point3D_id] = new_point3D_id
-        #     new_point3D_count += 1
-        
-        # if self.verbose:
-        #     print(f"  添加了 {len(prev_to_merged_point3D_id)} 个prev 3D点")
-        #     print(f"  添加了 {new_point3D_count} 个curr未匹配的非重叠区3D点")
-        #     print(f"  curr_to_merged映射数量: {len(curr_to_merged_point3D_id)} (含{len(matched_curr_point3D_ids)}个已匹配)")
-
-        # # 4.5 添加prev的所有影像，更新track
-        # merged_image_id = 1
-        # for image_id in sorted(prev_recon.images.keys()):
-        #     prev_image = prev_recon.images[image_id]
-            
-        #     new_points2D = []
-        #     point2D_idx = 0
-            
-        #     for point2D in prev_image.points2D:
-        #         xy_array = np.asarray(point2D.xy, dtype=np.float64)
-                
-        #         if point2D.has_point3D() and point2D.point3D_id in prev_to_merged_point3D_id:
-        #             new_point3D_id = prev_to_merged_point3D_id[point2D.point3D_id]
-        #             new_point2D = pycolmap.Point2D(xy=xy_array, point3D_id=new_point3D_id)
-        #             new_points2D.append(new_point2D)
-                    
-        #             # 更新track
-        #             track = merged_recon.points3D[new_point3D_id].track
-        #             track.add_element(merged_image_id, point2D_idx)
-        #         else:
-        #             new_points2D.append(pycolmap.Point2D(xy=xy_array))
-                
-        #         point2D_idx += 1
-            
-        #     new_image = pycolmap.Image(
-        #         image_id=merged_image_id,
-        #         name=prev_image.name,
-        #         camera_id=prev_image.camera_id,
-        #         cam_from_world=prev_image.cam_from_world,
-        #         points2D=new_points2D
-        #     )
-        #     merged_recon.add_image(new_image)
-        #     merged_image_id += 1
-        
-        # if self.verbose:
-        #     print(f"  添加了 {merged_image_id - 1} 张prev影像")
-
-        # # 4.6 添加curr中非重叠区域的影像
-        # # 【关键】这里要处理所有curr 3D点，包括已匹配的！
-        # curr_non_overlap_image_ids = list(range(
-        #     self.overlap + 1,
-        #     len(curr_recon.images) + 1
-        # ))
-        
-        # curr_to_merged_image_id = {}
-        # for curr_img_id in curr_non_overlap_image_ids:
-        #     if curr_img_id not in curr_recon.images:
-        #         continue
-            
-        #     curr_image = curr_recon.images[curr_img_id]
-            
-        #     new_points2D = []
-        #     point2D_idx = 0
-            
-        #     for point2D in curr_image.points2D:
-        #         xy_array = np.asarray(point2D.xy, dtype=np.float64)
-                
-        #         # 【关键改动】检查curr_to_merged_point3D_id，这包括：
-        #         # 1. 已匹配的curr点 -> prev的merged ID
-        #         # 2. 未匹配的curr非重叠区点 -> 新添加的merged ID
-        #         if point2D.has_point3D() and point2D.point3D_id in curr_to_merged_point3D_id:
-        #             new_point3D_id = curr_to_merged_point3D_id[point2D.point3D_id]
-        #             new_point2D = pycolmap.Point2D(xy=xy_array, point3D_id=new_point3D_id)
-        #             new_points2D.append(new_point2D)
-                    
-        #             # 【关键】更新track - 为已匹配的点增加curr非重叠影像的观测！
-        #             track = merged_recon.points3D[new_point3D_id].track
-        #             track.add_element(merged_image_id, point2D_idx)
-        #         else:
-        #             new_points2D.append(pycolmap.Point2D(xy=xy_array))
-                
-        #         point2D_idx += 1
-            
-        #     new_image = pycolmap.Image(
-        #         image_id=merged_image_id,
-        #         name=curr_image.name,
-        #         camera_id=curr_image.camera_id,
-        #         cam_from_world=curr_image.cam_from_world,
-        #         points2D=new_points2D
-        #     )
-        #     merged_recon.add_image(new_image)
-        #     curr_to_merged_image_id[curr_img_id] = merged_image_id
-        #     merged_image_id += 1
-        
-        # if self.verbose:
-        #     print(f"  添加了 {len(curr_to_merged_image_id)} 张curr非重叠影像")
-
-        # # 4.7 清理观测数量不足的3D点
-        # points3d_to_remove = []
-        # for point3d_id in list(merged_recon.points3D.keys()):
-        #     point3d = merged_recon.points3D[point3d_id]
-        #     if len(point3d.track.elements) < 2:
-        #         points3d_to_remove.append(point3d_id)
-        
-        # for point3d_id in points3d_to_remove:
-        #     del merged_recon.points3D[point3d_id]
-        
-        # if self.verbose and len(points3d_to_remove) > 0:
-        #     print(f"  移除了 {len(points3d_to_remove)} 个观测不足的3D点")
-
-        # # 4.8 更新merged_reconstruction
-        # self.merged_reconstruction = merged_recon
-        
-        # if self.verbose:
-        #     print(f"  合并完成:")
-        #     print(f"    总影像数: {len(merged_recon.images)}")
-        #     print(f"    总3D点数: {len(merged_recon.points3D)}")
-
-        # # 4.9 保存merged_reconstruction
-        # temp_path = self.output_dir / "temp_merged" / f"merged_reconstruction_{len(self.inference_reconstructions)}"
-        # temp_path.mkdir(parents=True, exist_ok=True)
-        # merged_recon.write_text(str(temp_path))
-        # merged_recon.export_PLY(str(temp_path / "points3D.ply"))
-        # self.export_reconstruction_to_las(merged_recon, str(temp_path / "points3D.las"))
-
-        # 4. 合并两个reconstruction
-        # 4.1 创建新的merged reconstruction
-        merged_recon = pycolmap.Reconstruction()
-
-        # 4.2 复制prev的所有cameras
-        for camera_id, camera in prev_recon.cameras.items():
-            merged_recon.add_camera(camera)
-        
-        # 4.3 统计匹配信息
-        matched_prev_point3D_ids = set(key[0] for key in matched_pairs.keys())
-        matched_curr_point3D_ids = set(key[1] for key in matched_pairs.keys())
-        
-        # 建立 prev_point3D_id -> matched average 的映射
-        prev_to_average = {}
-        for key, data in matched_pairs.items():
-            prev_point3D_id = key[0]
-            prev_to_average[prev_point3D_id] = {
-                'xyz': data['average_xyz'],
-                'color': data['average_color']
-            }
-        
-        # 建立 curr_point3D_id -> prev_point3D_id 的映射（用于后续查找merged ID）
-        curr_to_prev_point3D_id = {}
-        for key in matched_pairs.keys():
-            prev_id, curr_id = key
-            curr_to_prev_point3D_id[curr_id] = prev_id
-        
-        if self.verbose:
-            print(f"  匹配统计:")
-            print(f"    matched_pairs数量: {len(matched_pairs)}")
-            print(f"    prev中被匹配的3D点: {len(matched_prev_point3D_ids)}")
-            print(f"    curr中被匹配的3D点: {len(matched_curr_point3D_ids)}")
-
-        # 4.4 先添加所有3D点（使用空track）
-        # 4.4.1 复制prev的3D点（匹配的用均值坐标）
-        prev_to_merged_point3D_id = {}
-        for point3D_id, point3D in prev_recon.points3D.items():
-            if point3D_id in prev_to_average:
-                xyz = prev_to_average[point3D_id]['xyz']
-                color = prev_to_average[point3D_id]['color']
-                # color = np.array([255,0,0], dtype=np.uint8) # 红色
-            else:
-                xyz = np.array(point3D.xyz, dtype=np.float64)
-                color = np.array(point3D.color, dtype=np.uint8)
-            
-            new_point3D_id = merged_recon.add_point3D(
-                xyz=xyz,
-                track=pycolmap.Track(),
-                color=color
-            )
-            prev_to_merged_point3D_id[point3D_id] = new_point3D_id
-
-        # 4.4.2 建立 curr_to_merged_point3D_id 映射
-        # 已匹配的curr点 -> 对应prev点的merged ID
-        curr_to_merged_point3D_id = {}
-        for curr_id, prev_id in curr_to_prev_point3D_id.items():
-            curr_to_merged_point3D_id[curr_id] = prev_to_merged_point3D_id[prev_id]
-        
-        # 4.4.3 添加curr中未匹配的、但在非重叠区有观测的3D点
-        curr_overlap_image_set = set(curr_overlap_image_ids)
-        new_point3D_count = 0
-        
-        for point3D_id, point3D in curr_recon.points3D.items():
-            # 跳过已匹配的点（它们已经通过prev添加，会在后面更新track）
-            if point3D_id in matched_curr_point3D_ids:
-                continue
-            
-            # 检查是否在非重叠区有观测
-            has_non_overlap_obs = False
-            for track_elem in point3D.track.elements:
-                if track_elem.image_id not in curr_overlap_image_set:
-                    has_non_overlap_obs = True
-                    break
-            
-            if not has_non_overlap_obs:
-                continue
-            
-            new_point3D_id = merged_recon.add_point3D(
-                xyz=np.array(point3D.xyz, dtype=np.float64),
-                track=pycolmap.Track(),
-                color=np.array(point3D.color, dtype=np.uint8)
-            )
-            curr_to_merged_point3D_id[point3D_id] = new_point3D_id
-            new_point3D_count += 1
-        
-        if self.verbose:
-            print(f"  添加了 {len(prev_to_merged_point3D_id)} 个prev 3D点")
-            print(f"  添加了 {new_point3D_count} 个curr未匹配的非重叠区3D点")
-            print(f"  curr_to_merged映射数量: {len(curr_to_merged_point3D_id)} (含{len(matched_curr_point3D_ids)}个已匹配)")
-
-        # 4.5 添加prev的所有影像，更新track
-        merged_image_id = 1
-        for image_id in sorted(prev_recon.images.keys()):
-            prev_image = prev_recon.images[image_id]
-            
-            new_points2D = []
-            point2D_idx = 0
-            
-            for point2D in prev_image.points2D:
-                xy_array = np.asarray(point2D.xy, dtype=np.float64)
-                
-                if point2D.has_point3D() and point2D.point3D_id in prev_to_merged_point3D_id:
-                    new_point3D_id = prev_to_merged_point3D_id[point2D.point3D_id]
-                    new_point2D = pycolmap.Point2D(xy=xy_array, point3D_id=new_point3D_id)
-                    new_points2D.append(new_point2D)
-                    
-                    # 更新track
-                    track = merged_recon.points3D[new_point3D_id].track
-                    track.add_element(merged_image_id, point2D_idx)
-                else:
-                    new_points2D.append(pycolmap.Point2D(xy=xy_array))
-                
-                point2D_idx += 1
-            
-            new_image = pycolmap.Image(
-                image_id=merged_image_id,
-                name=prev_image.name,
-                camera_id=prev_image.camera_id,
-                cam_from_world=prev_image.cam_from_world,
-                points2D=new_points2D
-            )
-            merged_recon.add_image(new_image)
-            merged_image_id += 1
-        
-        if self.verbose:
-            print(f"  添加了 {merged_image_id - 1} 张prev影像")
-
-        # 4.6 添加curr中非重叠区域的影像
-        # 【关键】这里要处理所有curr 3D点，包括已匹配的！
-        curr_non_overlap_image_ids = list(range(
-            self.overlap + 1,
-            len(curr_recon.images) + 1
-        ))
-        
-        curr_to_merged_image_id = {}
-        for curr_img_id in curr_non_overlap_image_ids:
-            if curr_img_id not in curr_recon.images:
-                continue
-            
-            curr_image = curr_recon.images[curr_img_id]
-            
-            new_points2D = []
-            point2D_idx = 0
-            
-            for point2D in curr_image.points2D:
-                xy_array = np.asarray(point2D.xy, dtype=np.float64)
-                
-                # 【关键改动】检查curr_to_merged_point3D_id，这包括：
-                # 1. 已匹配的curr点 -> prev的merged ID
-                # 2. 未匹配的curr非重叠区点 -> 新添加的merged ID
-                if point2D.has_point3D() and point2D.point3D_id in curr_to_merged_point3D_id:
-                    new_point3D_id = curr_to_merged_point3D_id[point2D.point3D_id]
-                    new_point2D = pycolmap.Point2D(xy=xy_array, point3D_id=new_point3D_id)
-                    new_points2D.append(new_point2D)
-                    
-                    # 【关键】更新track - 为已匹配的点增加curr非重叠影像的观测！
-                    track = merged_recon.points3D[new_point3D_id].track
-                    track.add_element(merged_image_id, point2D_idx)
-                else:
-                    new_points2D.append(pycolmap.Point2D(xy=xy_array))
-                
-                point2D_idx += 1
-            
-            new_image = pycolmap.Image(
-                image_id=merged_image_id,
-                name=curr_image.name,
-                camera_id=curr_image.camera_id,
-                cam_from_world=curr_image.cam_from_world,
-                points2D=new_points2D
-            )
-            merged_recon.add_image(new_image)
-            curr_to_merged_image_id[curr_img_id] = merged_image_id
-            merged_image_id += 1
-        
-        if self.verbose:
-            print(f"  添加了 {len(curr_to_merged_image_id)} 张curr非重叠影像")
-
-        # 4.7 清理观测数量不足的3D点
-        points3d_to_remove = []
-        for point3d_id in list(merged_recon.points3D.keys()):
-            point3d = merged_recon.points3D[point3d_id]
-            if len(point3d.track.elements) < 2:
-                points3d_to_remove.append(point3d_id)
-        
-        for point3d_id in points3d_to_remove:
-            del merged_recon.points3D[point3d_id]
-        
-        if self.verbose and len(points3d_to_remove) > 0:
-            print(f"  移除了 {len(points3d_to_remove)} 个观测不足的3D点")
-
-        # 4.8 更新merged_reconstruction
+        # 4. 更新merged_reconstruction
         self.merged_reconstruction = merged_recon
         
+        # 5. 提取 merged 点云用于可视化
+        self._update_merged_point_cloud_for_visualization(merged_recon)
+        
+        # 6. 导出LAS格式
+        self.export_reconstruction_to_las(merged_recon, str(output_dir / "points3D.las"))
+        
         if self.verbose:
-            print(f"  合并完成:")
+            print(f"  ✓ 合并完成:")
             print(f"    总影像数: {len(merged_recon.images)}")
             print(f"    总3D点数: {len(merged_recon.points3D)}")
+            print(f"    结果保存到: {output_dir}")
 
-        # 4.9 保存merged_reconstruction
-        temp_path = self.output_dir / "temp_merged" / f"merged_{len(self.inference_reconstructions)}"
-        temp_path.mkdir(parents=True, exist_ok=True)
-        merged_recon.write_text(str(temp_path))
-        merged_recon.export_PLY(str(temp_path / "points3D.ply"))
-        self.export_reconstruction_to_las(merged_recon, str(temp_path / "points3D.las"))
-        if self.verbose:
-            print(f"  ✓ 合并结果已保存到: {temp_path}")
-
-        return True
-
-    # 使用体素网格进行合并
-    # def _merge_reconstruction_intermediate_results(self, voxel_size: float = 10.0) -> bool:
-    #     """
-    #     合并reconstruction中间结果
-        
-    #     使用基于相机照射方向的倾斜3D体素网格进行均值合并：
-    #     1. 获取重叠区影像的照射方向（相机光轴方向）
-    #     2. 基于照射方向建立倾斜的局部坐标系
-    #     3. 在局部坐标系中建立可控大小的体素网格
-    #     4. 在每个体素内对prev和curr的3D点进行均值合并
-        
-    #     Args:
-    #         voxel_size: 体素大小（单位：米），默认1.0米
-        
-    #     Returns:
-    #         True if successful, False otherwise
-    #     """
-    #     # 如果这是第一个reconstruction，直接设置为merged
-    #     if len(self.inference_reconstructions) == 1:
-    #         self.merged_reconstruction = self.inference_reconstructions[0]['reconstruction']
-    #         merged_recon = self.merged_reconstruction
-    #         # 保存merged_reconstruction
-    #         temp_path = self.output_dir / "temp_merged" / f"merged_reconstruction_{len(self.inference_reconstructions)}"
-    #         temp_path.mkdir(parents=True, exist_ok=True)
-    #         merged_recon.write_text(str(temp_path))
-    #         merged_recon.export_PLY(str(temp_path / "points3D.ply"))
-    #         self.export_reconstruction_to_las(merged_recon, str(temp_path / "points3D.las"))
-    #         return True
-
-    #     # 获取前一个已合并的reconstruction和当前新的reconstruction
-    #     prev_recon = self.merged_reconstruction
-    #     curr_recon_data = self.inference_reconstructions[-1]
-    #     curr_recon = curr_recon_data['reconstruction']
-
-    #     # ============================================================================
-    #     # 1. 获取重叠区域的影像ID
-    #     # ============================================================================
-    #     # prev_recon中倒数overlap个影像
-    #     prev_overlap_image_ids = list(range(
-    #         len(prev_recon.images) - self.overlap + 1,
-    #         len(prev_recon.images) + 1
-    #     ))
-    #     # curr_recon中前overlap个影像
-    #     curr_overlap_image_ids = list(range(
-    #         1, self.overlap + 1
-    #     ))
-
-    #     # 检查重叠影像数量是否匹配
-    #     if len(prev_overlap_image_ids) != len(curr_overlap_image_ids):
-    #         if self.verbose:
-    #             print(f"  Warning: Overlapping image count mismatch")
-    #         return False
-
-    #     prev_overlap_image_set = set(prev_overlap_image_ids)
-    #     curr_overlap_image_set = set(curr_overlap_image_ids)
-
-    #     if self.verbose:
-    #         print(f"  重叠影像: prev={prev_overlap_image_ids}, curr={curr_overlap_image_ids}")
-
-    #     # ============================================================================
-    #     # 2. 获取每个重叠影像的照射方向（相机光轴方向）
-    #     # ============================================================================
-    #     def get_camera_viewing_direction(image):
-    #         """获取相机的照射方向（世界坐标系中的光轴方向，指向场景）"""
-    #         R = np.array(image.cam_from_world.rotation.matrix())
-    #         # 相机光轴在相机坐标系中是Z轴正方向 [0, 0, 1]
-    #         # 转换到世界坐标系: direction = R^T @ [0, 0, 1]
-    #         viewing_direction = R.T @ np.array([0, 0, 1])
-    #         return viewing_direction / np.linalg.norm(viewing_direction)
-        
-    #     def get_camera_center(image):
-    #         """获取相机中心在世界坐标系中的位置"""
-    #         R = np.array(image.cam_from_world.rotation.matrix())
-    #         t = np.array(image.cam_from_world.translation)
-    #         return -R.T @ t
-        
-    #     # 收集prev重叠区的相机信息
-    #     prev_cameras_info = []
-    #     for img_id in prev_overlap_image_ids:
-    #         if img_id in prev_recon.images:
-    #             image = prev_recon.images[img_id]
-    #             prev_cameras_info.append({
-    #                 'image_id': img_id,
-    #                 'viewing_direction': get_camera_viewing_direction(image),
-    #                 'camera_center': get_camera_center(image),
-    #                 'source': 'prev'
-    #             })
-        
-    #     # 收集curr重叠区的相机信息
-    #     curr_cameras_info = []
-    #     for img_id in curr_overlap_image_ids:
-    #         if img_id in curr_recon.images:
-    #             image = curr_recon.images[img_id]
-    #             curr_cameras_info.append({
-    #                 'image_id': img_id,
-    #                 'viewing_direction': get_camera_viewing_direction(image),
-    #                 'camera_center': get_camera_center(image),
-    #                 'source': 'curr'
-    #             })
-        
-    #     # 计算所有重叠区相机的平均照射方向
-    #     all_viewing_directions = [c['viewing_direction'] for c in prev_cameras_info + curr_cameras_info]
-    #     mean_viewing_direction = np.mean(all_viewing_directions, axis=0)
-    #     mean_viewing_direction = mean_viewing_direction / np.linalg.norm(mean_viewing_direction)
-        
-    #     # 计算重叠区相机中心的平均位置
-    #     all_camera_centers = [c['camera_center'] for c in prev_cameras_info + curr_cameras_info]
-    #     mean_camera_center = np.mean(all_camera_centers, axis=0)
-        
-    #     if self.verbose:
-    #         print(f"  平均照射方向: [{mean_viewing_direction[0]:.4f}, {mean_viewing_direction[1]:.4f}, {mean_viewing_direction[2]:.4f}]")
-    #         print(f"  相机中心均值: [{mean_camera_center[0]:.2f}, {mean_camera_center[1]:.2f}, {mean_camera_center[2]:.2f}]")
-
-    #     # ============================================================================
-    #     # 3. 基于照射方向建立倾斜的局部坐标系
-    #     # ============================================================================
-    #     def build_tilted_coordinate_system(viewing_direction):
-    #         """
-    #         建立倾斜的局部坐标系
-    #         - Z轴: 照射方向（相机光轴方向）
-    #         - X轴: 水平方向，垂直于Z轴
-    #         - Y轴: 由Z和X叉乘得到
-            
-    #         返回旋转矩阵 R_local，world_point_local = R_local @ (world_point - origin)
-    #         """
-    #         z_axis = viewing_direction / np.linalg.norm(viewing_direction)
-            
-    #         # 选择一个与Z轴不平行的参考向量来构建X轴
-    #         # 优先使用世界坐标系的Z轴（向上方向），如果太接近则用X轴
-    #         world_up = np.array([0, 0, 1])
-    #         if abs(np.dot(z_axis, world_up)) > 0.9:
-    #             # 照射方向接近垂直，使用世界X轴作为参考
-    #             ref_vector = np.array([1, 0, 0])
-    #         else:
-    #             ref_vector = world_up
-            
-    #         # X轴 = ref_vector × Z轴（右手系）
-    #         x_axis = np.cross(ref_vector, z_axis)
-    #         x_axis = x_axis / np.linalg.norm(x_axis)
-            
-    #         # Y轴 = Z轴 × X轴
-    #         y_axis = np.cross(z_axis, x_axis)
-    #         y_axis = y_axis / np.linalg.norm(y_axis)
-            
-    #         # 构建旋转矩阵：局部坐标系的轴作为行向量
-    #         R_local = np.array([x_axis, y_axis, z_axis])
-    #         return R_local
-        
-    #     R_local = build_tilted_coordinate_system(mean_viewing_direction)
-        
-    #     if self.verbose:
-    #         print(f"  倾斜坐标系:")
-    #         print(f"    X轴: [{R_local[0, 0]:.4f}, {R_local[0, 1]:.4f}, {R_local[0, 2]:.4f}]")
-    #         print(f"    Y轴: [{R_local[1, 0]:.4f}, {R_local[1, 1]:.4f}, {R_local[1, 2]:.4f}]")
-    #         print(f"    Z轴: [{R_local[2, 0]:.4f}, {R_local[2, 1]:.4f}, {R_local[2, 2]:.4f}]")
-
-    #     # ============================================================================
-    #     # 4. 提取重叠区的3D点云并转换到倾斜坐标系
-    #     # ============================================================================
-    #     # 提取prev重叠区的3D点
-    #     prev_overlap_points = {}  # {point3D_id: {'xyz_world': ..., 'xyz_local': ..., 'color': ..., 'track': ...}}
-    #     for point3D_id, point3D in prev_recon.points3D.items():
-    #         # 检查该点是否在重叠区有观测
-    #         overlap_obs_count = 0
-    #         for track_elem in point3D.track.elements:
-    #             if track_elem.image_id in prev_overlap_image_set:
-    #                 overlap_obs_count += 1
-            
-    #         if overlap_obs_count > 0:
-    #             xyz_world = np.array(point3D.xyz, dtype=np.float64)
-    #             # 转换到倾斜局部坐标系
-    #             xyz_local = R_local @ (xyz_world - mean_camera_center)
-                
-    #             prev_overlap_points[point3D_id] = {
-    #                 'xyz_world': xyz_world,
-    #                 'xyz_local': xyz_local,
-    #                 'color': np.array(point3D.color, dtype=np.uint8),
-    #                 'track_elements': list(point3D.track.elements),
-    #                 'source': 'prev',
-    #                 'overlap_obs_count': overlap_obs_count
-    #             }
-        
-    #     # 提取curr重叠区的3D点
-    #     curr_overlap_points = {}
-    #     for point3D_id, point3D in curr_recon.points3D.items():
-    #         overlap_obs_count = 0
-    #         for track_elem in point3D.track.elements:
-    #             if track_elem.image_id in curr_overlap_image_set:
-    #                 overlap_obs_count += 1
-            
-    #         if overlap_obs_count > 0:
-    #             xyz_world = np.array(point3D.xyz, dtype=np.float64)
-    #             xyz_local = R_local @ (xyz_world - mean_camera_center)
-                
-    #             curr_overlap_points[point3D_id] = {
-    #                 'xyz_world': xyz_world,
-    #                 'xyz_local': xyz_local,
-    #                 'color': np.array(point3D.color, dtype=np.uint8),
-    #                 'track_elements': list(point3D.track.elements),
-    #                 'source': 'curr',
-    #                 'overlap_obs_count': overlap_obs_count
-    #             }
-        
-    #     if self.verbose:
-    #         print(f"  Prev重叠区3D点: {len(prev_overlap_points)}")
-    #         print(f"  Curr重叠区3D点: {len(curr_overlap_points)}")
-
-    #     # ============================================================================
-    #     # 5. 获取点云范围，建立倾斜体素网格
-    #     # ============================================================================
-    #     # 收集所有重叠区点的局部坐标
-    #     all_local_points = []
-    #     for data in prev_overlap_points.values():
-    #         all_local_points.append(data['xyz_local'])
-    #     for data in curr_overlap_points.values():
-    #         all_local_points.append(data['xyz_local'])
-        
-    #     if len(all_local_points) == 0:
-    #         if self.verbose:
-    #             print("  Warning: 重叠区没有3D点")
-    #         return False
-        
-    #     all_local_points = np.array(all_local_points)
-        
-    #     # 计算点云边界（在局部坐标系中）
-    #     min_bounds = np.min(all_local_points, axis=0)
-    #     max_bounds = np.max(all_local_points, axis=0)
-    #     extent = max_bounds - min_bounds
-        
-    #     if self.verbose:
-    #         print(f"  点云范围(局部坐标系):")
-    #         print(f"    X: [{min_bounds[0]:.2f}, {max_bounds[0]:.2f}], 范围: {extent[0]:.2f}")
-    #         print(f"    Y: [{min_bounds[1]:.2f}, {max_bounds[1]:.2f}], 范围: {extent[1]:.2f}")
-    #         print(f"    Z: [{min_bounds[2]:.2f}, {max_bounds[2]:.2f}], 范围: {extent[2]:.2f}")
-    #         print(f"  体素大小: {voxel_size}")
-
-    #     # 体素索引计算函数
-    #     def xyz_local_to_voxel_key(xyz_local):
-    #         """将局部坐标转换为体素索引 (i, j, k)"""
-    #         voxel_idx = np.floor((xyz_local - min_bounds) / voxel_size).astype(int)
-    #         return tuple(voxel_idx)
-
-    #     # ============================================================================
-    #     # 6. 将所有重叠区3D点投入体素网格
-    #     # ============================================================================
-    #     voxel_grid = defaultdict(lambda: {
-    #         'prev_points': [],  # 来自prev的点
-    #         'curr_points': []   # 来自curr的点
-    #     })
-        
-    #     # 投入prev的点
-    #     for point3D_id, data in prev_overlap_points.items():
-    #         voxel_key = xyz_local_to_voxel_key(data['xyz_local'])
-    #         voxel_grid[voxel_key]['prev_points'].append({
-    #             'point3D_id': point3D_id,
-    #             'xyz_world': data['xyz_world'],
-    #             'xyz_local': data['xyz_local'],
-    #             'color': data['color'],
-    #             'overlap_obs_count': data['overlap_obs_count']
-    #         })
-        
-    #     # 投入curr的点
-    #     for point3D_id, data in curr_overlap_points.items():
-    #         voxel_key = xyz_local_to_voxel_key(data['xyz_local'])
-    #         voxel_grid[voxel_key]['curr_points'].append({
-    #             'point3D_id': point3D_id,
-    #             'xyz_world': data['xyz_world'],
-    #             'xyz_local': data['xyz_local'],
-    #             'color': data['color'],
-    #             'overlap_obs_count': data['overlap_obs_count']
-    #         })
-        
-    #     # 统计体素信息
-    #     if self.verbose:
-    #         total_voxels = len(voxel_grid)
-    #         overlap_voxels = sum(1 for v in voxel_grid.values() 
-    #                             if len(v['prev_points']) > 0 and len(v['curr_points']) > 0)
-    #         prev_only_voxels = sum(1 for v in voxel_grid.values() 
-    #                               if len(v['prev_points']) > 0 and len(v['curr_points']) == 0)
-    #         curr_only_voxels = sum(1 for v in voxel_grid.values() 
-    #                               if len(v['prev_points']) == 0 and len(v['curr_points']) > 0)
-    #         print(f"  体素统计:")
-    #         print(f"    总体素数: {total_voxels}")
-    #         print(f"    有重叠的体素: {overlap_voxels}")
-    #         print(f"    仅prev的体素: {prev_only_voxels}")
-    #         print(f"    仅curr的体素: {curr_only_voxels}")
-
-    #     # ============================================================================
-    #     # 7. 在每个体素内进行均值合并
-    #     # ============================================================================
-    #     # 存储合并结果
-    #     merged_overlap_points = {}  # 重叠体素中的合并点
-    #     prev_only_point_ids = set()  # 仅在prev中的点（不在重叠体素）
-    #     curr_only_point_ids = set()  # 仅在curr中的点（不在重叠体素）
-        
-    #     # 匹配映射
-    #     prev_to_merged_xyz = {}  # prev_point3D_id -> merged_xyz
-    #     curr_to_prev_mapping = {}  # curr_point3D_id -> prev_point3D_id (用于track合并)
-        
-    #     merged_point_idx = 0
-        
-    #     for voxel_key, voxel_data in voxel_grid.items():
-    #         prev_pts = voxel_data['prev_points']
-    #         curr_pts = voxel_data['curr_points']
-            
-    #         if len(prev_pts) > 0 and len(curr_pts) > 0:
-    #             # 重叠体素：对所有点进行均值合并
-    #             all_xyz_world = []
-    #             all_colors = []
-    #             all_prev_ids = []
-    #             all_curr_ids = []
-                
-    #             for pt in prev_pts:
-    #                 all_xyz_world.append(pt['xyz_world'])
-    #                 all_colors.append(pt['color'].astype(float))
-    #                 all_prev_ids.append(pt['point3D_id'])
-                
-    #             for pt in curr_pts:
-    #                 all_xyz_world.append(pt['xyz_world'])
-    #                 all_colors.append(pt['color'].astype(float))
-    #                 all_curr_ids.append(pt['point3D_id'])
-                
-    #             # 计算均值
-    #             merged_xyz = np.mean(all_xyz_world, axis=0)
-    #             merged_color = np.mean(all_colors, axis=0).astype(np.uint8)
-                
-    #             # 使用第一个prev点的ID作为代表（用于后续track构建）
-    #             representative_prev_id = all_prev_ids[0]
-                
-    #             merged_overlap_points[merged_point_idx] = {
-    #                 'merged_xyz': merged_xyz,
-    #                 'merged_color': merged_color,
-    #                 'prev_point_ids': all_prev_ids,
-    #                 'curr_point_ids': all_curr_ids,
-    #                 'representative_prev_id': representative_prev_id,
-    #                 'num_points_merged': len(all_xyz_world)
-    #             }
-                
-    #             # 记录映射关系
-    #             for prev_id in all_prev_ids:
-    #                 prev_to_merged_xyz[prev_id] = {
-    #                     'xyz': merged_xyz,
-    #                     'color': merged_color,
-    #                     'merged_idx': merged_point_idx
-    #                 }
-                
-    #             for curr_id in all_curr_ids:
-    #                 curr_to_prev_mapping[curr_id] = representative_prev_id
-                
-    #             merged_point_idx += 1
-            
-    #         elif len(prev_pts) > 0:
-    #             # 仅prev的体素：记录这些点
-    #             for pt in prev_pts:
-    #                 prev_only_point_ids.add(pt['point3D_id'])
-            
-    #         elif len(curr_pts) > 0:
-    #             # 仅curr的体素：记录这些点
-    #             for pt in curr_pts:
-    #                 curr_only_point_ids.add(pt['point3D_id'])
-        
-    #     if self.verbose:
-    #         print(f"  合并结果:")
-    #         print(f"    合并后的重叠点数: {len(merged_overlap_points)}")
-    #         print(f"    仅prev的点数: {len(prev_only_point_ids)}")
-    #         print(f"    仅curr的点数: {len(curr_only_point_ids)}")
-    #         if len(merged_overlap_points) > 0:
-    #             avg_merged = np.mean([m['num_points_merged'] for m in merged_overlap_points.values()])
-    #             print(f"    平均每个合并点包含: {avg_merged:.2f} 个原始点")
-
-    #     # ============================================================================
-    #     # 8. 构建合并后的reconstruction
-    #     # ============================================================================
-    #     merged_recon = pycolmap.Reconstruction()
-        
-    #     # 8.1 复制prev的所有cameras
-    #     for camera_id, camera in prev_recon.cameras.items():
-    #         merged_recon.add_camera(camera)
-        
-    #     # 8.2 添加所有3D点
-    #     prev_to_merged_point3D_id = {}  # prev原始ID -> merged中的新ID
-    #     curr_to_merged_point3D_id = {}  # curr原始ID -> merged中的新ID
-        
-    #     # 8.2.1 添加prev的所有3D点
-    #     for point3D_id, point3D in prev_recon.points3D.items():
-    #         # 检查是否在重叠区被合并
-    #         if point3D_id in prev_to_merged_xyz:
-    #             xyz = prev_to_merged_xyz[point3D_id]['xyz']
-    #             color = prev_to_merged_xyz[point3D_id]['color']
-    #         else:
-    #             xyz = np.array(point3D.xyz, dtype=np.float64)
-    #             color = np.array(point3D.color, dtype=np.uint8)
-            
-    #         new_point3D_id = merged_recon.add_point3D(
-    #             xyz=xyz,
-    #             track=pycolmap.Track(),
-    #             color=color
-    #         )
-    #         prev_to_merged_point3D_id[point3D_id] = new_point3D_id
-        
-    #     # 8.2.2 建立curr到merged的映射
-    #     # 已合并的curr点 -> 对应的prev点的merged ID
-    #     for curr_id, prev_id in curr_to_prev_mapping.items():
-    #         if prev_id in prev_to_merged_point3D_id:
-    #             curr_to_merged_point3D_id[curr_id] = prev_to_merged_point3D_id[prev_id]
-        
-    #     # 8.2.3 添加curr中未合并但在非重叠区有观测的3D点
-    #     new_curr_point_count = 0
-    #     for point3D_id, point3D in curr_recon.points3D.items():
-    #         # 跳过已合并的点
-    #         if point3D_id in curr_to_merged_point3D_id:
-    #             continue
-            
-    #         # 检查是否在非重叠区有观测
-    #         has_non_overlap_obs = False
-    #         for track_elem in point3D.track.elements:
-    #             if track_elem.image_id not in curr_overlap_image_set:
-    #                 has_non_overlap_obs = True
-    #                 break
-            
-    #         if not has_non_overlap_obs:
-    #             continue
-            
-    #         new_point3D_id = merged_recon.add_point3D(
-    #             xyz=np.array(point3D.xyz, dtype=np.float64),
-    #             track=pycolmap.Track(),
-    #             color=np.array(point3D.color, dtype=np.uint8)
-    #         )
-    #         curr_to_merged_point3D_id[point3D_id] = new_point3D_id
-    #         new_curr_point_count += 1
-        
-    #     if self.verbose:
-    #         print(f"  添加了 {len(prev_to_merged_point3D_id)} 个prev 3D点")
-    #         print(f"  添加了 {new_curr_point_count} 个curr新3D点")
-
-    #     # 8.3 添加prev的所有影像，更新track
-    #     merged_image_id = 1
-    #     for image_id in sorted(prev_recon.images.keys()):
-    #         prev_image = prev_recon.images[image_id]
-            
-    #         new_points2D = []
-    #         point2D_idx = 0
-            
-    #         for point2D in prev_image.points2D:
-    #             xy_array = np.asarray(point2D.xy, dtype=np.float64)
-                
-    #             if point2D.has_point3D() and point2D.point3D_id in prev_to_merged_point3D_id:
-    #                 new_point3D_id = prev_to_merged_point3D_id[point2D.point3D_id]
-    #                 new_point2D = pycolmap.Point2D(xy=xy_array, point3D_id=new_point3D_id)
-    #                 new_points2D.append(new_point2D)
-                    
-    #                 # 更新track
-    #                 track = merged_recon.points3D[new_point3D_id].track
-    #                 track.add_element(merged_image_id, point2D_idx)
-    #             else:
-    #                 new_points2D.append(pycolmap.Point2D(xy=xy_array))
-                
-    #             point2D_idx += 1
-            
-    #         new_image = pycolmap.Image(
-    #             image_id=merged_image_id,
-    #             name=prev_image.name,
-    #             camera_id=prev_image.camera_id,
-    #             cam_from_world=prev_image.cam_from_world,
-    #             points2D=new_points2D
-    #         )
-    #         merged_recon.add_image(new_image)
-    #         merged_image_id += 1
-        
-    #     prev_image_count = merged_image_id - 1
-    #     if self.verbose:
-    #         print(f"  添加了 {prev_image_count} 张prev影像")
-
-    #     # 8.4 添加curr中非重叠区域的影像
-    #     curr_non_overlap_image_ids = list(range(
-    #         self.overlap + 1,
-    #         len(curr_recon.images) + 1
-    #     ))
-        
-    #     curr_to_merged_image_id = {}
-    #     for curr_img_id in curr_non_overlap_image_ids:
-    #         if curr_img_id not in curr_recon.images:
-    #             continue
-            
-    #         curr_image = curr_recon.images[curr_img_id]
-            
-    #         new_points2D = []
-    #         point2D_idx = 0
-            
-    #         for point2D in curr_image.points2D:
-    #             xy_array = np.asarray(point2D.xy, dtype=np.float64)
-                
-    #             if point2D.has_point3D() and point2D.point3D_id in curr_to_merged_point3D_id:
-    #                 new_point3D_id = curr_to_merged_point3D_id[point2D.point3D_id]
-    #                 new_point2D = pycolmap.Point2D(xy=xy_array, point3D_id=new_point3D_id)
-    #                 new_points2D.append(new_point2D)
-                    
-    #                 # 更新track
-    #                 track = merged_recon.points3D[new_point3D_id].track
-    #                 track.add_element(merged_image_id, point2D_idx)
-    #             else:
-    #                 new_points2D.append(pycolmap.Point2D(xy=xy_array))
-                
-    #             point2D_idx += 1
-            
-    #         new_image = pycolmap.Image(
-    #             image_id=merged_image_id,
-    #             name=curr_image.name,
-    #             camera_id=curr_image.camera_id,
-    #             cam_from_world=curr_image.cam_from_world,
-    #             points2D=new_points2D
-    #         )
-    #         merged_recon.add_image(new_image)
-    #         curr_to_merged_image_id[curr_img_id] = merged_image_id
-    #         merged_image_id += 1
-        
-    #     if self.verbose:
-    #         print(f"  添加了 {len(curr_to_merged_image_id)} 张curr非重叠影像")
-
-    #     # 8.5 清理观测数量不足的3D点
-    #     points3d_to_remove = []
-    #     for point3d_id in list(merged_recon.points3D.keys()):
-    #         point3d = merged_recon.points3D[point3d_id]
-    #         if len(point3d.track.elements) < 2:
-    #             points3d_to_remove.append(point3d_id)
-        
-    #     for point3d_id in points3d_to_remove:
-    #         del merged_recon.points3D[point3d_id]
-        
-    #     if self.verbose and len(points3d_to_remove) > 0:
-    #         print(f"  移除了 {len(points3d_to_remove)} 个观测不足的3D点")
-
-    #     # 8.6 更新merged_reconstruction
-    #     self.merged_reconstruction = merged_recon
-        
-    #     if self.verbose:
-    #         print(f"  ===== 合并完成 =====")
-    #         print(f"    总影像数: {len(merged_recon.images)}")
-    #         print(f"    总3D点数: {len(merged_recon.points3D)}")
-
-    #     # 8.7 保存merged_reconstruction
-    #     temp_path = self.output_dir / "temp_merged" / f"merged_reconstruction_{len(self.inference_reconstructions)}"
-    #     temp_path.mkdir(parents=True, exist_ok=True)
-    #     merged_recon.write_text(str(temp_path))
-    #     merged_recon.export_PLY(str(temp_path / "points3D.ply"))
-    #     self.export_reconstruction_to_las(merged_recon, str(temp_path / "points3D.las"))
-
-    #     return True
+        return True  
 
     def _align_merged_reconstruction_to_gps_poses(
         self,
@@ -5598,6 +4733,8 @@ def run_incremental_feature_matching(
     min_inlier_per_frame: int = 32,
     run_global_sfm_first: bool = True,
     filter_edge_margin: float = 150.0,
+    enable_visualization: bool = True,
+    visualization_mode: str = 'merged',  # 'aligned' | 'merged'
     verbose: bool = False,
 ) -> bool:
     """Run incremental image initialization pipeline.
@@ -5614,6 +4751,8 @@ def run_incremental_feature_matching(
         min_inlier_per_frame: Minimum number of inliers per frame for feature matching
         run_global_sfm_first: Whether to run global SfM first
         filter_edge_margin: Edge margin for filtering points (in pixels), default 10, set to 0 to disable
+        enable_visualization: Whether to start viser server for visualization
+        visualization_mode: Point cloud visualization mode, 'aligned' (per batch) or 'merged' (unified)
         verbose: Enable verbose logging
     
     Returns:
@@ -5660,6 +4799,8 @@ def run_incremental_feature_matching(
         max_points3D_val=max_points3D_val,
         min_inlier_per_frame=min_inlier_per_frame,
         filter_edge_margin=filter_edge_margin,
+        enable_visualization=enable_visualization,
+        visualization_mode=visualization_mode,
         verbose=verbose,
     )
 
@@ -5704,6 +4845,9 @@ if __name__ == "__main__":
     # input_dir = Path(r"drone-map-anything\examples\SWJTU_7th_teaching_building\images")
     # output_dir = Path(r"drone-map-anything\output\SWJTU_7th_teaching_building\sparse_incremental_reconstruction")
     
+    # input_dir = Path(r"drone-map-anything\examples\HuaPo\images")
+    # output_dir = Path(r"drone-map-anything\output\HuaPo\sparse_incremental_reconstruction")
+
     # Get all image files and sort them
     supported_formats = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"}
     image_files = sorted([

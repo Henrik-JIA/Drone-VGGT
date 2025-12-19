@@ -12,6 +12,186 @@ import pycolmap
 from mapanything.third_party.projection import project_3D_points_np
 
 
+# def batch_np_matrix_to_pycolmap(
+#     points3d,
+#     extrinsics,
+#     intrinsics,
+#     tracks,
+#     image_size,
+#     masks=None,
+#     max_reproj_error=None,
+#     max_points3D_val=3000,
+#     shared_camera=False,
+#     camera_type="SIMPLE_PINHOLE",
+#     extra_params=None,
+#     min_inlier_per_frame=64,
+#     points_rgb=None,
+# ):
+#     """
+#     Convert Batched NumPy Arrays to PyCOLMAP
+
+#     Check https://github.com/colmap/pycolmap for more details about its format
+
+#     NOTE that colmap expects images/cameras/points3D to be 1-indexed
+#     so there is a +1 offset between colmap index and batch index
+
+
+#     NOTE: different from VGGSfM, this function:
+#     1. Use np instead of torch
+#     2. Frame index and camera id starts from 1 rather than 0 (to fit the format of PyCOLMAP)
+#     """
+#     # points3d: Px3
+#     # extrinsics: Nx3x4
+#     # intrinsics: Nx3x3
+#     # tracks: NxPx2
+#     # masks: NxP
+#     # image_size: 2, assume all the frames have been padded to the same size
+#     # where N is the number of frames and P is the number of tracks
+
+#     N, P, _ = tracks.shape
+#     assert len(extrinsics) == N
+#     assert len(intrinsics) == N
+#     assert len(points3d) == P
+#     assert image_size.shape[0] == 2
+
+#     reproj_mask = None
+
+#     # 计算重投影误差
+#     if max_reproj_error is not None:
+#         # 把3D点投影回2D图像
+#         projected_points_2d, projected_points_cam = project_3D_points_np(
+#             points3d, extrinsics, intrinsics
+#         )
+#         # 计算投影位置和实际检测位置的差距
+#         projected_diff = np.linalg.norm(projected_points_2d - tracks, axis=-1)
+#         projected_points_2d[projected_points_cam[:, -1] <= 0] = 1e6
+#         # 如果差距小于最大重投影误差，则设置为True
+#         reproj_mask = projected_diff < max_reproj_error
+
+#     if masks is not None and reproj_mask is not None:
+#         masks = np.logical_and(masks, reproj_mask)
+#     elif masks is not None:
+#         masks = masks
+#     else:
+#         masks = reproj_mask
+
+#     assert masks is not None
+
+#     # 检查每帧是否有足够的有效点
+#     if masks.sum(1).min() < min_inlier_per_frame: # 默认每帧至少64个点
+#         print("Not enough inliers per frame, skip BA.")
+#         return None, None
+
+#     # Reconstruction object, following the format of PyCOLMAP/COLMAP
+#     reconstruction = pycolmap.Reconstruction()
+
+#     # 只添加在至少2张图像中可见的3D点
+#     inlier_num = masks.sum(0) # 统计每个点被多少张图看到，至少2张图可见的点才被添加
+#     valid_mask = inlier_num >= 2  # a track is invalid if without two inliers
+#     valid_idx = np.nonzero(valid_mask)[0] # 获取至少2张图可见的点的索引
+
+#     # Only add 3D points that have sufficient 2D points
+#     for vidx in valid_idx:
+#         # Use RGB colors if provided, otherwise use zeros
+#         rgb = points_rgb[vidx] if points_rgb is not None else np.zeros(3)
+#         reconstruction.add_point3D(points3d[vidx], pycolmap.Track(), rgb)
+
+#     num_points3D = len(valid_idx)
+#     camera = None
+#     # frame idx
+#     for fidx in range(N): # 遍历每张图像
+#         # set camera 
+#         # 如果shared_camera=True：所有图像共用1个相机对象；
+#         # 如果shared_camera=False：每张图像创建独立的相机对象。
+#         if camera is None or (not shared_camera):
+#             # 创建相机内参
+#             pycolmap_intri = _build_pycolmap_intri(
+#                 fidx, intrinsics, camera_type, extra_params
+#             )
+
+#             # 创建相机对象
+#             camera = pycolmap.Camera(
+#                 model=camera_type,
+#                 width=image_size[0],
+#                 height=image_size[1],
+#                 params=pycolmap_intri,
+#                 camera_id=fidx + 1,
+#             )
+
+#             # add camera 添加相机到重建对象
+#             reconstruction.add_camera(camera)
+
+#         # set image，w2c 变换，将世界坐标系下的外参转到相机坐标系下
+#         cam_from_world = pycolmap.Rigid3d(
+#             pycolmap.Rotation3d(extrinsics[fidx][:3, :3]), extrinsics[fidx][:3, 3]
+#         )  # Rot and Trans
+
+#         # 创建图像对象，包含相机位姿和图像ID
+#         image = pycolmap.Image(
+#             id=fidx + 1,
+#             name=f"image_{fidx + 1}",
+#             camera_id=camera.camera_id,
+#             cam_from_world=cam_from_world,
+#         )
+
+#         # 为这张图像添加2D特征点，并关联到3D点
+#         points2D_list = [] # 创建一个空列表，用来存放这张照片中的所有2D特征点
+
+#         point2D_idx = 0 # 计数器，记录当前是这张照片中的第几个特征点
+
+#         # NOTE point3D_id start by 1
+#         for point3D_id in range(1, num_points3D + 1):
+#             original_track_idx = valid_idx[point3D_id - 1] # 获取这个3D点在照片中的索引
+
+#             if (np.abs(reconstruction.points3D[point3D_id].xyz) < max_points3D_val).all(): # 检查3D点是否合理，因为太远的点（比如坐标是10000）可能是异常值或错误
+#                 if masks[fidx][original_track_idx]: # 检查这个点在当前照片中是否可见
+#                     # 记录"照片→3D点"的关系
+#                     # 第0个点(x,y) → 3D点id_1
+#                     # 第1个点(x,y) → 3D点id_2
+#                     # 第2个点(x,y) → 3D点id_3
+#                     # ...
+#                     # It seems we don't need +0.5 for BA
+#                     point2D_xy = tracks[fidx][original_track_idx] # 获取这个3D点在图像中的2D坐标
+#                     # Please note when adding the Point2D object
+#                     # It not only requires the 2D xy location, but also the id to 3D point
+#                     points2D_list.append(pycolmap.Point2D(point2D_xy, point3D_id)) # 记录关联关系，将2D坐标和3D点ID关联起来
+
+#                     # 记录"3D点→照片"的关系
+#                     # 3D点id_1 → 第0个点(x,y)
+#                     # 3D点id_2 → 第1个点(x,y)
+#                     # 3D点id_3 → 第2个点(x,y)
+#                     # ...
+#                     # add element
+#                     track = reconstruction.points3D[point3D_id].track # 获取这个3D点的轨迹对象
+#                     track.add_element(fidx + 1, point2D_idx) # 这个3D点在第fidx + 1张照片中，是这张照片中的第point2D_idx个特征点
+#                     point2D_idx += 1
+
+#         # 断言检查，确保计数器和列表长度一致
+#         assert point2D_idx == len(points2D_list)
+
+#         try:
+#             image.points2D = pycolmap.ListPoint2D(points2D_list) 
+#             # image.registered = True # 标记这张图像成功注册
+#         except:  # noqa
+#             print(f"frame {fidx + 1} is out of BA")
+#             # image.registered = False # 标记这张图像注册失败
+
+#         # add image
+#         reconstruction.add_image(image)
+
+#     # Clean up 3D points without track elements (filtered by coordinate check)
+#     # 检查3D点是否存在2D关联，如果不存在则删除
+#     points_to_remove = [
+#         point3D_id for point3D_id in reconstruction.points3D
+#         if len(reconstruction.points3D[point3D_id].track.elements) == 0
+#     ]
+#     for point3D_id in points_to_remove:
+#         del reconstruction.points3D[point3D_id]
+#     if points_to_remove:
+#         print(f"Removed {len(points_to_remove)} points without 2D associations")
+    
+#     return reconstruction, valid_mask
+
 def batch_np_matrix_to_pycolmap(
     points3d,
     extrinsics,
@@ -78,7 +258,7 @@ def batch_np_matrix_to_pycolmap(
     assert masks is not None
 
     # 检查每帧是否有足够的有效点
-    if masks.sum(1).min() < min_inlier_per_frame: # 默认每帧至少64个点
+    if masks.sum(1).min() < min_inlier_per_frame:
         print("Not enough inliers per frame, skip BA.")
         return None, None
 
@@ -86,30 +266,59 @@ def batch_np_matrix_to_pycolmap(
     reconstruction = pycolmap.Reconstruction()
 
     # 只添加在至少2张图像中可见的3D点
-    inlier_num = masks.sum(0) # 统计每个点被多少张图看到，至少2张图可见的点才被添加
-    valid_mask = inlier_num >= 2  # a track is invalid if without two inliers
-    valid_idx = np.nonzero(valid_mask)[0] # 获取至少2张图可见的点的索引
-
-    # Only add 3D points that have sufficient 2D points
-    for vidx in valid_idx:
-        # Use RGB colors if provided, otherwise use zeros
-        rgb = points_rgb[vidx] if points_rgb is not None else np.zeros(3)
-        reconstruction.add_point3D(points3d[vidx], pycolmap.Track(), rgb)
-
+    inlier_num = masks.sum(0)
+    valid_mask = inlier_num >= 2
+    valid_idx = np.nonzero(valid_mask)[0]
     num_points3D = len(valid_idx)
+
+    if num_points3D == 0:
+        print("No valid 3D points found, skip BA.")
+        return None, None
+
+    # ========== 优化1: 预计算3D点坐标有效性（向量化）==========
+    valid_points3d = points3d[valid_idx]  # (num_points3D, 3)
+    coords_valid_mask = np.all(np.abs(valid_points3d) < max_points3D_val, axis=1)  # (num_points3D,)
+    
+    # ========== 优化2: 批量添加3D点 ==========
+    default_rgb = np.zeros(3, dtype=np.uint8)
+    if points_rgb is not None:
+        rgb_array = points_rgb[valid_idx]
+    else:
+        rgb_array = np.tile(default_rgb, (num_points3D, 1))
+    
+    # 预创建空Track对象用于复用
+    empty_track = pycolmap.Track()
+    for i in range(num_points3D):
+        reconstruction.add_point3D(valid_points3d[i], pycolmap.Track(), rgb_array[i])
+
+    # ========== 优化3: 预计算每帧的有效观测（向量化）==========
+    # 预提取有效点在每帧的 mask 和 tracks
+    masks_valid = masks[:, valid_idx]  # (N, num_points3D)
+    tracks_valid = tracks[:, valid_idx, :]  # (N, num_points3D, 2)
+    
+    # 结合坐标有效性检查
+    combined_valid = masks_valid & coords_valid_mask[np.newaxis, :]  # (N, num_points3D)
+    
+    # ========== 优化4: 预计算所有帧的有效点索引 ==========
+    # 避免每帧都调用 np.where
+    frame_valid_indices = [np.where(combined_valid[fidx])[0] for fidx in range(N)]
+
+    # ========== 优化5: 缓存points3D字典引用 ==========
+    points3D_dict = reconstruction.points3D
+    
+    # 预缓存所有3D点的track引用（减少字典查找）
+    track_refs = [points3D_dict[i + 1].track for i in range(num_points3D)]
+
     camera = None
-    # frame idx
-    for fidx in range(N): # 遍历每张图像
-        # set camera 
-        # 如果shared_camera=True：所有图像共用1个相机对象；
-        # 如果shared_camera=False：每张图像创建独立的相机对象。
+    image_id_base = 1
+    
+    # 遍历每张图像
+    for fidx in range(N):
+        # 设置相机
         if camera is None or (not shared_camera):
-            # 创建相机内参
             pycolmap_intri = _build_pycolmap_intri(
                 fidx, intrinsics, camera_type, extra_params
             )
-
-            # 创建相机对象
             camera = pycolmap.Camera(
                 model=camera_type,
                 width=image_size[0],
@@ -117,81 +326,67 @@ def batch_np_matrix_to_pycolmap(
                 params=pycolmap_intri,
                 camera_id=fidx + 1,
             )
-
-            # add camera 添加相机到重建对象
             reconstruction.add_camera(camera)
 
-        # set image，w2c 变换，将世界坐标系下的外参转到相机坐标系下
+        # 设置图像位姿
+        extr = extrinsics[fidx]
         cam_from_world = pycolmap.Rigid3d(
-            pycolmap.Rotation3d(extrinsics[fidx][:3, :3]), extrinsics[fidx][:3, 3]
-        )  # Rot and Trans
+            pycolmap.Rotation3d(extr[:3, :3]), extr[:3, 3]
+        )
 
-        # 创建图像对象，包含相机位姿和图像ID
+        image_id = fidx + image_id_base
         image = pycolmap.Image(
-            id=fidx + 1,
-            name=f"image_{fidx + 1}",
+            id=image_id,
+            name=f"image_{image_id}",
             camera_id=camera.camera_id,
             cam_from_world=cam_from_world,
         )
 
-        # 为这张图像添加2D特征点，并关联到3D点
-        points2D_list = [] # 创建一个空列表，用来存放这张照片中的所有2D特征点
-
-        point2D_idx = 0 # 计数器，记录当前是这张照片中的第几个特征点
-
-        # NOTE point3D_id start by 1
-        for point3D_id in range(1, num_points3D + 1):
-            original_track_idx = valid_idx[point3D_id - 1] # 获取这个3D点在照片中的索引
-
-            if (np.abs(reconstruction.points3D[point3D_id].xyz) < max_points3D_val).all(): # 检查3D点是否合理，因为太远的点（比如坐标是10000）可能是异常值或错误
-                if masks[fidx][original_track_idx]: # 检查这个点在当前照片中是否可见
-                    # 记录"照片→3D点"的关系
-                    # 第0个点(x,y) → 3D点id_1
-                    # 第1个点(x,y) → 3D点id_2
-                    # 第2个点(x,y) → 3D点id_3
-                    # ...
-                    # It seems we don't need +0.5 for BA
-                    point2D_xy = tracks[fidx][original_track_idx] # 获取这个3D点在图像中的2D坐标
-                    # Please note when adding the Point2D object
-                    # It not only requires the 2D xy location, but also the id to 3D point
-                    points2D_list.append(pycolmap.Point2D(point2D_xy, point3D_id)) # 记录关联关系，将2D坐标和3D点ID关联起来
-
-                    # 记录"3D点→照片"的关系
-                    # 3D点id_1 → 第0个点(x,y)
-                    # 3D点id_2 → 第1个点(x,y)
-                    # 3D点id_3 → 第2个点(x,y)
-                    # ...
-                    # add element
-                    track = reconstruction.points3D[point3D_id].track # 获取这个3D点的轨迹对象
-                    track.add_element(fidx + 1, point2D_idx) # 这个3D点在第fidx + 1张照片中，是这张照片中的第point2D_idx个特征点
-                    point2D_idx += 1
-
-        # 断言检查，确保计数器和列表长度一致
-        assert point2D_idx == len(points2D_list)
+        # ========== 优化6: 使用预计算的有效点索引 ==========
+        valid_point_indices = frame_valid_indices[fidx]
+        num_valid = len(valid_point_indices)
+        
+        if num_valid == 0:
+            image.points2D = pycolmap.ListPoint2D([])
+            reconstruction.add_image(image)
+            continue
+        
+        # 批量获取2D坐标（使用连续内存访问）
+        valid_2d_coords = tracks_valid[fidx, valid_point_indices]  # (num_valid, 2)
+        
+        # ========== 优化7: 预分配列表大小 ==========
+        points2D_list = [None] * num_valid
+        
+        # ========== 优化8: 使用缓存的track引用，减少字典查找 ==========
+        for local_idx in range(num_valid):
+            point_local_idx = valid_point_indices[local_idx]
+            point3D_id = point_local_idx + 1
+            
+            # 直接使用numpy数组索引（更快）
+            points2D_list[local_idx] = pycolmap.Point2D(valid_2d_coords[local_idx], point3D_id)
+            
+            # 使用缓存的track引用
+            track_refs[point_local_idx].add_element(image_id, local_idx)
 
         try:
-            image.points2D = pycolmap.ListPoint2D(points2D_list) 
-            # image.registered = True # 标记这张图像成功注册
+            image.points2D = pycolmap.ListPoint2D(points2D_list)
         except:  # noqa
             print(f"frame {fidx + 1} is out of BA")
-            # image.registered = False # 标记这张图像注册失败
 
-        # add image
         reconstruction.add_image(image)
 
-    # Clean up 3D points without track elements (filtered by coordinate check)
-    # 检查3D点是否存在2D关联，如果不存在则删除
+    # ========== 优化9: 使用预缓存的track引用清理无效3D点 ==========
     points_to_remove = [
-        point3D_id for point3D_id in reconstruction.points3D
-        if len(reconstruction.points3D[point3D_id].track.elements) == 0
+        i + 1 for i in range(num_points3D)
+        if len(track_refs[i].elements) == 0
     ]
-    for point3D_id in points_to_remove:
-        del reconstruction.points3D[point3D_id]
+    
     if points_to_remove:
+        for point3D_id in points_to_remove:
+            del points3D_dict[point3D_id]
         print(f"Removed {len(points_to_remove)} points without 2D associations")
     
     return reconstruction, valid_mask
-
 
 def pycolmap_to_batch_np_matrix(
     reconstruction, device="cpu", camera_type="SIMPLE_PINHOLE"

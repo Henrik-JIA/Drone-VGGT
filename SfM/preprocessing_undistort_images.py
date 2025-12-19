@@ -707,6 +707,7 @@ def main():
     # 基础目录
     preprocessing_dir = project_root / "examples" / "Ganluo_images" / "preprocessing"
     # preprocessing_dir = project_root / "examples" / "SWJTU_7th_teaching_building" / "preprocessing"
+    preprocessing_dir = project_root / "examples" / "HuaPo" / "preprocessing"
     
     # image_list.json 路径
     image_list_path = preprocessing_dir / "undistort_images" / "image_list.json"
