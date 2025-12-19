@@ -255,7 +255,13 @@ class IncrementalFeatureMatcherSfM:
         
         @self.gui_frustum_scale.on_update
         def _(_):
-            self._update_visualization()
+            # 直接更新所有已有 frustum 的 scale（而不是重新创建）
+            new_scale = self.gui_frustum_scale.value
+            for handle in self.viser_frustum_handles:
+                try:
+                    handle.scale = new_scale
+                except:
+                    pass
         
         if self.verbose:
             print("✓ Viser visualization server started")
@@ -477,6 +483,7 @@ class IncrementalFeatureMatcherSfM:
                             fov=fov_y,
                             aspect=aspect,
                             scale=self.gui_frustum_scale.value,
+                            color=(255, 0, 0),  # 红色线框
                             image=img_thumbnail,
                             wxyz=tf.SO3.from_matrix(R_cam).wxyz,
                             position=t_cam,
@@ -542,6 +549,7 @@ class IncrementalFeatureMatcherSfM:
                             fov=fov_y,
                             aspect=aspect,
                             scale=self.gui_frustum_scale.value,
+                            color=(255, 0, 0),  # 红色线框
                             image=img_thumbnail,
                             wxyz=tf.SO3.from_matrix(R_c2w).wxyz,
                             position=t_c2w,
@@ -4203,7 +4211,7 @@ class IncrementalFeatureMatcherSfM:
             # 点云融合参数
             point_fusion=True,
             fusion_method="2d_matching",
-            cell_sizes=[1, 2, 4, 6, 8, 10],
+            cell_sizes=[1, 2, 4, 6, 8, 10, 15, 20, 40, 80, 160, 320, 640, 1280],
             keep_unmatched_overlap=True,  # 保留重叠区未匹配点
             spatial_dedup_threshold=0.1,
             # 精化对齐参数
@@ -4217,11 +4225,11 @@ class IncrementalFeatureMatcherSfM:
                 (1.0, "scale_translation"),  # 第5阶段：dist<=1m
                 (0.5, "scale_translation"),  # 第6阶段：dist<=0.5m
             ],
-            voxel_size=4,
+            voxel_size=4.0,
             statistical_filter=False,
             min_track_length=2,
             boundary_filter=True,
-            filter_edge_margin=50,
+            filter_edge_margin=self.filter_edge_margin,
             verbose=self.verbose
         )
         
@@ -4460,12 +4468,12 @@ def run_incremental_feature_matching(
     image_interval: int = 2,
     min_images_for_scale: int = 6,
     overlap: int = 2,
-    pred_vis_scores_thres_value: float = 0.7, 
+    pred_vis_scores_thres_value: float = 0.5, 
     max_reproj_error: float = 5.0,
     max_points3D_val: int = 3000,
     min_inlier_per_frame: int = 32,
     run_global_sfm_first: bool = True,
-    filter_edge_margin: float = 150.0,
+    filter_edge_margin: float = 100.0,
     enable_visualization: bool = True,
     visualization_mode: str = 'merged',  # 'aligned' | 'merged'
     verbose: bool = False,
