@@ -4203,7 +4203,7 @@ class IncrementalFeatureMatcherSfM:
             # 点云融合参数
             point_fusion=True,
             fusion_method="2d_matching",
-            cell_sizes=[1, 3, 5, 10],
+            cell_sizes=[1, 2, 4, 6, 8, 10],
             keep_unmatched_overlap=True,  # 保留重叠区未匹配点
             spatial_dedup_threshold=0.1,
             # 精化对齐参数
@@ -4462,7 +4462,7 @@ def run_incremental_feature_matching(
     overlap: int = 2,
     pred_vis_scores_thres_value: float = 0.7, 
     max_reproj_error: float = 5.0,
-    max_points3D_val: int = 5000,
+    max_points3D_val: int = 3000,
     min_inlier_per_frame: int = 32,
     run_global_sfm_first: bool = True,
     filter_edge_margin: float = 150.0,
