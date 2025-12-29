@@ -19,8 +19,6 @@ from PIL import Image
 import laspy
 from scipy.spatial.transform import Rotation as R
 from collections import defaultdict
-import viser
-import viser.transforms as tf
 
 current_dir = Path(__file__).parent
 project_root = current_dir.parent  # drone-map-anything 根目录
@@ -33,6 +31,7 @@ if str(third_dir) not in sys.path:
 from feature_matcher import FeatureMatcherSfM
 from merge_construction import merge_reconstructions
 from sfm_extraction import extract_sfm_reconstruction_from_global
+from sfm_visualizer import SfMVisualizer
 from utils.gps import extract_gps_from_image, lat_lon_to_enu
 from utils.xmp import parse_xmp_tags
 from mapanything.utils.image import preprocess_inputs
@@ -205,444 +204,15 @@ class IncrementalFeatureMatcherSfM:
         self.recovered_inference_outputs: List[Dict] = []
 
         self.enable_visualization = enable_visualization
-        self.viser_server = None
-        self.viser_frustum_handles = []
-        self.viser_point_handles = []  # 每个 batch 的点云 handle 列表（aligned_recon 模式）
-        self.unified_point_clouds = []  # 每个 batch 的整体点云数据列表 [{'points': ndarray, 'colors': ndarray}, ...]
-        self.merged_point_cloud_handle = None  # merged 点云的 handle（merged 模式）
-        self.merged_point_cloud = None  # merged 点云数据 {'points': ndarray, 'colors': ndarray}
-        self.merged_point_cloud_version = 0  # merged 点云版本号
-
-        # Setup visualization if enabled
+        
+        # Setup visualization using SfMVisualizer
+        self.visualizer: Optional[SfMVisualizer] = None
         if self.enable_visualization:
-            self._setup_visualization()
-
-    def _setup_visualization(self):
-        """Setup viser visualization server."""
-        self.viser_server = viser.ViserServer()
-
-        # 添加客户端连接回调，设置相机参数
-        @self.viser_server.on_client_connect
-        def _(client: viser.ClientHandle) -> None:
-            # 设置更大的渲染距离，防止点云在远距离消失
-            # 这些参数会影响深度裁剪
-            client.camera.far = 5000.0  # 远裁剪平面，默认可能只有100
-            client.camera.near = 0.1      # 近裁剪平面
-
-        self.viser_server.scene.add_frame(
-            "/reconstruction",
-            wxyz=tf.SO3.from_x_radians(0.0).wxyz,
-            position=(0, 0, 0),
-            show_axes=True,
-        )
-        
-        # Add GUI controls
-        with self.viser_server.gui.add_folder("Visualization"):
-            self.gui_point_size = self.viser_server.gui.add_slider(
-                "Point size",
-                min=0.1,
-                max=5.0,
-                step=0.1,
-                initial_value=2.0,
+            self.visualizer = SfMVisualizer(
+                visualization_mode=self.visualization_mode,
+                verbose=self.verbose,
             )
-            self.gui_show_frustums = self.viser_server.gui.add_checkbox(
-                "Show frustums", True
-            )
-            self.gui_show_points = self.viser_server.gui.add_checkbox(
-                "Show point clouds", True
-            )
-            self.gui_frustum_scale = self.viser_server.gui.add_slider(
-                "Frustum scale",
-                min=0.1,
-                max=10.0,
-                step=0.1,
-                initial_value=3.0,
-            )
-        
-        # Initialize storage for scene handles
-        self.viser_frustum_handles = []
-        self.viser_point_handles = []
-        
-        # Add callbacks for real-time updates
-        @self.gui_show_frustums.on_update
-        def _(_):
-            for handle in self.viser_frustum_handles:
-                handle.visible = self.gui_show_frustums.value
-
-        @self.gui_point_size.on_update
-        def _(_):
-            # 根据 visualization_mode 更新相应点云的大小
-            if self.visualization_mode == 'aligned':
-                for handle in self.viser_point_handles:
-                    handle.point_size = self.gui_point_size.value
-            else:  # merged
-                if self.merged_point_cloud_handle is not None:
-                    self.merged_point_cloud_handle.point_size = self.gui_point_size.value
-        
-        @self.gui_show_points.on_update
-        def _(_):
-            show = self.gui_show_points.value
-            # 根据 visualization_mode 更新相应点云的可见性
-            if self.visualization_mode == 'aligned':
-                for handle in self.viser_point_handles:
-                    handle.visible = show
-            else:  # merged
-                if self.merged_point_cloud_handle is not None:
-                    self.merged_point_cloud_handle.visible = show
-        
-        @self.gui_frustum_scale.on_update
-        def _(_):
-            # 直接更新所有已有 frustum 的 scale（而不是重新创建）
-            new_scale = self.gui_frustum_scale.value
-            for handle in self.viser_frustum_handles:
-                try:
-                    handle.scale = new_scale
-                except:
-                    pass
-        
-        if self.verbose:
-            print("✓ Viser visualization server started")
-            print(f"  Open browser at: http://localhost:8080")
-        
-        return self.viser_server
-
-    # def _update_visualization(self):
-    #     """Update viser visualization with latest data.
-        
-    #     This function:
-    #     1. Uses the latest scale_ratio to rescale ALL point clouds
-    #     2. Updates/adds camera frustums
-    #     3. Updates/adds point clouds
-    #     """
-    #     if not hasattr(self, 'viser_server') or self.viser_server is None:
-    #         return
-        
-    #     # Get number of images to visualize
-    #     num_images = len(self.recovered_inference_outputs)
-        
-    #     # Clear old handles if we're re-scaling
-    #     if len(self.viser_point_handles) > 0:
-    #         for handle in self.viser_frustum_handles:
-    #             handle.remove() # 移除所有相机视锥体
-    #         for handle in self.viser_point_handles:
-    #             handle.remove() # 移除所有点云
-    #         self.viser_frustum_handles = [] # 清空列表
-    #         self.viser_point_handles = [] # 清空列表
-        
-    #     # Visualize each image
-    #     for i in range(num_images):
-    #         recovered_output = self.recovered_inference_outputs[i]
-
-    #         pts3d_recovered = recovered_output['pts3d']  # (1, H, W, 3) tensor
-    #         pts3d_np = pts3d_recovered[0].cpu().numpy()  # (H, W, 3)
-
-    #         H, W, _ = pts3d_np.shape
-            
-    #         pts_recovered = pts3d_np.reshape(-1, 3)
-            
-    #         # Get colors from original image (from input_views)
-    #         if i < len(self.input_views):
-    #             img_array = self.input_views[i]['img'].cpu().numpy()  # (H_orig, W_orig, 3)
-    #             # Resize colors to match point cloud resolution
-    #             img_resized = np.array(Image.fromarray(img_array).resize((W, H), Image.BILINEAR))
-    #             colors = img_resized.reshape(-1, 3).astype(np.uint8)
-    #         else:
-    #             # Default gray color if no image available
-    #             colors = np.full((pts_recovered.shape[0], 3), 128, dtype=np.uint8)
-            
-    #         # ==================== Add camera frustum =====================
-    #         camera_pose = recovered_output['camera_poses'][0].cpu().numpy()  # (4, 4)
-    #         K = np.array(recovered_output['camera_K'])  # (3, 3)
-    #         width = recovered_output['image_width']
-    #         height = recovered_output['image_height']
-            
-    #         # Calculate FOV from intrinsics
-    #         fx = K[0, 0]
-    #         fy = K[1, 1]
-    #         fov_y = 2 * np.arctan2(height / 2, fy)
-    #         aspect = width / height
-            
-    #         # Camera orientation and position
-    #         R_cam = camera_pose[:3, :3]
-    #         t_cam = camera_pose[:3, 3]
-            
-    #         if self.gui_show_frustums.value:
-    #             # Get thumbnail image
-    #             if i < len(self.input_views):
-    #                 img_thumbnail = self.input_views[i]['img'].cpu().numpy()
-    #                 # Downsample for display
-    #                 downsample = 4
-    #                 img_thumbnail = img_thumbnail[::downsample, ::downsample]
-    #             else:
-    #                 img_thumbnail = None
-                
-    #             frustum_handle = self.viser_server.scene.add_camera_frustum(
-    #                 f"/reconstruction/camera_{i:03d}",
-    #                 fov=fov_y,
-    #                 aspect=aspect,
-    #                 scale=self.gui_frustum_scale.value,
-    #                 image=img_thumbnail,
-    #                 wxyz=tf.SO3.from_matrix(R_cam).wxyz,
-    #                 position=t_cam,
-    #             )
-    #             self.viser_frustum_handles.append(frustum_handle)
-            
-    #         # ==================== Add point cloud =====================
-    #         if self.gui_show_points.value:
-    #             point_handle = self.viser_server.scene.add_point_cloud(
-    #                 f"/reconstruction/points_{i:03d}",
-    #                 points=pts_recovered,
-    #                 colors=colors,
-    #                 point_size=self.gui_point_size.value,
-    #                 point_shape="rounded",
-    #             )
-    #             self.viser_point_handles.append(point_handle)
-        
-    #     if self.verbose:
-    #         print(f"  ✓ Visualization updated: {num_images} cameras and point clouds")
-    #         print(f"    Total points: {sum([h.points.shape[0] for h in self.viser_point_handles])}")
-            
-    def _update_visualization(self):
-        """Update viser visualization with latest data.
-        
-        This function:
-        1. For 'aligned' mode: Incrementally adds NEW batch point clouds (from aligned_recon.points3D)
-        2. For 'merged' mode: Updates merged point cloud (from merged_reconstruction)
-        3. Adds only NEW camera frustums that haven't been visualized yet
-        
-        Point cloud mode is controlled by self.visualization_mode ('aligned' or 'merged')
-        """
-        if not hasattr(self, 'viser_server') or self.viser_server is None:
-            return
-        
-        show_points = self.gui_show_points.value
-        
-        # ==================== 1. aligned 模式：增量添加每个 batch 的整体点云 ====================
-        if self.visualization_mode == 'aligned':
-            num_point_clouds = len(self.unified_point_clouds)
-            num_visualized_point_clouds = len(self.viser_point_handles)  # 已可视化的点云数量
-            
-            if num_point_clouds > num_visualized_point_clouds:
-                if self.verbose:
-                    print(f"  Adding {num_point_clouds - num_visualized_point_clouds} new batch point clouds...")
-                
-                # 只添加新的 batch 点云
-                for i in range(num_visualized_point_clouds, num_point_clouds):
-                    unified_pc = self.unified_point_clouds[i]
-                    points = unified_pc['points']
-                    colors = unified_pc['colors']
-                    
-                    if len(points) > 0:
-                        point_handle = self.viser_server.scene.add_point_cloud(
-                            f"/reconstruction/points_batch_{i:03d}",
-                            points=points,
-                            colors=colors,
-                            point_size=self.gui_point_size.value,
-                            point_shape="rounded",
-                        )
-                        point_handle.visible = show_points
-                        self.viser_point_handles.append(point_handle)
-                        
-                        if self.verbose:
-                            print(f"  ✓ Added point cloud for batch {i}: {len(points)} points")
-        
-        # ==================== 2. merged 模式：更新整体合并点云 ====================
-        elif self.visualization_mode == 'merged' and self.merged_point_cloud is not None:
-            current_version = self.merged_point_cloud_version
-            visualized_version = getattr(self, '_visualized_merged_version', 0)
-            
-            if current_version > visualized_version:
-                points = self.merged_point_cloud['points']
-                colors = self.merged_point_cloud['colors']
-                
-                if len(points) > 0:
-                    # 移除旧的 merged 点云（如果存在）
-                    if self.merged_point_cloud_handle is not None:
-                        try:
-                            self.merged_point_cloud_handle.remove()
-                        except:
-                            pass
-                    
-                    # 添加新的 merged 点云
-                    self.merged_point_cloud_handle = self.viser_server.scene.add_point_cloud(
-                        "/reconstruction/points_merged",
-                        points=points,
-                        colors=colors,
-                        point_size=self.gui_point_size.value,
-                        point_shape="rounded",
-                    )
-                    self.merged_point_cloud_handle.visible = show_points
-                    
-                    if self.verbose:
-                        print(f"  ✓ Merged point cloud updated: {len(points)} points")
-                    
-                    self._visualized_merged_version = current_version
-        
-        # ==================== 2. 增量添加相机 frustum ====================
-        # aligned 模式：从 recovered_inference_outputs 获取（有重叠）
-        # merged 模式：从 merged_reconstruction 获取（无重叠）
-        
-        if self.visualization_mode == 'aligned':
-            # ==================== aligned 模式：增量添加，有重叠 ====================
-            num_images = len(self.recovered_inference_outputs)
-            num_visualized = len(self.viser_frustum_handles)
-            
-            if num_images > num_visualized:
-                if self.verbose:
-                    print(f"  Adding {num_images - num_visualized} new camera frustums (aligned mode)...")
-                
-                for i in range(num_visualized, num_images):
-                    recovered_output = self.recovered_inference_outputs[i]
-                    
-                    camera_pose = recovered_output['camera_poses'][0].cpu().numpy()  # (4, 4)
-                    K = np.array(recovered_output['camera_K'])  # (3, 3)
-                    width = recovered_output['image_width']
-                    height = recovered_output['image_height']
-                    
-                    fx = K[0, 0]
-                    fy = K[1, 1]
-                    fov_y = 2 * np.arctan2(height / 2, fy)
-                    aspect = width / height
-                    
-                    R_cam = camera_pose[:3, :3]
-                    t_cam = camera_pose[:3, 3]
-                    
-                    if self.gui_show_frustums.value:
-                        if i < len(self.input_views):
-                            img_thumbnail = self.input_views[i]['img'].cpu().numpy()
-                            downsample = 4
-                            img_thumbnail = img_thumbnail[::downsample, ::downsample]
-                        else:
-                            img_thumbnail = None
-                        
-                        frustum_handle = self.viser_server.scene.add_camera_frustum(
-                            f"/reconstruction/camera_{i:03d}",
-                            fov=fov_y,
-                            aspect=aspect,
-                            scale=self.gui_frustum_scale.value,
-                            color=(255, 0, 0),  # 红色线框
-                            image=img_thumbnail,
-                            wxyz=tf.SO3.from_matrix(R_cam).wxyz,
-                            position=t_cam,
-                        )
-                        self.viser_frustum_handles.append(frustum_handle)
-                
-                if self.verbose:
-                    total_points = sum(len(pc['points']) for pc in self.unified_point_clouds)
-                    print(f"  ✓ Visualization updated: {num_images} cameras, {len(self.unified_point_clouds)} batches, {total_points} points (aligned mode)")
-        
-        elif self.visualization_mode == 'merged' and self.merged_reconstruction is not None:
-            # ==================== merged 模式：从 merged_reconstruction 获取，无重叠 ====================
-            num_images = len(self.merged_reconstruction.images)
-            num_visualized = len(self.viser_frustum_handles)
-            
-            if num_images > num_visualized:
-                if self.verbose:
-                    print(f"  Adding {num_images - num_visualized} new camera frustums (merged mode)...")
-                
-                # 清除旧的 frustum handles（因为 merged 后 image_id 可能重新编号）
-                for handle in self.viser_frustum_handles:
-                    try:
-                        handle.remove()
-                    except:
-                        pass
-                self.viser_frustum_handles = []
-                
-                # 重新添加所有 merged_reconstruction 中的相机
-                for image_id, pyimage in sorted(self.merged_reconstruction.images.items()):
-                    pycamera = self.merged_reconstruction.cameras[pyimage.camera_id]
-                    
-                    # 从 pycolmap 提取相机位姿 (cam_from_world 是 world2cam)
-                    R_w2c = np.array(pyimage.cam_from_world.rotation.matrix())
-                    t_w2c = np.array(pyimage.cam_from_world.translation)
-                    
-                    # 转换为 cam2world (viser 需要 cam2world)
-                    R_c2w = R_w2c.T
-                    t_c2w = -R_w2c.T @ t_w2c
-                    
-                    # 获取相机内参
-                    width = pycamera.width
-                    height = pycamera.height
-                    fx = pycamera.focal_length_x
-                    fy = pycamera.focal_length_y
-                    
-                    fov_y = 2 * np.arctan2(height / 2, fy)
-                    aspect = width / height
-                    
-                    if self.gui_show_frustums.value:
-                        # 尝试通过图像名获取缩略图
-                        img_thumbnail = None
-                        image_name = pyimage.name
-                        # 查找对应的 input_views 索引
-                        for idx, path in enumerate(self.image_paths):
-                            if path.name == image_name and idx < len(self.input_views):
-                                img_thumbnail = self.input_views[idx]['img'].cpu().numpy()
-                                downsample = 4
-                                img_thumbnail = img_thumbnail[::downsample, ::downsample]
-                                break
-                        
-                        frustum_handle = self.viser_server.scene.add_camera_frustum(
-                            f"/reconstruction/camera_merged_{image_id:03d}",
-                            fov=fov_y,
-                            aspect=aspect,
-                            scale=self.gui_frustum_scale.value,
-                            color=(255, 0, 0),  # 红色线框
-                            image=img_thumbnail,
-                            wxyz=tf.SO3.from_matrix(R_c2w).wxyz,
-                            position=t_c2w,
-                        )
-                        self.viser_frustum_handles.append(frustum_handle)
-                
-                if self.verbose:
-                    total_points = len(self.merged_point_cloud['points']) if self.merged_point_cloud else 0
-                    print(f"  ✓ Visualization updated: {num_images} cameras (unique), {total_points} points (merged mode)")
-        else:
-            if self.verbose:
-                print(f"  No new cameras to visualize")
-
-    def _update_merged_point_cloud_for_visualization(self, reconstruction: pycolmap.Reconstruction):
-        """从 merged_reconstruction 提取整体点云用于可视化（merged 模式）
-        
-        每次合并后调用此函数更新 merged 点云数据。
-        
-        Args:
-            reconstruction: 合并后的 pycolmap.Reconstruction 对象
-        """
-        if reconstruction is None or len(reconstruction.points3D) == 0:
-            return
-        
-        num_points = len(reconstruction.points3D)
-        merged_points = np.empty((num_points, 3), dtype=np.float32)
-        merged_colors = np.empty((num_points, 3), dtype=np.uint8)
-        
-        for i, (point3D_id, point3D) in enumerate(reconstruction.points3D.items()):
-            merged_points[i] = point3D.xyz
-            merged_colors[i] = point3D.color  # RGB
-        
-        # 更新 merged 点云数据
-        self.merged_point_cloud = {
-            'points': merged_points,
-            'colors': merged_colors,
-        }
-        self.merged_point_cloud_version += 1  # 更新版本号触发可视化更新
-        
-        if self.verbose:
-            print(f"  ✓ Updated merged point cloud for visualization: {num_points} points")
-
-    def _prepare_visualization_data(self, image_path: Path) -> bool:
-        """Prepare and update visualization after adding a new image.
-        
-        This is called after _recover_original_pose for each new image.
-        """
-        # Setup visualization server on first call
-        if not hasattr(self, 'viser_server'):
-            self._setup_visualization()
-        
-        # Update visualization with all current data
-        if hasattr(self, 'viser_server') and self.viser_server is not None:
-            self._update_visualization()
-        
-        return True
+            self.visualizer.setup()
 
     def _load_model(self):
         """Load model (lazy loading).
@@ -1266,15 +836,13 @@ class IncrementalFeatureMatcherSfM:
                         unified_points[i] = point3D.xyz
                         unified_colors[i] = point3D.color  # RGB
                     
-                    # 将当前 batch 的整体点云添加到列表（增量添加，不覆盖之前的）
-                    self.unified_point_clouds.append({
-                        'points': unified_points,
-                        'colors': unified_colors,
-                        'batch_idx': len(self.inference_reconstructions) - 1,  # 记录 batch 索引
-                    })
+                    # 将当前 batch 的整体点云添加到可视化器
+                    if self.visualizer is not None:
+                        self.visualizer.add_batch_point_cloud(unified_points, unified_colors)
                     
                     if self.verbose:
-                        print(f"  ✓ Added unified point cloud for batch {len(self.unified_point_clouds)}: {num_points} points")
+                        batch_count = len(self.visualizer.unified_point_clouds) if self.visualizer else 0
+                        print(f"  ✓ Added unified point cloud for batch {batch_count}: {num_points} points")
                 
                 # ==================== 2. 为每个图像存储相机位姿信息（用于显示 frustum）====================
                 for local_idx, global_idx in enumerate(indices):
@@ -1333,9 +901,13 @@ class IncrementalFeatureMatcherSfM:
                 merge_reconstruction_success = self._merge_reconstruction_intermediate_results()
 
             # Viser visualization
-            # prepare data for visualization (这里会自动更新可视化)
-            if self.enable_visualization:
-                prepare_visualization_data_success = self._prepare_visualization_data(image_path)
+            if self.enable_visualization and self.visualizer is not None:
+                self.visualizer.update(
+                    recovered_inference_outputs=self.recovered_inference_outputs,
+                    merged_reconstruction=self.merged_reconstruction,
+                    input_views=self.input_views,
+                    image_paths=self.image_paths,
+                )
         
         if not success:
             print(f"Failed to process image: {image_path}")
@@ -4444,7 +4016,8 @@ class IncrementalFeatureMatcherSfM:
             self.merged_reconstruction = self.inference_reconstructions[0]['reconstruction']
             merged_recon = self.merged_reconstruction
             # 提取 merged 点云用于可视化
-            self._update_merged_point_cloud_for_visualization(merged_recon)
+            if self.visualizer is not None:
+                self.visualizer.update_merged_point_cloud(merged_recon)
             # 保存merged_reconstruction
             temp_path = self.output_dir / "temp_merged" / f"merged_{len(self.inference_reconstructions)}"
             temp_path.mkdir(parents=True, exist_ok=True)
@@ -4522,7 +4095,8 @@ class IncrementalFeatureMatcherSfM:
         self.merged_reconstruction = merged_recon
         
         # 5. 提取 merged 点云用于可视化
-        self._update_merged_point_cloud_for_visualization(merged_recon)
+        if self.visualizer is not None:
+            self.visualizer.update_merged_point_cloud(merged_recon)
         
         # 6. 导出LAS格式
         self.export_reconstruction_to_las(merged_recon, str(output_dir / "points3D.las"))
@@ -4759,7 +4333,7 @@ def run_incremental_feature_matching(
     merge_boundary_filter: bool = True,  # 是否启用边界过滤
     merge_statistical_filter: bool = False,  # 是否启用统计过滤
     enable_visualization: bool = True,
-    visualization_mode: str = 'merged',  # 'aligned' | 'merged'
+    visualization_mode: str = 'aligned',  # 'aligned' | 'merged'
     verbose: bool = False,
 ) -> bool:
     """Run incremental image initialization pipeline.
