@@ -23,8 +23,12 @@ import viser
 import viser.transforms as tf
 
 current_dir = Path(__file__).parent
+project_root = current_dir.parent  # drone-map-anything 根目录
+third_dir = project_root / "third" / "vggt"  # 指向 third/vggt 目录（vggt项目根目录）
 if str(current_dir) not in sys.path:
     sys.path.insert(0, str(current_dir))
+if str(third_dir) not in sys.path:
+    sys.path.insert(0, str(third_dir))
 
 from feature_matcher import FeatureMatcherSfM
 from merge_construction import merge_reconstructions
@@ -40,6 +44,16 @@ from mapanything.third_party.np_to_pycolmap import (
     batch_np_matrix_to_pycolmap_wo_track,
 )
 from mapanything.utils.image import rgb
+
+# VGGT model imports (conditional)
+try:
+    from vggt.models.vggt import VGGT
+    from vggt.utils.load_fn import load_and_preprocess_images
+    from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+    VGGT_AVAILABLE = True
+except ImportError:
+    VGGT_AVAILABLE = False
+    print("Warning: VGGT model not available. Install vggt package to use VGGT model.")
 
 def cam_from_enu_transform(roll, pitch, yaw):
     """
@@ -82,6 +96,8 @@ class IncrementalFeatureMatcherSfM:
         self,
         output_dir: Path,
         reconstruction_type: str = 'dense_feature_points',  # 'dense_feature_points' | 'each_pixel_feature_points'
+        model_type: str = 'mapanything',  # 'mapanything' | 'vggt'
+        model_path: Optional[str] = None,  # 模型权重路径（VGGT需要）
         global_sparse_reconstruction: Optional[pycolmap.Reconstruction] = None,
         min_images_for_scale: int = 2,
         overlap: int = 1,
@@ -90,6 +106,9 @@ class IncrementalFeatureMatcherSfM:
         min_inlier_per_frame: int = 32,
         pred_vis_scores_thres_value: float = 0.3, 
         filter_edge_margin: float = 10.0,  # 边缘过滤范围（像素），默认10，设为0禁用
+        merge_voxel_size: float = 1.0,  # 点云合并时的体素大小（米）
+        merge_boundary_filter: bool = True,  # 是否启用边界过滤
+        merge_statistical_filter: bool = False,  # 是否启用统计过滤
         enable_visualization: bool = True,
         visualization_mode: str = 'merged',  # 'aligned' | 'merged'，点云可视化模式
         verbose: bool = False,
@@ -99,6 +118,8 @@ class IncrementalFeatureMatcherSfM:
         Args:
             output_dir: Directory for output files
             reconstruction_type: Type of reconstruction to use, 'dense_feature_points' | 'each_pixel_feature_points'
+            model_type: Type of model to use, 'mapanything' | 'vggt'
+            model_path: Path to model weights (required for VGGT, optional for MapAnything)
             min_images_for_scale: Minimum number of images before calculating scale.
                                   2 = calculate from 2nd image (default)
                                   3 = calculate from 3rd image
@@ -110,13 +131,26 @@ class IncrementalFeatureMatcherSfM:
             min_inlier_per_frame: Minimum inlier count per frame for valid BA
             pred_vis_scores_thres_value: Visibility confidence threshold for tracks
             filter_edge_margin: Edge margin for filtering points (in pixels), default 10, set to 0 to disable
+            merge_voxel_size: Voxel size for point cloud merging (in meters), default 1.0
+            merge_boundary_filter: Whether to enable boundary filtering during merge, default True
+            merge_statistical_filter: Whether to enable statistical filtering during merge, default False
             enable_visualization: Whether to start viser server for visualization
             visualization_mode: Point cloud visualization mode, 'aligned' (per batch) or 'merged' (unified)
             verbose: Enable verbose logging
         """
+        # Model type validation
+        if model_type not in ['mapanything', 'vggt']:
+            raise ValueError(f"model_type must be 'mapanything' or 'vggt', got: {model_type}")
+        if model_type == 'vggt' and not VGGT_AVAILABLE:
+            raise ValueError("VGGT model is not available. Please install the vggt package.")
+        
+        self.model_type = model_type
+        self.model_path = model_path
+        
         # Model (lazy loading)
         self.model = None
         self.device = None
+        self.dtype = None  # For VGGT mixed precision
 
         self.output_dir = Path(output_dir)
         
@@ -136,6 +170,9 @@ class IncrementalFeatureMatcherSfM:
         self.max_points3D_val = max_points3D_val
         self.min_inlier_per_frame = min_inlier_per_frame
         self.filter_edge_margin = filter_edge_margin
+        self.merge_voxel_size = merge_voxel_size
+        self.merge_boundary_filter = merge_boundary_filter
+        self.merge_statistical_filter = merge_statistical_filter
         
         # Visualization mode: 'aligned' (每个batch单独点云) or 'merged' (合并后整体点云)
         if visualization_mode not in ['aligned', 'merged']:
@@ -608,7 +645,9 @@ class IncrementalFeatureMatcherSfM:
         return True
 
     def _load_model(self):
-        """Load MapAnything model (lazy loading).
+        """Load model (lazy loading).
+        
+        Supports both MapAnything and VGGT models.
         
         Returns:
             Loaded model
@@ -617,12 +656,53 @@ class IncrementalFeatureMatcherSfM:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
             if self.verbose:
                 print(f"Using device: {self.device}")
-            model_name = "facebook/map-anything"
-            if self.verbose:
-                print(f"Loading model: {model_name}...")
-            self.model = MapAnything.from_pretrained(model_name).to(self.device)
-            if self.verbose:
-                print("✓ Model loaded")
+            
+            if self.model_type == 'mapanything':
+                model_name = "facebook/map-anything"
+                if self.verbose:
+                    print(f"Loading MapAnything model: {model_name}...")
+                self.model = MapAnything.from_pretrained(model_name).to(self.device)
+                if self.verbose:
+                    print("✓ MapAnything model loaded")
+            
+            elif self.model_type == 'vggt':
+                if self.verbose:
+                    print("Loading VGGT model...")
+                
+                # Determine dtype for mixed precision
+                if torch.cuda.is_available():
+                    self.dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+                else:
+                    self.dtype = torch.float32
+                
+                self.model = VGGT()
+                
+                # Load weights if provided
+                if self.model_path:
+                    # 处理相对路径：基于项目根目录解析
+                    model_path = Path(self.model_path)
+                    if not model_path.is_absolute():
+                        model_path = project_root / model_path
+                    
+                    if self.verbose:
+                        print(f"Loading weights from: {model_path}")
+                    state_dict = torch.load(str(model_path), map_location='cpu')
+                    self.model.load_state_dict(state_dict)
+                else:
+                    # Try to load from default location or huggingface
+                    try:
+                        # Try loading from huggingface hub
+                        self.model = VGGT.from_pretrained("facebook/vggt")
+                        if self.verbose:
+                            print("Loaded VGGT model from Hugging Face Hub")
+                    except Exception as e:
+                        if self.verbose:
+                            print(f"Warning: Could not load pretrained weights: {e}")
+                            print("Using randomly initialized VGGT model")
+                
+                self.model.to(self.device)
+                if self.verbose:
+                    print("✓ VGGT model loaded")
         
         return self.model
 
@@ -631,6 +711,7 @@ class IncrementalFeatureMatcherSfM:
         if self.model is not None:
             del self.model
             self.model = None
+            self.dtype = None
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             if self.verbose:
@@ -813,34 +894,79 @@ class IncrementalFeatureMatcherSfM:
                 # 批量矩阵求逆
                 extrinsic = np.linalg.inv(cam_batch)[:, :3, :]  # (n, 3, 4)
                 
-                # 处理图像和 original_coords
-                for i, idx in enumerate(indices):
-                    if idx < len(self.preprocessed_views):
-                        img = self.preprocessed_views[idx]['img']
-                        if img.dim() == 4 and img.shape[0] == 1:
-                            img = img.squeeze(0)
-                        batch_images.append(img)
+                # 处理图像和 original_coords - 根据模型类型选择不同的图像源
+                if self.model_type == 'vggt':
+                    # VGGT: 从输出中获取保存的预处理图像
+                    vggt_images = []
+                    for i, output in enumerate(outputs_list):
+                        vggt_img = output.get('vggt_image', None)
+                        if vggt_img is not None:
+                            vggt_images.append(vggt_img)
+                        else:
+                            # 回退到从 preprocessed_views 获取
+                            idx = indices[i]
+                            if idx < len(self.preprocessed_views):
+                                img = self.preprocessed_views[idx]['img']
+                                if img.dim() == 4 and img.shape[0] == 1:
+                                    img = img.squeeze(0)
+                                vggt_images.append(img)
                     
-                    scale_info = self.scale_info[idx]
-                    ori_w, ori_h = scale_info['original_size']
-                    original_coords[i] = [0, 0, ori_w, ori_h, ori_w, ori_h]
-                
-                images = torch.stack(batch_images)  # (num_frames, 3, H_preprocessed, W_preprocessed)
-                
-                # 将图像插值到推理输出的尺寸
-                points_rgb_images = F.interpolate(
-                    images,
-                    size=(height, width),
-                    mode="bilinear",
-                    align_corners=False,
-                )
+                    # 获取 original_coords
+                    for i, idx in enumerate(indices):
+                        scale_info = self.scale_info[idx]
+                        ori_w, ori_h = scale_info['original_size']
+                        original_coords[i] = [0, 0, ori_w, ori_h, ori_w, ori_h]
+                    
+                    # VGGT 图像已经是正确尺寸，直接使用
+                    if len(vggt_images) > 0:
+                        vggt_images_tensor = torch.stack(vggt_images)  # (n, 3, H, W)
+                        # VGGT 图像输出尺寸可能与 pts3d 不同，需要插值
+                        if vggt_images_tensor.shape[2:] != (height, width):
+                            vggt_images_tensor = F.interpolate(
+                                vggt_images_tensor,
+                                size=(height, width),
+                                mode="bilinear",
+                                align_corners=False,
+                            )
+                        # 转换为 numpy 并处理格式
+                        points_rgb_np = vggt_images_tensor.cpu().numpy()  # (N, 3, H, W)
+                        points_rgb_np = np.transpose(points_rgb_np, (0, 2, 3, 1))  # (N, H, W, 3)
+                        # 如果值在 0-1 范围，转换为 0-255
+                        if points_rgb_np.max() <= 1.0:
+                            points_rgb = (points_rgb_np * 255).astype(np.uint8)
+                        else:
+                            points_rgb = points_rgb_np.astype(np.uint8)
+                    else:
+                        raise ValueError("No VGGT images available for color extraction")
+                else:
+                    # MapAnything: 从 preprocessed_views 获取图像
+                    for i, idx in enumerate(indices):
+                        if idx < len(self.preprocessed_views):
+                            img = self.preprocessed_views[idx]['img']
+                            if img.dim() == 4 and img.shape[0] == 1:
+                                img = img.squeeze(0)
+                            batch_images.append(img)
+                        
+                        scale_info = self.scale_info[idx]
+                        ori_w, ori_h = scale_info['original_size']
+                        original_coords[i] = [0, 0, ori_w, ori_h, ori_w, ori_h]
+                    
+                    images = torch.stack(batch_images)  # (num_frames, 3, H_preprocessed, W_preprocessed)
+                    
+                    # 将图像插值到推理输出的尺寸
+                    points_rgb_images = F.interpolate(
+                        images,
+                        size=(height, width),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
 
-                model = self._load_model()
-                
-                # RGB处理
-                points_rgb_list = [rgb(points_rgb_images[i], model.encoder.data_norm_type) 
-                                   for i in range(points_rgb_images.shape[0])]
-                points_rgb = (np.stack(points_rgb_list) * 255).astype(np.uint8)  # Shape: (N, H, W, 3)
+                    model = self._load_model()
+                    
+                    # RGB处理
+                    points_rgb_list = [rgb(points_rgb_images[i], model.encoder.data_norm_type) 
+                                       for i in range(points_rgb_images.shape[0])]
+                    points_rgb = (np.stack(points_rgb_list) * 255).astype(np.uint8)  # Shape: (N, H, W, 3)
                 
                 # (S, H, W, 3), with x, y coordinates and frame indices
                 points_xyf = self.create_pixel_coordinate_grid(num_frames, height, width)
@@ -1376,43 +1502,15 @@ class IncrementalFeatureMatcherSfM:
         # Load model
         model = self._load_model()
 
-        # Run inference
-        if self.verbose:
-            print("Running MapAnything inference...")
-
         # 判断是第几张图像
         num_images = len(self.preprocessed_views)
 
-        if num_images == 1:
-            # 第一张图像，只推理单张
-            views_to_infer = [self.preprocessed_views[0]]
-            if self.verbose:
-                print("  Inferring first image (no scale calculation)")
-        elif num_images < self.min_images_for_scale:
-            # 图像数量不足 min_images_for_scale，推理从第一张到当前张的所有图像
-            views_to_infer = self.preprocessed_views[:]  # 所有图像
-            if self.verbose:
-                print(f"  Inferring images 1 to {num_images} ({num_images} images, building up to {self.min_images_for_scale})")
+        if self.model_type == 'mapanything':
+            outputs = self._run_mapanything_inference(model, num_images)
+        elif self.model_type == 'vggt':
+            outputs = self._run_vggt_inference(model, num_images)
         else:
-            # 图像数量已达到 min_images_for_scale，使用滑动窗口
-            views_to_infer = self.preprocessed_views[-self.min_images_for_scale:]
-            start_idx = num_images - self.min_images_for_scale + 1
-            if self.verbose:
-                print(f"  Inferring images {start_idx} to {num_images} ({self.min_images_for_scale} images, sliding window)")
-
-        outputs = model.infer(
-            views_to_infer,
-            memory_efficient_inference=False,
-            ignore_calibration_inputs=False,
-            ignore_depth_inputs=True,
-            ignore_pose_inputs=False,
-            ignore_depth_scale_inputs=True,
-            ignore_pose_scale_inputs=True,
-            use_amp=True,
-            amp_dtype="bf16",
-            apply_mask=True,
-            mask_edges=True,
-        )
+            raise ValueError(f"Unknown model type: {self.model_type}")
 
         # ==================== 计算 scale_ratio =====================
         scale_ratio = 1.0
@@ -1450,7 +1548,7 @@ class IncrementalFeatureMatcherSfM:
                 scale_ratio = (orig_dists[valid_mask] / (infer_dists[valid_mask] + 1e-8)).median().item()
                 
                 if self.verbose:
-                    print(f"  ================================ Computed Scale Ratio (COLMAP/MapAnything): {scale_ratio:.6f}")
+                    print(f"  ================================ Computed Scale Ratio (COLMAP/{self.model_type}): {scale_ratio:.6f}")
                     print(f"  Based on {valid_mask.sum().item()} camera pair distances from {num_infer} images")
             else:
                 if self.verbose:
@@ -1463,7 +1561,9 @@ class IncrementalFeatureMatcherSfM:
             print("✓ Inference completed!")
 
         # 从outputs中提取预测的尺度比例
-        predicted_scale_ratio = outputs[-1]['metric_scaling_factor'].item()
+        predicted_scale_ratio = outputs[-1].get('metric_scaling_factor', torch.tensor(1.0))
+        if isinstance(predicted_scale_ratio, torch.Tensor):
+            predicted_scale_ratio = predicted_scale_ratio.item()
         
         # 只存储当前图像（最后一张）的输出
         current_output = outputs[-1] if num_images >= 2 else outputs[0]
@@ -1483,6 +1583,185 @@ class IncrementalFeatureMatcherSfM:
             torch.cuda.empty_cache()
 
         return True
+
+    def _run_mapanything_inference(self, model, num_images: int) -> List[Dict]:
+        """Run MapAnything model inference.
+        
+        Args:
+            model: Loaded MapAnything model
+            num_images: Number of images to process
+            
+        Returns:
+            List of output dictionaries in unified format
+        """
+        if self.verbose:
+            print("Running MapAnything inference...")
+
+        if num_images == 1:
+            # 第一张图像，只推理单张
+            views_to_infer = [self.preprocessed_views[0]]
+            if self.verbose:
+                print("  Inferring first image (no scale calculation)")
+        elif num_images < self.min_images_for_scale:
+            # 图像数量不足 min_images_for_scale，推理从第一张到当前张的所有图像
+            views_to_infer = self.preprocessed_views[:]  # 所有图像
+            if self.verbose:
+                print(f"  Inferring images 1 to {num_images} ({num_images} images, building up to {self.min_images_for_scale})")
+        else:
+            # 图像数量已达到 min_images_for_scale，使用滑动窗口
+            views_to_infer = self.preprocessed_views[-self.min_images_for_scale:]
+            start_idx = num_images - self.min_images_for_scale + 1
+            if self.verbose:
+                print(f"  Inferring images {start_idx} to {num_images} ({self.min_images_for_scale} images, sliding window)")
+
+        outputs = model.infer(
+            views_to_infer,
+            memory_efficient_inference=False,
+            ignore_calibration_inputs=False,
+            ignore_depth_inputs=True,
+            ignore_pose_inputs=False,
+            ignore_depth_scale_inputs=True,
+            ignore_pose_scale_inputs=True,
+            use_amp=True,
+            amp_dtype="bf16",
+            apply_mask=True,
+            mask_edges=True,
+        )
+        
+        return outputs
+
+    def _run_vggt_inference(self, model, num_images: int) -> List[Dict]:
+        """Run VGGT model inference.
+        
+        Args:
+            model: Loaded VGGT model
+            num_images: Number of images to process
+            
+        Returns:
+            List of output dictionaries in unified format (compatible with MapAnything output)
+        """
+        if self.verbose:
+            print("Running VGGT inference...")
+
+        # Determine which images to infer
+        if num_images == 1:
+            image_paths_to_infer = [self.image_paths[0]]
+            view_indices = [0]
+            if self.verbose:
+                print("  Inferring first image (no scale calculation)")
+        elif num_images < self.min_images_for_scale:
+            image_paths_to_infer = self.image_paths[:]
+            view_indices = list(range(num_images))
+            if self.verbose:
+                print(f"  Inferring images 1 to {num_images} ({num_images} images, building up to {self.min_images_for_scale})")
+        else:
+            image_paths_to_infer = self.image_paths[-self.min_images_for_scale:]
+            view_indices = list(range(num_images - self.min_images_for_scale, num_images))
+            start_idx = num_images - self.min_images_for_scale + 1
+            if self.verbose:
+                print(f"  Inferring images {start_idx} to {num_images} ({self.min_images_for_scale} images, sliding window)")
+
+        # Preprocess images for VGGT
+        image_paths_str = [str(p) for p in image_paths_to_infer]
+        images = load_and_preprocess_images(image_paths_str).to(self.device)
+        
+        # Get image size for pose decoding
+        _, _, H, W = images.shape  # [S, 3, H, W]
+        image_size_hw = (H, W)
+
+        # Run inference
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(dtype=self.dtype):
+                predictions = model(images)
+
+        # Convert VGGT output to unified format
+        # VGGT outputs: world_points [B, S, H, W, 3], pose_enc [B, S, 9], etc.
+        outputs = self._convert_vggt_output_to_unified_format(
+            predictions, 
+            image_size_hw, 
+            view_indices,
+            images  # 传递原始图像用于颜色提取
+        )
+        
+        return outputs
+
+    def _convert_vggt_output_to_unified_format(
+        self, 
+        predictions: Dict, 
+        image_size_hw: Tuple[int, int],
+        view_indices: List[int],
+        images: torch.Tensor = None  # VGGT 预处理后的图像 [S, 3, H, W]
+    ) -> List[Dict]:
+        """Convert VGGT predictions to unified output format compatible with MapAnything.
+        
+        Args:
+            predictions: VGGT model predictions
+            image_size_hw: Tuple of (height, width) of preprocessed images
+            view_indices: List of view indices in original image list
+            images: VGGT preprocessed images tensor [S, 3, H, W] for color extraction
+            
+        Returns:
+            List of dictionaries with unified output format:
+                - pts3d: [1, H, W, 3] - 3D points
+                - conf: [1, H, W] - confidence
+                - camera_poses: [1, 4, 4] - camera pose (cam2world)
+                - intrinsics: [1, 3, 3] - camera intrinsics
+                - metric_scaling_factor: scalar - metric scaling factor
+                - vggt_image: [3, H, W] - VGGT preprocessed image for color (VGGT only)
+        """
+        # Extract predictions
+        world_points = predictions['world_points']  # [B, S, H, W, 3]
+        world_points_conf = predictions['world_points_conf']  # [B, S, H, W]
+        pose_enc = predictions['pose_enc']  # [B, S, 9]
+        
+        # Convert pose encoding to extrinsics and intrinsics
+        # extrinsics: [B, S, 3, 4] (cam from world)
+        # intrinsics: [B, S, 3, 3]
+        extrinsics, intrinsics = pose_encoding_to_extri_intri(
+            pose_enc, 
+            image_size_hw=image_size_hw,
+            pose_encoding_type="absT_quaR_FoV",
+            build_intrinsics=True
+        )
+        
+        # Convert extrinsics (cam from world) to camera poses (cam2world / world from cam)
+        # cam2world = inverse of extrinsics
+        B, S = extrinsics.shape[:2]
+        camera_poses = torch.zeros(B, S, 4, 4, device=extrinsics.device, dtype=extrinsics.dtype)
+        
+        for b in range(B):
+            for s in range(S):
+                # extrinsics is [R|t] where camera_coords = R @ world_coords + t
+                # cam2world: world_coords = R.T @ (camera_coords - t) = R.T @ camera_coords - R.T @ t
+                R = extrinsics[b, s, :3, :3]
+                t = extrinsics[b, s, :3, 3]
+                
+                R_inv = R.T
+                t_inv = -R_inv @ t
+                
+                camera_poses[b, s, :3, :3] = R_inv
+                camera_poses[b, s, :3, 3] = t_inv
+                camera_poses[b, s, 3, 3] = 1.0
+        
+        # Build unified output list
+        outputs = []
+        for s in range(S):
+            output = {
+                'pts3d': world_points[:, s, :, :, :],  # [B, H, W, 3] -> keep B dim for consistency
+                'conf': world_points_conf[:, s, :, :],  # [B, H, W]
+                'camera_poses': camera_poses[:, s, :, :],  # [B, 4, 4]
+                'intrinsics': intrinsics[:, s, :, :],  # [B, 3, 3]
+                'metric_scaling_factor': torch.tensor(1.0),  # VGGT doesn't output this, use 1.0
+                # Additional VGGT-specific outputs
+                'depth': predictions.get('depth', None),
+                'depth_conf': predictions.get('depth_conf', None),
+                'view_index': view_indices[s],
+                # 保存 VGGT 预处理后的图像用于颜色提取
+                'vggt_image': images[s] if images is not None else None,  # [3, H, W]
+            }
+            outputs.append(output)
+        
+        return outputs
 
 
     def _batch_recover_original_poses(self, image_path: Path, start_idx: int, end_idx: int, transform_tracks: bool = True) -> bool:
@@ -4225,10 +4504,10 @@ class IncrementalFeatureMatcherSfM:
                 (1.0, "scale_translation"),  # 第5阶段：dist<=1m
                 (0.5, "scale_translation"),  # 第6阶段：dist<=0.5m
             ],
-            voxel_size=4.0,
-            statistical_filter=False,
+            voxel_size=self.merge_voxel_size,
+            statistical_filter=self.merge_statistical_filter,
             min_track_length=2,
-            boundary_filter=True,
+            boundary_filter=self.merge_boundary_filter,
             filter_edge_margin=self.filter_edge_margin,
             verbose=self.verbose
         )
@@ -4465,15 +4744,20 @@ def run_incremental_feature_matching(
     image_paths: List[Path],
     output_dir: Path,
     reconstruction_type: str = 'each_pixel_feature_points', # 'dense_feature_points' | 'each_pixel_feature_points'
+    model_type: str = 'mapanything',  # 'mapanything' | 'vggt'
+    model_path: Optional[str] = None,  # 模型权重路径（VGGT需要）
     image_interval: int = 2,
     min_images_for_scale: int = 6,
     overlap: int = 2,
-    pred_vis_scores_thres_value: float = 0.5, 
+    pred_vis_scores_thres_value: float = 0.6, 
     max_reproj_error: float = 5.0,
-    max_points3D_val: int = 3000,
+    max_points3D_val: int = 10000,
     min_inlier_per_frame: int = 32,
     run_global_sfm_first: bool = True,
-    filter_edge_margin: float = 100.0,
+    filter_edge_margin: float = 50.0, # 边缘过滤范围（像素），默认50，设为0禁用
+    merge_voxel_size: float = 1.0,  # 点云合并时的体素大小（米）
+    merge_boundary_filter: bool = True,  # 是否启用边界过滤
+    merge_statistical_filter: bool = False,  # 是否启用统计过滤
     enable_visualization: bool = True,
     visualization_mode: str = 'merged',  # 'aligned' | 'merged'
     verbose: bool = False,
@@ -4483,6 +4767,9 @@ def run_incremental_feature_matching(
     Args:
         image_paths: List of image file paths in processing order
         output_dir: Directory for output files
+        reconstruction_type: Type of reconstruction, 'dense_feature_points' or 'each_pixel_feature_points'
+        model_type: Type of model to use, 'mapanything' or 'vggt'
+        model_path: Path to model weights (required for VGGT, optional for MapAnything)
         image_interval: Interval for selecting images (1=all, 2=every 2nd, etc.)
         min_images_for_scale: Minimum number of images required for scale estimation
         overlap: Number of overlapping images between consecutive reconstructions
@@ -4492,6 +4779,9 @@ def run_incremental_feature_matching(
         min_inlier_per_frame: Minimum number of inliers per frame for feature matching
         run_global_sfm_first: Whether to run global SfM first
         filter_edge_margin: Edge margin for filtering points (in pixels), default 10, set to 0 to disable
+        merge_voxel_size: Voxel size for point cloud merging (in meters), default 1.0
+        merge_boundary_filter: Whether to enable boundary filtering during merge, default True
+        merge_statistical_filter: Whether to enable statistical filtering during merge, default False
         enable_visualization: Whether to start viser server for visualization
         visualization_mode: Point cloud visualization mode, 'aligned' (per batch) or 'merged' (unified)
         verbose: Enable verbose logging
@@ -4532,6 +4822,8 @@ def run_incremental_feature_matching(
     matcher = IncrementalFeatureMatcherSfM(
         output_dir=output_dir,
         reconstruction_type=reconstruction_type,
+        model_type=model_type,
+        model_path=model_path,
         global_sparse_reconstruction=global_sparse_reconstruction,
         min_images_for_scale=min_images_for_scale,
         overlap=overlap,
@@ -4540,6 +4832,9 @@ def run_incremental_feature_matching(
         max_points3D_val=max_points3D_val,
         min_inlier_per_frame=min_inlier_per_frame,
         filter_edge_margin=filter_edge_margin,
+        merge_voxel_size=merge_voxel_size,
+        merge_boundary_filter=merge_boundary_filter,
+        merge_statistical_filter=merge_statistical_filter,
         enable_visualization=enable_visualization,
         visualization_mode=visualization_mode,
         verbose=verbose,
@@ -4571,6 +4866,8 @@ if __name__ == "__main__":
     # Example usage
     from pathlib import Path
     
+    # ==================== 配置参数 ====================
+    # 输入输出目录
     # input_dir = Path(r"drone-map-anything\examples\Comprehensive_building_sel\images")
     # output_dir = Path(r"drone-map-anything\output\Comprehensive_building_sel\sparse_incremental_reconstruction")
     
@@ -4589,6 +4886,12 @@ if __name__ == "__main__":
     # input_dir = Path(r"drone-map-anything\examples\HuaPo\images")
     # output_dir = Path(r"drone-map-anything\output\HuaPo\sparse_incremental_reconstruction")
 
+    # 模型选择: 'mapanything' 或 'vggt'
+    MODEL_TYPE = 'vggt'  # 切换模型类型
+    MODEL_PATH = "weights/vggt/model.pt"  # VGGT 模型权重路径，如果使用 VGGT 需要设置，例如: "weights/model.pt"
+        
+    # ================================================
+
     # Get all image files and sort them
     supported_formats = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"}
     image_files = sorted([
@@ -4597,11 +4900,14 @@ if __name__ == "__main__":
     ])
     
     print(f"Found {len(image_files)} images")
+    print(f"Using model: {MODEL_TYPE}")
     
     # Run incremental initialization
     success = run_incremental_feature_matching(
         image_paths=image_files,
         output_dir=output_dir,
+        model_type=MODEL_TYPE,
+        model_path=MODEL_PATH,
         verbose=True,
     )
     
