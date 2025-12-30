@@ -2316,7 +2316,7 @@ class IncrementalFeatureMatcherSfM:
             # 点云融合参数
             point_fusion=True,
             fusion_method="2d_matching",
-            cell_sizes=[1, 2, 4, 6, 8, 10, 15, 20, 40, 80, 160, 320, 640, 1280],
+            cell_sizes=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 30, 40, 80, 160, 320, 640, 1280],
             keep_unmatched_overlap=True,  # 保留重叠区未匹配点
             spatial_dedup_threshold=0.1,
             # 精化对齐参数
