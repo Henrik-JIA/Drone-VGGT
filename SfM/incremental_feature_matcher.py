@@ -37,6 +37,7 @@ from reconstruction_alignment import (
     find_single_images_pair_matches,
     estimate_sim3_transform,
 )
+from reconstruction_rename import rename_colmap_recons_and_rescale_camera
 from utils.gps import extract_gps_from_image, lat_lon_to_enu
 from utils.xmp import parse_xmp_tags
 from mapanything.utils.image import preprocess_inputs
@@ -675,7 +676,7 @@ class IncrementalFeatureMatcherSfM:
                 proc_h = self.scale_info[start_idx]['output_size'][1]
                 
                 # 重命名和缩放相机参数
-                reconstruction = self.rename_colmap_recons_and_rescale_camera(
+                reconstruction = rename_colmap_recons_and_rescale_camera(
                     reconstruction=reconstruction,
                     image_paths=image_paths_list,
                     original_coords=original_coords,
@@ -1888,7 +1889,7 @@ class IncrementalFeatureMatcherSfM:
             proc_h = self.scale_info[start_idx]['output_size'][1]
 
             # 调用函数
-            reconstruction = self.rename_colmap_recons_and_rescale_camera(
+            reconstruction = rename_colmap_recons_and_rescale_camera(
                 reconstruction=reconstruction,
                 image_paths=image_paths_list,
                 original_coords=original_coords,
@@ -1970,113 +1971,6 @@ class IncrementalFeatureMatcherSfM:
             import traceback
             traceback.print_exc()
             return False
-
-    def rename_colmap_recons_and_rescale_camera(
-        self,
-        reconstruction,
-        image_paths,
-        original_coords,
-        img_size,
-        shift_point2d_to_original_res=False,
-        shared_camera=False,
-    ):
-        # 规范化 original_coords 到 numpy
-        if "torch" in sys.modules and isinstance(original_coords, torch.Tensor):
-            original_coords_np = original_coords.detach().cpu().numpy()
-        else:
-            original_coords_np = np.asarray(original_coords)
-            
-        if isinstance(img_size, (list, tuple, np.ndarray)) and len(img_size) == 2:
-            proc_w = float(img_size[0])
-            proc_h = float(img_size[1])
-        else:
-            proc_w = float(img_size)
-            proc_h = float(img_size)
-        
-        # ========== 优化1: 预计算所有帧参数（向量化）==========
-        real_sizes = original_coords_np[:, -2:].astype(np.float64)  # (N, 2) [W_orig, H_orig]
-        inv_proc_size = np.array([1.0 / max(1e-8, proc_w), 1.0 / max(1e-8, proc_h)])
-        scale_factors = real_sizes * inv_proc_size  # (N, 2) [sx, sy]
-        
-        # 预提取 top_left 并转换为 float32（用于 shift_point2d）
-        if shift_point2d_to_original_res:
-            top_lefts = original_coords_np[:, :2].astype(np.float32)  # (N, 2) [x1, y1]
-            # 预计算 scale_xy 数组（float32），避免循环内创建
-            scale_factors_f32 = scale_factors.astype(np.float32)  # (N, 2)
-        
-        rescale_camera = True
-        processed_camera_ids = set()
-        
-        # ========== 优化2: 缓存字典引用 ==========
-        images_dict = reconstruction.images
-        cameras_dict = reconstruction.cameras
-
-        for pyimageid in images_dict:
-            pyimage = images_dict[pyimageid]
-            idx = pyimageid - 1
-            
-            # Rename image
-            pyimage.name = image_paths[idx]
-            
-            # 获取预计算的缩放因子
-            sx, sy = scale_factors[idx]
-            real_w, real_h = real_sizes[idx]
-
-            # ========== 优化3: 相机参数处理 ==========
-            camera_id = pyimage.camera_id
-            if rescale_camera and camera_id not in processed_camera_ids:
-                pycamera = cameras_dict[camera_id]
-                pred_params = list(pycamera.params)
-                num_params = len(pred_params)
-                model_name = getattr(pycamera, "model", "UNKNOWN")
-
-                if str(model_name) == "PINHOLE" or num_params == 4:
-                    pred_params[0] *= sx  # fx
-                    pred_params[1] *= sy  # fy
-                    pred_params[2] *= sx  # cx
-                    pred_params[3] *= sy  # cy
-                else:
-                    if num_params >= 2:
-                        pred_params[0] *= sx
-                        pred_params[1] *= sy
-                    if num_params >= 4:
-                        pred_params[-2] *= sx
-                        pred_params[-1] *= sy
-
-                pycamera.params = pred_params
-                pycamera.width = int(real_w)
-                pycamera.height = int(real_h)
-                
-                processed_camera_ids.add(camera_id)
-                
-                if shared_camera:
-                    rescale_camera = False
-
-            # ========== 优化4: points2D 坐标变换 ==========
-            if shift_point2d_to_original_res:
-                points2D_list = pyimage.points2D
-                num_points = len(points2D_list)
-                
-                if num_points > 0:
-                    # 使用预计算的参数（避免循环内创建数组）
-                    top_left = top_lefts[idx]
-                    scale_xy = scale_factors_f32[idx]
-                    
-                    # ========== 优化5: 更高效的坐标提取 ==========
-                    # 预分配数组，使用索引访问
-                    coords = np.empty((num_points, 2), dtype=np.float32)
-                    for i in range(num_points):
-                        coords[i] = points2D_list[i].xy
-                    
-                    # 向量化变换（原地操作）
-                    coords -= top_left
-                    coords *= scale_xy
-                    
-                    # ========== 优化6: 使用索引而非 enumerate ==========
-                    for i in range(num_points):
-                        points2D_list[i].xy = coords[i]
-
-        return reconstruction
 
     def _align_current_reconstruction_by_point_cloud(
         self,
