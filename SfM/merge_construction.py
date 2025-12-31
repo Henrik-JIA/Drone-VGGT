@@ -1402,16 +1402,24 @@ def merge_points_with_2d_matching(
                 matched_pairs, recon1, recon2_aligned, verbose
             )
     
-    # 建立映射
-    matched_recon1_ids = set(k[0] for k in matched_pairs.keys())
-    matched_recon2_ids = set(k[1] for k in matched_pairs.keys())
-    recon2_to_recon1 = {k[1]: k[0] for k in matched_pairs.keys()}
+    # 建立映射（优化：一次遍历完成所有映射构建）
+    matched_recon1_ids = set()
+    matched_recon2_ids = set()
+    recon2_to_recon1 = {}
+    recon1_to_average = {}
+    
+    for (r1_id, r2_id), data in matched_pairs.items():
+        matched_recon1_ids.add(r1_id)
+        matched_recon2_ids.add(r2_id)
+        recon2_to_recon1[r2_id] = r1_id
+        recon1_to_average[r1_id] = (data['average_xyz'], data['average_color'])
     
     if verbose:
         print(f"\n2D-based merge:")
         print(f"  Matched 3D point pairs: {len(matched_pairs)}")
         print(f"  Recon1 total points: {len(recon1.points3D)}")
         print(f"  Recon2 total points: {len(recon2_aligned.points3D)}")
+        print(f"  Spatial dedup threshold: {spatial_dedup_threshold}m")
     
     all_points = {}
     all_colors = {}
@@ -1421,17 +1429,8 @@ def merge_points_with_2d_matching(
     next_id = 1
     
     # Step 2: 添加匹配点的平均坐标
-    recon1_to_average = {}
-    for (r1_id, r2_id), data in matched_pairs.items():
-        recon1_to_average[r1_id] = {
-            'xyz': data['average_xyz'],
-            'color': data['average_color']
-        }
-    
     matched_added = 0
-    for r1_id in matched_recon1_ids:
-        xyz = recon1_to_average[r1_id]['xyz']
-        color = recon1_to_average[r1_id]['color']
+    for r1_id, (xyz, color) in recon1_to_average.items():
         all_points[next_id] = xyz
         all_colors[next_id] = color
         point3D_id_map1[r1_id] = next_id
@@ -1442,106 +1441,79 @@ def merge_points_with_2d_matching(
     for r2_id, r1_id in recon2_to_recon1.items():
         point3D_id_map2[r2_id] = point3D_id_map1[r1_id]
     
-    # Step 4: 构建recon2所有点的KD-Tree用于3D距离过滤
-    # 目的：对于recon1未匹配的点，如果与recon2某点3D距离很近，说明是重复点，丢弃
-    recon2_pts_for_tree = []
-    recon2_ids_for_tree = []
-    for pt_id, point3D in recon2_aligned.points3D.items():
-        if pt_id not in matched_recon2_ids:  # 只考虑未匹配的点
-            recon2_pts_for_tree.append(point3D.xyz)
-            recon2_ids_for_tree.append(pt_id)
-    
-    recon2_tree = None
-    if recon2_pts_for_tree:
-        recon2_tree = cKDTree(np.array(recon2_pts_for_tree))
-    
-    # 同样构建recon1未匹配点的KD-Tree
-    recon1_pts_for_tree = []
-    recon1_ids_for_tree = []
+    # Step 4: 预先收集所有未匹配点数据到数组（批量处理优化）
+    # Recon1 未匹配点
+    recon1_unmatched_ids = []
+    recon1_unmatched_xyz = []
+    recon1_unmatched_colors = []
     for pt_id, point3D in recon1.points3D.items():
         if pt_id not in matched_recon1_ids:
-            recon1_pts_for_tree.append(point3D.xyz)
-            recon1_ids_for_tree.append(pt_id)
+            recon1_unmatched_ids.append(pt_id)
+            recon1_unmatched_xyz.append(point3D.xyz)
+            recon1_unmatched_colors.append(point3D.color)
     
-    recon1_tree = None
-    if recon1_pts_for_tree:
-        recon1_tree = cKDTree(np.array(recon1_pts_for_tree))
+    # Recon2 未匹配点
+    recon2_unmatched_ids = []
+    recon2_unmatched_xyz = []
+    recon2_unmatched_colors = []
+    for pt_id, point3D in recon2_aligned.points3D.items():
+        if pt_id not in matched_recon2_ids:
+            recon2_unmatched_ids.append(pt_id)
+            recon2_unmatched_xyz.append(point3D.xyz)
+            recon2_unmatched_colors.append(point3D.color)
     
-    # 3D距离阈值：小于此距离认为是重复点
-    # 注意：如果这个值太大，会导致过多点被误判为重复点而丢弃
-    if verbose:
-        print(f"  Spatial dedup threshold: {spatial_dedup_threshold}m")
+    # 转换为 NumPy 数组
+    recon1_unmatched_xyz_arr = np.array(recon1_unmatched_xyz) if recon1_unmatched_xyz else np.empty((0, 3))
+    recon2_unmatched_xyz_arr = np.array(recon2_unmatched_xyz) if recon2_unmatched_xyz else np.empty((0, 3))
     
-    # Step 5: 添加recon1的未匹配点
-    # 策略：如果该点与recon2某未匹配点3D距离很近，说明可能是同一物理点，只保留recon1的
+    # Step 5: 添加 recon1 未匹配点（批量 KD-Tree 查询）
     recon1_unmatched_added = 0
     recon1_unmatched_as_duplicate = 0
     
-    for pt_id, point3D in recon1.points3D.items():
-        if pt_id in matched_recon1_ids:
-            # 已经作为匹配点添加
-            continue
+    if len(recon1_unmatched_ids) > 0:
+        # 构建 recon2 未匹配点的 KD-Tree
+        if len(recon2_unmatched_xyz_arr) > 0:
+            recon2_tree = cKDTree(recon2_unmatched_xyz_arr)
+            # 批量查询：一次查询所有 recon1 未匹配点到 recon2 的最近距离
+            distances, _ = recon2_tree.query(recon1_unmatched_xyz_arr, k=1)
+            near_recon2_mask = distances < spatial_dedup_threshold
+            recon1_unmatched_as_duplicate = int(np.sum(near_recon2_mask))
         
-        xyz = np.array(point3D.xyz)
-        
-        # 检查是否与recon2某点3D距离很近（这些会被视为"准重复点"，recon1优先保留）
-        is_near_recon2 = False
-        if recon2_tree is not None:
-            dist, _ = recon2_tree.query(xyz, k=1)
-            if dist < spatial_dedup_threshold:
-                is_near_recon2 = True
-        
-        # recon1的点总是保留（优先级高）
-        all_points[next_id] = xyz
-        all_colors[next_id] = np.array(point3D.color)
-        point3D_id_map1[pt_id] = next_id
-        next_id += 1
-        recon1_unmatched_added += 1
-        
-        if is_near_recon2:
-            recon1_unmatched_as_duplicate += 1
+        # recon1 的点总是保留
+        for i, pt_id in enumerate(recon1_unmatched_ids):
+            all_points[next_id] = recon1_unmatched_xyz_arr[i]
+            all_colors[next_id] = np.array(recon1_unmatched_colors[i])
+            point3D_id_map1[pt_id] = next_id
+            next_id += 1
+            recon1_unmatched_added += 1
     
-    # Step 6: 添加recon2的未匹配点
-    # 策略：只添加那些与recon1所有点（包括匹配和未匹配）3D距离较远的点
-    # 这样避免双层
-    
-    # 构建recon1所有已添加点的KD-Tree
-    all_recon1_pts = []
-    for pt_id in point3D_id_map1.values():
-        all_recon1_pts.append(all_points[pt_id])
-    
-    if all_recon1_pts:
-        all_recon1_tree = cKDTree(np.array(all_recon1_pts))
-    else:
-        all_recon1_tree = None
-    
+    # Step 6: 添加 recon2 未匹配点（批量 KD-Tree 查询）
     recon2_unmatched_added = 0
     recon2_unmatched_discarded = 0
     
-    for pt_id, point3D in recon2_aligned.points3D.items():
-        if pt_id in matched_recon2_ids:
-            # 已经作为匹配点处理
-            continue
+    if len(recon2_unmatched_ids) > 0:
+        # 构建 recon1 所有已添加点的 KD-Tree
+        # 收集所有 recon1 点（匹配 + 未匹配）
+        all_recon1_pts = np.array([all_points[pid] for pid in point3D_id_map1.values()])
         
-        xyz = np.array(point3D.xyz)
-        
-        # 检查是否与recon1某点3D距离很近
-        is_duplicate = False
-        if all_recon1_tree is not None:
-            dist, _ = all_recon1_tree.query(xyz, k=1)
-            if dist < spatial_dedup_threshold:
-                is_duplicate = True
-        
-        if is_duplicate and not keep_unmatched_overlap:
-            # 这是重复点，丢弃
-            recon2_unmatched_discarded += 1
+        if len(all_recon1_pts) > 0:
+            all_recon1_tree = cKDTree(all_recon1_pts)
+            # 批量查询：一次查询所有 recon2 未匹配点到 recon1 的最近距离
+            distances, _ = all_recon1_tree.query(recon2_unmatched_xyz_arr, k=1)
+            is_duplicate_mask = distances < spatial_dedup_threshold
         else:
-            # 不是重复点，或者用户选择保留
-            all_points[next_id] = xyz
-            all_colors[next_id] = np.array(point3D.color)
-            point3D_id_map2[pt_id] = next_id
-            next_id += 1
-            recon2_unmatched_added += 1
+            is_duplicate_mask = np.zeros(len(recon2_unmatched_ids), dtype=bool)
+        
+        # 根据结果添加或丢弃
+        for i, pt_id in enumerate(recon2_unmatched_ids):
+            if is_duplicate_mask[i] and not keep_unmatched_overlap:
+                recon2_unmatched_discarded += 1
+            else:
+                all_points[next_id] = recon2_unmatched_xyz_arr[i]
+                all_colors[next_id] = np.array(recon2_unmatched_colors[i])
+                point3D_id_map2[pt_id] = next_id
+                next_id += 1
+                recon2_unmatched_added += 1
     
     if verbose:
         print(f"\nFinal merge statistics:")
@@ -1794,6 +1766,105 @@ def smooth_boundary_points(
         print(f"  Smoothed {smoothed_count} boundary points")
     
     return smoothed_points
+
+
+def _add_images_batch(
+    source_recon,
+    merged_recon,
+    merged_points3D: dict,
+    camera_id_map: Dict[int, int],
+    point3D_id_map: Dict[int, int],
+    start_image_id: int,
+    filter_edge_margin: int = 0,
+    skip_image_ids: Optional[Set[int]] = None
+) -> Tuple[Dict[int, int], int, int]:
+    """
+    批量添加影像到合并后的 reconstruction（内部辅助函数）
+    
+    Args:
+        source_recon: 源 reconstruction
+        merged_recon: 目标合并 reconstruction
+        merged_points3D: 合并后的 points3D 字典引用
+        camera_id_map: 相机 ID 映射 {old_id: new_id}
+        point3D_id_map: 3D点 ID 映射 {old_id: new_id}
+        start_image_id: 起始影像 ID
+        filter_edge_margin: 边缘过滤边距（像素）
+        skip_image_ids: 需要跳过的影像 ID 集合
+        
+    Returns:
+        image_id_map: 影像 ID 映射 {old_id: new_id}
+        next_image_id: 下一个可用的影像 ID
+        edge_filtered_count: 被边缘过滤的 2D 点数量
+    """
+    image_id_map = {}
+    next_image_id = start_image_id
+    edge_filtered_count = 0
+    
+    # 预转换 point3D_id_map 的键为集合，加速 in 查询
+    valid_point3d_ids = set(point3D_id_map.keys())
+    skip_set = skip_image_ids if skip_image_ids else set()
+    
+    sorted_img_ids = sorted(source_recon.images.keys())
+    for img_id in sorted_img_ids:
+        # 跳过指定的影像
+        if img_id in skip_set:
+            continue
+        
+        image = source_recon.images[img_id]
+        points2D = image.points2D
+        n_points = len(points2D)
+        
+        # 获取影像尺寸用于边缘过滤（缓存 camera_id 映射结果）
+        new_camera_id = camera_id_map[image.camera_id]
+        camera = merged_recon.cameras[new_camera_id]
+        img_width = camera.width
+        img_height = camera.height
+        
+        # 使用 NumPy 批量处理边缘检测
+        if filter_edge_margin > 0 and n_points > 0:
+            coords = np.array([pt.xy for pt in points2D], dtype=np.float32)
+            edge_mask = (
+                (coords[:, 0] < filter_edge_margin) | 
+                (coords[:, 0] >= img_width - filter_edge_margin) |
+                (coords[:, 1] < filter_edge_margin) | 
+                (coords[:, 1] >= img_height - filter_edge_margin)
+            )
+        else:
+            edge_mask = None
+        
+        # 重建 points2D 列表（预分配列表）
+        new_points2D = [None] * n_points
+        for pt2d_idx in range(n_points):
+            point2D = points2D[pt2d_idx]
+            pt3d_id = point2D.point3D_id
+            
+            if pt3d_id != -1 and pt3d_id in valid_point3d_ids:
+                is_edge_point = edge_mask[pt2d_idx] if edge_mask is not None else False
+                
+                if is_edge_point:
+                    new_points2D[pt2d_idx] = pycolmap.Point2D(point2D.xy)
+                    edge_filtered_count += 1
+                else:
+                    new_pt3d_id = point3D_id_map[pt3d_id]
+                    new_points2D[pt2d_idx] = pycolmap.Point2D(point2D.xy, new_pt3d_id)
+                    # 更新 3D 点的 track
+                    merged_points3D[new_pt3d_id].track.add_element(next_image_id, pt2d_idx)
+            else:
+                new_points2D[pt2d_idx] = pycolmap.Point2D(point2D.xy)
+        
+        # 创建新影像
+        new_image = pycolmap.Image(
+            image_id=next_image_id,
+            name=image.name,
+            camera_id=new_camera_id,
+            cam_from_world=image.cam_from_world,
+            points2D=new_points2D
+        )
+        merged_recon.add_image(new_image)
+        image_id_map[img_id] = next_image_id
+        next_image_id += 1
+    
+    return image_id_map, next_image_id, edge_filtered_count
 
 
 def merge_reconstructions(
@@ -2190,61 +2261,19 @@ def merge_reconstructions(
             print(f"Points3D from Recon2 (non-overlap): {len(point3D_id_map2)}")
     
     # 6.4 添加 recon1 的所有影像
-    image_id_map1 = {}  # {old_id: new_id}
-    next_image_id = 1
-    edge_filtered_count_r1 = 0  # 统计边缘过滤的点数
+    # 预取 merged_recon.points3D 引用，减少后续重复属性访问
+    merged_points3D = merged_recon.points3D
     
-    for img_id in sorted(recon1.images.keys()):
-        image = recon1.images[img_id]
-        
-        # 获取影像尺寸用于边缘过滤
-        camera = merged_recon.cameras[camera_id_map1[image.camera_id]]
-        img_width = camera.width
-        img_height = camera.height
-        
-        # 计算有效区域边界（边缘过滤）
-        if filter_edge_margin > 0:
-            min_x = filter_edge_margin
-            max_x = img_width - filter_edge_margin
-            min_y = filter_edge_margin
-            max_y = img_height - filter_edge_margin
-        
-        # 重建 points2D 列表
-        new_points2D = []
-        for pt2d_idx, point2D in enumerate(image.points2D):
-            if point2D.point3D_id != -1 and point2D.point3D_id in point3D_id_map1:
-                # 检查是否在边缘范围内
-                is_edge_point = False
-                if filter_edge_margin > 0:
-                    x, y = point2D.xy[0], point2D.xy[1]
-                    is_edge_point = (x < min_x or x >= max_x or y < min_y or y >= max_y)
-                
-                if is_edge_point:
-                    # 边缘点：不关联3D点
-                    new_points2D.append(pycolmap.Point2D(point2D.xy))
-                    edge_filtered_count_r1 += 1
-                else:
-                    # 非边缘点：正常关联3D点
-                    new_pt3d_id = point3D_id_map1[point2D.point3D_id]
-                    new_points2D.append(pycolmap.Point2D(point2D.xy, new_pt3d_id))
-                    
-                    # 更新 3D 点的 track
-                    track = merged_recon.points3D[new_pt3d_id].track
-                    track.add_element(next_image_id, pt2d_idx)
-            else:
-                new_points2D.append(pycolmap.Point2D(point2D.xy))
-        
-        # 创建新影像
-        new_image = pycolmap.Image(
-            image_id=next_image_id,
-            name=image.name,
-            camera_id=camera_id_map1[image.camera_id],
-            cam_from_world=image.cam_from_world,
-            points2D=new_points2D
-        )
-        merged_recon.add_image(new_image)
-        image_id_map1[img_id] = next_image_id
-        next_image_id += 1
+    image_id_map1, next_image_id, edge_filtered_count_r1 = _add_images_batch(
+        source_recon=recon1,
+        merged_recon=merged_recon,
+        merged_points3D=merged_points3D,
+        camera_id_map=camera_id_map1,
+        point3D_id_map=point3D_id_map1,
+        start_image_id=1,
+        filter_edge_margin=filter_edge_margin,
+        skip_image_ids=None
+    )
     
     if verbose:
         print(f"\nImages from Recon1: {len(image_id_map1)}")
@@ -2252,144 +2281,95 @@ def merge_reconstructions(
             print(f"  Edge-filtered 2D points (margin={filter_edge_margin}px): {edge_filtered_count_r1}")
     
     # 6.5 添加 recon2 的非重叠影像
-    image_id_map2 = {}  # {old_id: new_id}
-    edge_filtered_count_r2 = 0  # 统计边缘过滤的点数
-    
-    for img_id in sorted(recon2_aligned.images.keys()):
-        # 跳过重叠影像
-        if img_id in recon2_overlap_image_ids:
-            continue
-        
-        image = recon2_aligned.images[img_id]
-        
-        # 获取影像尺寸用于边缘过滤
-        camera = merged_recon.cameras[camera_id_map2[image.camera_id]]
-        img_width = camera.width
-        img_height = camera.height
-        
-        # 计算有效区域边界（边缘过滤）
-        if filter_edge_margin > 0:
-            min_x = filter_edge_margin
-            max_x = img_width - filter_edge_margin
-            min_y = filter_edge_margin
-            max_y = img_height - filter_edge_margin
-        
-        # 重建 points2D 列表
-        new_points2D = []
-        for pt2d_idx, point2D in enumerate(image.points2D):
-            if point2D.point3D_id != -1 and point2D.point3D_id in point3D_id_map2:
-                # 检查是否在边缘范围内
-                is_edge_point = False
-                if filter_edge_margin > 0:
-                    x, y = point2D.xy[0], point2D.xy[1]
-                    is_edge_point = (x < min_x or x >= max_x or y < min_y or y >= max_y)
-                
-                if is_edge_point:
-                    # 边缘点：不关联3D点
-                    new_points2D.append(pycolmap.Point2D(point2D.xy))
-                    edge_filtered_count_r2 += 1
-                else:
-                    # 非边缘点：正常关联3D点
-                    new_pt3d_id = point3D_id_map2[point2D.point3D_id]
-                    new_points2D.append(pycolmap.Point2D(point2D.xy, new_pt3d_id))
-                    
-                    # 更新 3D 点的 track
-                    track = merged_recon.points3D[new_pt3d_id].track
-                    track.add_element(next_image_id, pt2d_idx)
-            else:
-                new_points2D.append(pycolmap.Point2D(point2D.xy))
-        
-        # 创建新影像
-        new_image = pycolmap.Image(
-            image_id=next_image_id,
-            name=image.name,
-            camera_id=camera_id_map2[image.camera_id],
-            cam_from_world=image.cam_from_world,
-            points2D=new_points2D
-        )
-        merged_recon.add_image(new_image)
-        image_id_map2[img_id] = next_image_id
-        next_image_id += 1
+    image_id_map2, next_image_id, edge_filtered_count_r2 = _add_images_batch(
+        source_recon=recon2_aligned,
+        merged_recon=merged_recon,
+        merged_points3D=merged_points3D,
+        camera_id_map=camera_id_map2,
+        point3D_id_map=point3D_id_map2,
+        start_image_id=next_image_id,
+        filter_edge_margin=filter_edge_margin,
+        skip_image_ids=recon2_overlap_image_ids  # 跳过重叠影像
+    )
     
     if verbose:
         print(f"Images from Recon2 (non-overlap): {len(image_id_map2)}")
         if filter_edge_margin > 0:
             print(f"  Edge-filtered 2D points (margin={filter_edge_margin}px): {edge_filtered_count_r2}")
     
-    # 6.6 清理观测不足的3D点（track元素少于阈值的点）
-    # 同时需要更新images中引用这些点的2D点，确保数据一致性
+    # 6.6 清理观测不足的3D点（高效版：利用 track 直接定位受影响的影像）
     # min_track_length: 用户指定的最小track长度
     #   0 = 只删除track为空的点（最宽松，保留最多点）
     #   1 = 至少1个观测（与0效果相同）
     #   2 = 至少2个观测（COLMAP默认要求）
     #   3+ = 更严格的过滤
-    if min_track_length <= 0:
-        effective_min_track = 1  # 只删除track为空的点
-    else:
-        effective_min_track = min_track_length
+    effective_min_track = max(1, min_track_length)
     
-    points3d_to_remove = set()
+    points3d_to_remove = []
     empty_track_count = 0
     insufficient_track_count = 0
     
-    for point3d_id in list(merged_recon.points3D.keys()):
-        point3d = merged_recon.points3D[point3d_id]
-        track_len = len(point3d.track.elements)
+    # 同时收集需删除的点和受影响的 (image_id, point2D_idx) 对
+    # 使用 defaultdict 按 image_id 分组，避免后续遍历所有影像
+    from collections import defaultdict
+    affected_points_by_image = defaultdict(list)  # {image_id: [point2D_idx, ...]}
+    
+    for point3d_id, point3d in merged_points3D.items():
+        track = point3d.track
+        track_elements = track.elements
+        track_len = len(track_elements)
+        
         if track_len == 0:
             empty_track_count += 1
-            points3d_to_remove.add(point3d_id)
+            points3d_to_remove.append(point3d_id)
         elif track_len < effective_min_track:
             insufficient_track_count += 1
-            points3d_to_remove.add(point3d_id)
+            points3d_to_remove.append(point3d_id)
+            # 从 track 中收集受影响的 (image_id, point2D_idx)
+            for elem in track_elements:
+                affected_points_by_image[elem.image_id].append(elem.point2D_idx)
     
-    # 如果有需要删除的3D点，必须同时更新images中引用它们的2D点
-    # 否则images.txt和points3D.txt会不一致，导致COLMAP显示异常
+    # 如果有需要删除的3D点，更新受影响的影像
     if points3d_to_remove:
-        # 重建所有images，清理对被删除3D点的引用
-        all_image_ids = list(merged_recon.images.keys())
-        images_to_update = []
+        merged_images = merged_recon.images
+        Point2D = pycolmap.Point2D
+        Image = pycolmap.Image
+        add_image = merged_recon.add_image
         
-        for img_id in all_image_ids:
-            image = merged_recon.images[img_id]
-            new_points2D = []
-            needs_update = False
+        # 只处理受影响的影像（而不是遍历所有影像）
+        for img_id, affected_indices in affected_points_by_image.items():
+            image = merged_images[img_id]
+            points2D = image.points2D
             
-            for point2D in image.points2D:
-                if point2D.point3D_id in points3d_to_remove:
-                    # 解除与被删除3D点的关联
-                    new_points2D.append(pycolmap.Point2D(point2D.xy))
-                    needs_update = True
-                else:
-                    new_points2D.append(point2D)
+            # 使用浅拷贝，只替换受影响的点
+            new_points2D = list(points2D)
+            for idx in affected_indices:
+                new_points2D[idx] = Point2D(points2D[idx].xy)
             
-            if needs_update:
-                images_to_update.append((img_id, image, new_points2D))
-        
-        # 更新images（先全部收集，再统一更新，避免迭代问题）
-        for img_id, old_image, new_points2D in images_to_update:
-            new_image = pycolmap.Image(
-                image_id=old_image.image_id,
-                name=old_image.name,
-                camera_id=old_image.camera_id,
-                cam_from_world=old_image.cam_from_world,
+            # 更新影像
+            new_image = Image(
+                image_id=image.image_id,
+                name=image.name,
+                camera_id=image.camera_id,
+                cam_from_world=image.cam_from_world,
                 points2D=new_points2D
             )
-            del merged_recon.images[img_id]
-            merged_recon.add_image(new_image)
+            del merged_images[img_id]
+            add_image(new_image)
         
-        # 删除3D点
+        # 批量删除3D点
         for point3d_id in points3d_to_remove:
-            del merged_recon.points3D[point3d_id]
+            del merged_points3D[point3d_id]
         
-        if verbose and images_to_update:
-            print(f"\nUpdated {len(images_to_update)} images to fix 2D-3D references")
+        if verbose and affected_points_by_image:
+            print(f"\nUpdated {len(affected_points_by_image)} images to fix 2D-3D references")
     
     if verbose:
         if empty_track_count > 0:
             print(f"Removed {empty_track_count} 3D points with empty track (no 2D observations)")
         if insufficient_track_count > 0:
             print(f"Removed {insufficient_track_count} 3D points with insufficient observations (< {effective_min_track})")
-        if len(points3d_to_remove) > 0:
+        if points3d_to_remove:
             print(f"Total removed: {len(points3d_to_remove)} points")
     
     # 7. 保存合并结果
