@@ -319,6 +319,7 @@ def voxel_downsample(
 ) -> Tuple[Dict[int, np.ndarray], Dict[int, np.ndarray], Dict[int, List[int]]]:
     """
     对点云进行体素下采样，每个体素只保留一个代表点（质心）
+    使用numpy向量化操作实现高效处理
     
     Args:
         points_xyz: 点坐标 {point_id: xyz}
@@ -331,47 +332,90 @@ def voxel_downsample(
         downsampled_color: 下采样后的点颜色 {new_id: color}
         voxel_to_original_ids: 每个新点对应的原始点ID列表 {new_id: [old_ids]}
     """
-    if len(points_xyz) == 0:
+    n_points = len(points_xyz)
+    if n_points == 0:
         return {}, {}, {}
     
-    # 将点分配到体素
-    voxel_dict = {}  # {voxel_key: [(point_id, xyz, color), ...]}
+    # Step 1: 批量提取数据到numpy数组（避免逐点操作）
+    point_ids = np.array(list(points_xyz.keys()), dtype=np.int64)
+    xyz_array = np.empty((n_points, 3), dtype=np.float64)
+    color_array = np.empty((n_points, 3), dtype=np.float32)
     
-    for pt_id, xyz in points_xyz.items():
-        # 计算体素索引
-        voxel_key = tuple((xyz / voxel_size).astype(int))
-        
-        if voxel_key not in voxel_dict:
-            voxel_dict[voxel_key] = []
-        
-        color = points_color.get(pt_id, np.array([128, 128, 128], dtype=np.uint8))
-        voxel_dict[voxel_key].append((pt_id, xyz, color))
+    default_color = np.array([128, 128, 128], dtype=np.uint8)
+    for i, pt_id in enumerate(point_ids):
+        xyz_array[i] = points_xyz[pt_id]
+        color_array[i] = points_color.get(pt_id, default_color)
     
-    # 对每个体素计算质心和平均颜色
+    # Step 2: 向量化计算所有点的体素索引
+    inv_voxel_size = 1.0 / voxel_size
+    voxel_indices = np.floor(xyz_array * inv_voxel_size).astype(np.int64)
+    
+    # Step 3: 将3D体素索引编码为唯一的1D索引（用于分组）
+    # 先计算偏移量使所有索引非负
+    voxel_min = voxel_indices.min(axis=0)
+    voxel_indices_shifted = voxel_indices - voxel_min
+    
+    # 计算每个维度的范围
+    voxel_range = voxel_indices_shifted.max(axis=0) + 1
+    
+    # 编码为1D索引：idx = x + y*range_x + z*range_x*range_y
+    multipliers = np.array([1, voxel_range[0], voxel_range[0] * voxel_range[1]], dtype=np.int64)
+    voxel_1d = (voxel_indices_shifted * multipliers).sum(axis=1)
+    
+    # Step 4: 获取唯一体素和分组信息
+    # argsort按体素分组排序，unique获取唯一体素和边界
+    sort_idx = np.argsort(voxel_1d)
+    voxel_1d_sorted = voxel_1d[sort_idx]
+    
+    # 找到唯一体素和它们的起始位置
+    unique_voxels, unique_starts, unique_counts = np.unique(
+        voxel_1d_sorted, return_index=True, return_counts=True
+    )
+    n_voxels = len(unique_voxels)
+    
+    # Step 5: 向量化计算每个体素的质心和平均颜色
+    # 使用np.add.at进行分组求和
+    xyz_sorted = xyz_array[sort_idx]
+    color_sorted = color_array[sort_idx]
+    point_ids_sorted = point_ids[sort_idx]
+    
+    # 为每个点分配其所属的体素索引（0到n_voxels-1）
+    voxel_labels = np.zeros(n_points, dtype=np.int64)
+    for i in range(n_voxels):
+        start = unique_starts[i]
+        end = start + unique_counts[i]
+        voxel_labels[start:end] = i
+    
+    # 分组求和坐标
+    xyz_sum = np.zeros((n_voxels, 3), dtype=np.float64)
+    np.add.at(xyz_sum, voxel_labels, xyz_sorted)
+    
+    # 分组求和颜色
+    color_sum = np.zeros((n_voxels, 3), dtype=np.float64)
+    np.add.at(color_sum, voxel_labels, color_sorted)
+    
+    # 计算平均值
+    counts_expanded = unique_counts[:, np.newaxis].astype(np.float64)
+    centroids = xyz_sum / counts_expanded
+    avg_colors = (color_sum / counts_expanded).astype(np.uint8)
+    
+    # Step 6: 构建输出字典
     downsampled_xyz = {}
     downsampled_color = {}
     voxel_to_original_ids = {}
     
-    new_id = 1
-    for voxel_key, points in voxel_dict.items():
-        # 计算质心
-        all_xyz = np.array([p[1] for p in points])
-        centroid = np.mean(all_xyz, axis=0)
+    for i in range(n_voxels):
+        new_id = i + 1
+        downsampled_xyz[new_id] = centroids[i]
+        downsampled_color[new_id] = avg_colors[i]
         
-        # 计算平均颜色
-        all_colors = np.array([p[2] for p in points], dtype=np.float32)
-        avg_color = np.mean(all_colors, axis=0).astype(np.uint8)
-        
-        # 记录原始点ID
-        original_ids = [p[0] for p in points]
-        
-        downsampled_xyz[new_id] = centroid
-        downsampled_color[new_id] = avg_color
-        voxel_to_original_ids[new_id] = original_ids
-        new_id += 1
+        # 提取该体素的原始点ID
+        start = unique_starts[i]
+        end = start + unique_counts[i]
+        voxel_to_original_ids[new_id] = point_ids_sorted[start:end].tolist()
     
     if verbose:
-        print(f"  Voxel downsampling: {len(points_xyz)} -> {len(downsampled_xyz)} points (voxel_size={voxel_size}m)")
+        print(f"  Voxel downsampling: {n_points} -> {n_voxels} points (voxel_size={voxel_size}m)")
     
     return downsampled_xyz, downsampled_color, voxel_to_original_ids
 
