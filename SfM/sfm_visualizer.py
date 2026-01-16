@@ -408,12 +408,14 @@ class SfMVisualizer:
                 width = recovered_output['image_width']
                 height = recovered_output['image_height']
                 
-                # Get thumbnail
+                # Get thumbnail (检查是否已被内存清理)
                 img_thumbnail = None
                 if input_views is not None and i < len(input_views):
-                    img_thumbnail = input_views[i]['img'].cpu().numpy()
-                    downsample = 4
-                    img_thumbnail = img_thumbnail[::downsample, ::downsample]
+                    img_tensor = input_views[i].get('img')
+                    if img_tensor is not None:
+                        img_thumbnail = img_tensor.cpu().numpy()
+                        downsample = 4
+                        img_thumbnail = img_thumbnail[::downsample, ::downsample]
                 
                 self.add_camera_frustum_from_pose(
                     index=i,
@@ -455,9 +457,12 @@ class SfMVisualizer:
                     image_name = pyimage.name
                     for idx, path in enumerate(image_paths):
                         if path.name == image_name and idx < len(input_views):
-                            img_thumbnail = input_views[idx]['img'].cpu().numpy()
-                            downsample = 4
-                            img_thumbnail = img_thumbnail[::downsample, ::downsample]
+                            # 检查图像是否已被清理（内存优化后可能为 None）
+                            img_tensor = input_views[idx].get('img')
+                            if img_tensor is not None:
+                                img_thumbnail = img_tensor.cpu().numpy()
+                                downsample = 4
+                                img_thumbnail = img_thumbnail[::downsample, ::downsample]
                             break
                 
                 self.add_camera_frustum_from_pycolmap(

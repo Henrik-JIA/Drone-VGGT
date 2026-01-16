@@ -19,6 +19,17 @@ from PIL import Image
 import laspy
 from scipy.spatial.transform import Rotation as R
 from collections import defaultdict
+import subprocess
+import cv2
+
+# UTM coordinate conversion imports (conditional)
+try:
+    import pymap3d as pm
+    import pyproj
+    UTM_EXPORT_AVAILABLE = True
+except ImportError:
+    UTM_EXPORT_AVAILABLE = False
+    print("Warning: pymap3d or pyproj not available. UTM export will not work. Install with: pip install pymap3d pyproj")
 
 current_dir = Path(__file__).parent
 project_root = current_dir.parent  # drone-map-anything 根目录
@@ -29,7 +40,15 @@ if str(third_dir) not in sys.path:
     sys.path.insert(0, str(third_dir))
 
 from feature_matcher import FeatureMatcherSfM
-from merge_construction import merge_reconstructions
+from merge_full_pipeline import merge_reconstructions
+from merge_confidence_blend import (
+    merge_two_reconstructions as merge_by_confidence_blend,
+    find_common_images,
+    build_correspondences_parallel,
+    find_corresponding_3d_points,
+    estimate_sim3_ransac
+)
+from merge_confidence import merge_two_reconstructions as merge_by_confidence
 from sfm_extraction import extract_sfm_reconstruction_from_global
 from sfm_visualizer import SfMVisualizer
 from reconstruction_alignment import (
@@ -114,6 +133,7 @@ class IncrementalFeatureMatcherSfM:
         merge_voxel_size: float = 1.0,  # 点云合并时的体素大小（米）
         merge_boundary_filter: bool = True,  # 是否启用边界过滤
         merge_statistical_filter: bool = False,  # 是否启用统计过滤
+        merge_method: str = 'confidence_blend',  # 'full' | 'confidence' | 'confidence_blend' 合并方式
         enable_visualization: bool = True,
         visualization_mode: str = 'merged',  # 'aligned' | 'merged'，点云可视化模式
         verbose: bool = False,
@@ -139,6 +159,11 @@ class IncrementalFeatureMatcherSfM:
             merge_voxel_size: Voxel size for point cloud merging (in meters), default 1.0
             merge_boundary_filter: Whether to enable boundary filtering during merge, default True
             merge_statistical_filter: Whether to enable statistical filtering during merge, default False
+            merge_method: Merge method selection:
+                'full' - use merge_full_pipeline.py with full pipeline
+                'confidence' - use merge_confidence.py with simple confidence-based selection
+                'confidence_blend' - use merge_confidence_blend.py with confidence-based selection 
+                                     and smooth edge blending/interpolation (default)
             enable_visualization: Whether to start viser server for visualization
             visualization_mode: Point cloud visualization mode, 'aligned' (per batch) or 'merged' (unified)
             verbose: Enable verbose logging
@@ -178,6 +203,7 @@ class IncrementalFeatureMatcherSfM:
         self.merge_voxel_size = merge_voxel_size
         self.merge_boundary_filter = merge_boundary_filter
         self.merge_statistical_filter = merge_statistical_filter
+        self.merge_method = merge_method  # 'full', 'confidence', or 'confidence_blend'
         
         # Visualization mode: 'aligned' (每个batch单独点云) or 'merged' (合并后整体点云)
         if visualization_mode not in ['aligned', 'merged']:
@@ -208,6 +234,16 @@ class IncrementalFeatureMatcherSfM:
         self.sfm_reconstructions: List[Dict] = []  # 存储传统SfM重建结果
         self.merged_reconstruction: Optional[pycolmap.Reconstruction] = None # 每次合并后更新的重建结果
         self.recovered_inference_outputs: List[Dict] = []
+        
+        # 像素级置信度图存储在 inference_reconstructions[i]['pixel_3d_mapping'][global_idx]['conf'] 中
+        # 格式: {global_image_idx: {'pts3d': (H,W,3), 'conf': (H,W), 'valid_mask': (H,W)}}
+        # conf 已缩放到原图尺寸，与 reconstruction 中的 2D 点坐标一致
+
+        # Georeferenced coordinate system (for export_georeferenced)
+        self.geo_center: Optional[np.ndarray] = None  # [x, y, alt] center offset in target CRS
+        self.output_epsg_code: Optional[int] = None  # EPSG code for output CRS
+        self.rec_georef: Optional[pycolmap.Reconstruction] = None  # Reconstruction in georeferenced coordinates
+        self.rec_georef_dir: Optional[Path] = None  # Output directory for georeferenced reconstruction
 
         self.enable_visualization = enable_visualization
         
@@ -292,6 +328,109 @@ class IncrementalFeatureMatcherSfM:
                 torch.cuda.empty_cache()
             if self.verbose:
                 print("✓ Model released from memory")
+
+    def _cleanup_intermediate_data(self, keep_last_n: int = 2):
+        """清理中间数据以释放内存，只保留最新的 N 个批次。
+        
+        Args:
+            keep_last_n: 保留最新的批次数量，默认为2（用于重叠处理）
+        """
+        import gc
+        
+        cleaned_items = []
+        
+        # 1. 清理 batch_tracks - 只保留最新的 keep_last_n 个批次
+        if len(self.batch_tracks) > keep_last_n:
+            num_to_remove = len(self.batch_tracks) - keep_last_n
+            for i in range(num_to_remove):
+                batch = self.batch_tracks[i]
+                # 显式删除大型 numpy 数组
+                for key in ['pred_tracks', 'pred_vis_scores', 'pred_confs', 'points_3d', 'points_rgb']:
+                    if key in batch and batch[key] is not None:
+                        del batch[key]
+            self.batch_tracks = self.batch_tracks[-keep_last_n:]
+            cleaned_items.append(f"batch_tracks: 删除 {num_to_remove} 个")
+        
+        # 2. 清理 image_tracks - 只保留最新的 keep_last_n * min_images_for_scale 个
+        max_image_tracks = keep_last_n * self.min_images_for_scale
+        if len(self.image_tracks) > max_image_tracks:
+            num_to_remove = len(self.image_tracks) - max_image_tracks
+            for i in range(num_to_remove):
+                track_info = self.image_tracks[i]
+                # 显式删除大型数组
+                for key in ['tracks_2d', 'vis_scores', 'confs', 'points_3d', 'points_rgb']:
+                    if key in track_info and track_info[key] is not None:
+                        del track_info[key]
+            self.image_tracks = self.image_tracks[-max_image_tracks:]
+            cleaned_items.append(f"image_tracks: 删除 {num_to_remove} 个")
+        
+        # 3. 清理 inference_reconstructions 中的 pixel_3d_mapping（保留 reconstruction 对象）
+        if len(self.inference_reconstructions) > keep_last_n:
+            for i in range(len(self.inference_reconstructions) - keep_last_n):
+                recon_data = self.inference_reconstructions[i]
+                if 'pixel_3d_mapping' in recon_data and recon_data['pixel_3d_mapping']:
+                    # 清空 pixel_3d_mapping 字典
+                    for global_idx in list(recon_data['pixel_3d_mapping'].keys()):
+                        mapping = recon_data['pixel_3d_mapping'][global_idx]
+                        for key in ['pts3d', 'conf', 'valid_mask']:
+                            if key in mapping:
+                                del mapping[key]
+                    recon_data['pixel_3d_mapping'] = {}
+            cleaned_items.append(f"pixel_3d_mapping: 清理 {len(self.inference_reconstructions) - keep_last_n} 个批次")
+        
+        # 4. 清理 recovered_inference_outputs - 只保留最新的
+        max_recovered = keep_last_n * self.min_images_for_scale
+        if len(self.recovered_inference_outputs) > max_recovered:
+            num_to_remove = len(self.recovered_inference_outputs) - max_recovered
+            for i in range(num_to_remove):
+                output = self.recovered_inference_outputs[i]
+                # 清理 tensor 数据
+                for key in ['pts3d', 'pts3d_cam', 'camera_poses', 'cam_trans', 'cam_quats', 'conf']:
+                    if key in output and output[key] is not None:
+                        del output[key]
+            self.recovered_inference_outputs = self.recovered_inference_outputs[-max_recovered:]
+            cleaned_items.append(f"recovered_inference_outputs: 删除 {num_to_remove} 个")
+        
+        # 5. 清理 inference_outputs 中的大型 tensor（保留元数据）
+        if len(self.inference_outputs) > keep_last_n * self.min_images_for_scale:
+            keep_from_idx = len(self.inference_outputs) - keep_last_n * self.min_images_for_scale
+            cleaned_count = 0
+            for i in range(keep_from_idx):
+                output = self.inference_outputs[i]
+                # 清理 current_output 中的 tensor
+                if 'current_output' in output and output['current_output'] is not None:
+                    for key in ['pts3d', 'pts3d_cam', 'conf', 'camera_poses', 'intrinsics']:
+                        if key in output['current_output']:
+                            del output['current_output'][key]
+                    output['current_output'] = None
+                # 清理 outputs 列表
+                if 'outputs' in output and output['outputs'] is not None:
+                    output['outputs'] = None
+                cleaned_count += 1
+            if cleaned_count > 0:
+                cleaned_items.append(f"inference_outputs: 清理 {cleaned_count} 个的 tensor")
+        
+        # 6. 清理 input_views 和 preprocessed_views 中的图像 tensor
+        keep_views_from = max(0, len(self.input_views) - keep_last_n * self.min_images_for_scale)
+        views_cleaned = 0
+        for i in range(keep_views_from):
+            if i < len(self.input_views) and 'img' in self.input_views[i]:
+                self.input_views[i]['img'] = None
+                views_cleaned += 1
+            if i < len(self.preprocessed_views) and 'img' in self.preprocessed_views[i]:
+                self.preprocessed_views[i]['img'] = None
+        if views_cleaned > 0:
+            cleaned_items.append(f"input/preprocessed_views: 清理 {views_cleaned} 个图像 tensor")
+        
+        # 7. 强制垃圾回收
+        gc.collect()
+        
+        # 8. 清理 CUDA 缓存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        if self.verbose and cleaned_items:
+            print(f"  ✓ 内存清理完成: {', '.join(cleaned_items)}")
 
     def add_image(self, image_path: Path) -> bool:
         """Add a new image and store its intrinsic and extrinsic parameters.
@@ -708,17 +847,28 @@ class IncrementalFeatureMatcherSfM:
                         image_alignment_min_inlier_ratio=0.3,
                     )
 
-                # 保存重建结果
+                # 保存重建结果（对齐到原始 SfM 后）
                 temp_path = self.output_dir / "temp_aligned_to_original_sfm" / f"{start_idx}_{end_idx}"
                 temp_path.mkdir(parents=True, exist_ok=True)
                 reconstruction.write_text(str(temp_path))
                 reconstruction.export_PLY(str(temp_path / "points3D.ply"))
                 
-                # 对齐到前一个重建reconstruction，且只调整平移，不旋转和缩放。
-                if len(self.inference_reconstructions) < 1:
+                # 对齐到前一个重建 reconstruction：支持平移和缩放，不旋转，基于重叠影像的相机位置对齐。
+                # 注意：对于 merge_method == 'confidence'，跳过此步骤，由 merge_by_confidence 一步到位完成更精确的对齐
+                if self.merge_method == 'confidence':
+                    # confidence 模式：跳过预对齐，直接使用 reconstruction
+                    # merge_by_confidence 会通过 RANSAC + 3D点匹配 进行更精确的对齐
                     aligned_recon = reconstruction
+                    if self.verbose:
+                        print(f"  ✓ 重建已保存到: {temp_path}")
+                        print(f"  (merge_method='confidence': 跳过预对齐，由 merge_by_confidence 一步到位)")
+                elif len(self.inference_reconstructions) < 1:
+                    # 第一个 batch，无需对齐
+                    aligned_recon = reconstruction
+                    if self.verbose:
+                        print(f"  ✓ 重建已保存到: {temp_path}")
                 else:
-                    # 获取前一个已合并的reconstruction和当前新的reconstruction
+                    # 其他 merge_method：执行预对齐（基于重叠影像的相机位置）
                     prev_recon_data = self.inference_reconstructions[-1]  # 列表中最后一个
                     prev_recon = prev_recon_data['reconstruction']
                     aligned_recon = reconstruction  # 当前正在处理的，还未添加到列表
@@ -741,9 +891,6 @@ class IncrementalFeatureMatcherSfM:
                     for i, prev_img_id in enumerate(prev_overlap_image_ids):
                         curr_img_id = curr_overlap_image_ids[i]
                         
-                    for i, prev_img_id in enumerate(prev_overlap_image_ids):
-                        curr_img_id = curr_overlap_image_ids[i]
-                        
                         if prev_img_id in prev_recon.images and curr_img_id in aligned_recon.images:
                             # prev_recon 相机位置（目标）
                             prev_image = prev_recon.images[prev_img_id]
@@ -760,15 +907,25 @@ class IncrementalFeatureMatcherSfM:
                             src_locations.append(camera_center_curr)
 
                     if len(src_locations) >= 3:
-                        # 有足够的点，使用 Sim3 变换（包含旋转和缩放）
+                        # 有足够的点，估计 Sim3 变换
                         src_points = np.array(src_locations, dtype=np.float64)
                         tgt_points = np.array(tgt_locations, dtype=np.float64)
                         sim3d = estimate_sim3_transform(src_points, tgt_points)
                         if sim3d is not None:
-                            # 只使用平移，不旋转不缩放
+                            # 只使用平移和缩放，不旋转
+                            # 先缩放源点，再计算平移
+                            scale = sim3d.scale
+                            src_centroid = src_points.mean(axis=0)
+                            tgt_centroid = tgt_points.mean(axis=0)
+                            # 平移 = 目标质心 - 缩放后的源质心
+                            translation = tgt_centroid - scale * src_centroid
+                            
                             identity_rotation = pycolmap.Rotation3d(np.eye(3))
-                            sim3_translation_only = pycolmap.Sim3d(1.0, identity_rotation, sim3d.translation)
-                            aligned_recon.transform(sim3_translation_only)
+                            sim3_scale_translate = pycolmap.Sim3d(scale, identity_rotation, translation)
+                            aligned_recon.transform(sim3_scale_translate)
+                            
+                            if self.verbose:
+                                print(f"    Alignment: scale={scale:.4f}, translation={translation}")
                         else:
                             if self.verbose:
                                 print("  ⚠ Sim3 estimation failed")
@@ -785,15 +942,27 @@ class IncrementalFeatureMatcherSfM:
                         if self.verbose:
                             print(f"  ⚠ 没有有效的重叠影像，无法对齐")
 
-                # 保存对齐后的重建结果（对齐到前一个重建后）
-                temp_path = self.output_dir / "temp_aligned_to_prev_recon_overlay_image" / f"{start_idx}_{end_idx}"
-                temp_path.mkdir(parents=True, exist_ok=True)
-                aligned_recon.write_text(str(temp_path))
-                aligned_recon.export_PLY(str(temp_path / "points3D.ply"))
-                if self.verbose:
-                    print(f"  ✓ 对齐后的重建已保存到: {temp_path}")
+                    # 保存对齐后的重建结果（对齐到前一个重建后）
+                    temp_path = self.output_dir / "temp_aligned_to_prev_recon_overlay_image" / f"{start_idx}_{end_idx}"
+                    temp_path.mkdir(parents=True, exist_ok=True)
+                    aligned_recon.write_text(str(temp_path))
+                    aligned_recon.export_PLY(str(temp_path / "points3D.ply"))
+                    if self.verbose:
+                        print(f"  ✓ 对齐后的重建已保存到: {temp_path}")
 
-                # 将 aligned_recon 添加到列表（统一在 if-else 之外处理）
+                # ==================== 提取逐像素3D点对应关系（缩放到原图尺寸）====================
+                # 从 outputs_list 中提取逐像素的 pts3d，与 reconstruction 中的稀疏点不同，
+                # 这里是密集的逐像素对应，可用于密集点云融合、语义投影等
+                # 数据结构：{global_idx: {'pts3d': (H,W,3), 'conf': (H,W), 'valid_mask': (H,W)}}
+                batch_pixel_3d_mapping = self._extract_pixel_to_3d_mapping_for_batch(
+                    outputs_list=outputs_list,
+                    global_indices=indices,
+                    conf_threshold=1.0,  # 可调整置信度阈值
+                    verbose=True
+                )
+                
+                # 将 aligned_recon 添加到列表（包含该批次的 pixel_3d_mapping）
+                # 注意：对于 merge_method='confidence'，aligned_recon 未经预对齐，由 merge_by_confidence 一步到位完成
                 image_paths = [str(self.image_paths[idx]) for idx in range(start_idx, end_idx)]
                 self.inference_reconstructions.append({
                     'start_idx': start_idx,
@@ -801,6 +970,7 @@ class IncrementalFeatureMatcherSfM:
                     'image_paths': image_paths,
                     'reconstruction': aligned_recon,
                     'valid_track_mask': valid_track_mask,
+                    'pixel_3d_mapping': batch_pixel_3d_mapping,  # 逐像素3D对应 {global_idx: {'pts3d', 'conf', 'valid_mask'}}，已缩放到原图尺寸
                 })
 
                 # ==================== 填充 recovered_inference_outputs 用于可视化 ====================
@@ -1950,12 +2120,26 @@ class IncrementalFeatureMatcherSfM:
             # 先缩放到原始图像尺寸（基本对齐）
             aligned_recon=reconstruction 
 
+            # 提取逐像素3D点对应关系（包含 conf）
+            # 从最新的 inference_outputs 中获取 outputs_list
+            latest_inference = self.inference_outputs[-1]
+            outputs_list = latest_inference.get('outputs', [])
+            global_indices = list(range(start_idx, end_idx))
+            
+            batch_pixel_3d_mapping = self._extract_pixel_to_3d_mapping_for_batch(
+                outputs_list=outputs_list,
+                global_indices=global_indices,
+                conf_threshold=1.0,
+                verbose=True
+            )
+            
             self.inference_reconstructions.append({
                 'start_idx': start_idx,
                 'end_idx': end_idx,
                 'image_paths': image_paths,
                 'reconstruction': aligned_recon,
                 'valid_track_mask': valid_track_mask,
+                'pixel_3d_mapping': batch_pixel_3d_mapping,  # 逐像素3D对应 {global_idx: {'pts3d', 'conf', 'valid_mask'}}，已缩放到原图尺寸
             })
             
             if self.verbose:
@@ -1971,6 +2155,187 @@ class IncrementalFeatureMatcherSfM:
             import traceback
             traceback.print_exc()
             return False
+
+    def _extract_and_resize_pts3d_for_batch(
+        self,
+        outputs_list: List[Dict],
+        global_indices: List[int],
+        verbose: bool = True
+    ) -> Dict[int, np.ndarray]:
+        """
+        从 outputs_list 中提取逐像素 3D 点并缩放到原始图像尺寸
+        
+        与置信度图不同，pts3d 是 3D 坐标，需要使用最近邻插值以保持几何一致性。
+        
+        数据结构说明：
+        - 输入 pts3d: (1, H_infer, W_infer, 3) - 推理尺寸下的密集 3D 点云
+        - 每个像素 (u, v) 对应一个 3D 点 (x, y, z)
+        - 输出: (H_orig, W_orig, 3) - 原图尺寸下的密集 3D 点云
+        
+        Args:
+            outputs_list: 推理输出列表，每个元素包含 'pts3d' key
+            global_indices: 每个输出对应的全局图像索引
+            verbose: 是否打印详细信息
+            
+        Returns:
+            batch_pts3d_maps: {global_idx: (H_orig, W_orig, 3) numpy array}
+                             已缩放到原图尺寸的逐像素 3D 点云字典
+        """
+        batch_pts3d_maps = {}
+        
+        for i, output in enumerate(outputs_list):
+            if i >= len(global_indices):
+                break
+            
+            global_idx = global_indices[i]
+            
+            if 'pts3d' not in output:
+                continue
+            
+            # 提取 pts3d: (1, H_infer, W_infer, 3) -> (H_infer, W_infer, 3)
+            pts3d = output['pts3d']
+            if hasattr(pts3d, 'cpu'):
+                pts3d = pts3d.cpu().numpy()
+            if pts3d.ndim == 4:
+                pts3d = pts3d[0]  # (H_infer, W_infer, 3)
+            
+            infer_h, infer_w, _ = pts3d.shape
+            
+            # 获取原图尺寸
+            if global_idx < len(self.scale_info):
+                s_info = self.scale_info[global_idx]
+                orig_w, orig_h = s_info['original_size']
+                
+                # 如果尺寸不同，进行最近邻重采样
+                if infer_w != orig_w or infer_h != orig_h:
+                    # 使用最近邻插值（保持 3D 坐标的精确性）
+                    # cv2.resize 对多通道支持良好
+                    pts3d_resized = cv2.resize(
+                        pts3d, 
+                        (orig_w, orig_h), 
+                        interpolation=cv2.INTER_NEAREST
+                    )
+                else:
+                    pts3d_resized = pts3d
+            else:
+                pts3d_resized = pts3d
+            
+            batch_pts3d_maps[global_idx] = pts3d_resized
+        
+        if verbose and self.verbose:
+            print(f"  ✓ Extracted {len(batch_pts3d_maps)} dense pts3d maps to original resolution")
+        
+        return batch_pts3d_maps
+
+    def _extract_pixel_to_3d_mapping_for_batch(
+        self,
+        outputs_list: List[Dict],
+        global_indices: List[int],
+        conf_threshold: float = 1.0,
+        verbose: bool = True
+    ) -> Dict[int, Dict[str, np.ndarray]]:
+        """
+        建立完整的逐像素到 3D 点的映射关系
+        
+        这个方法同时提取 pts3d 和 conf，并建立原图尺寸下的完整映射。
+        比 reconstruction 中的稀疏匹配更密集，可用于：
+        - 密集点云融合
+        - 语义标签投影
+        - 深度图生成
+        
+        Args:
+            outputs_list: 推理输出列表，包含 'pts3d' 和 'conf'
+            global_indices: 每个输出对应的全局图像索引
+            conf_threshold: 置信度阈值，低于此值的点可以标记为无效
+            verbose: 是否打印详细信息
+            
+        Returns:
+            pixel_3d_mapping: {
+                global_idx: {
+                    'pts3d': (H_orig, W_orig, 3) numpy array,  # 3D 坐标
+                    'conf': (H_orig, W_orig) numpy array,       # 置信度
+                    'valid_mask': (H_orig, W_orig) bool array,  # 有效性掩码
+                    'infer_size': (H_infer, W_infer),          # 推理尺寸
+                    'orig_size': (H_orig, W_orig),             # 原图尺寸
+                }
+            }
+        """
+        pixel_3d_mapping = {}
+        
+        for i, output in enumerate(outputs_list):
+            if i >= len(global_indices):
+                break
+            
+            global_idx = global_indices[i]
+            
+            if 'pts3d' not in output:
+                continue
+            
+            # 提取 pts3d
+            pts3d = output['pts3d']
+            if hasattr(pts3d, 'cpu'):
+                pts3d = pts3d.cpu().numpy()
+            if pts3d.ndim == 4:
+                pts3d = pts3d[0]  # (H_infer, W_infer, 3)
+            
+            infer_h, infer_w, _ = pts3d.shape
+            
+            # 提取 conf
+            conf = None
+            if 'conf' in output:
+                conf = output['conf']
+                if hasattr(conf, 'cpu'):
+                    conf = conf.cpu().numpy()
+                if conf.ndim == 3:
+                    conf = conf[0]  # (H_infer, W_infer)
+            
+            # 获取原图尺寸并重采样
+            if global_idx < len(self.scale_info):
+                s_info = self.scale_info[global_idx]
+                orig_w, orig_h = s_info['original_size']
+                
+                if infer_w != orig_w or infer_h != orig_h:
+                    # pts3d 使用最近邻（保持 3D 坐标精确性）
+                    pts3d_resized = cv2.resize(
+                        pts3d, (orig_w, orig_h), 
+                        interpolation=cv2.INTER_NEAREST
+                    )
+                    # conf 可以使用双线性插值（连续值）
+                    if conf is not None:
+                        conf_resized = cv2.resize(
+                            conf, (orig_w, orig_h), 
+                            interpolation=cv2.INTER_LINEAR
+                        )
+                    else:
+                        conf_resized = np.ones((orig_h, orig_w), dtype=np.float32)
+                else:
+                    pts3d_resized = pts3d
+                    conf_resized = conf if conf is not None else np.ones((infer_h, infer_w), dtype=np.float32)
+            else:
+                pts3d_resized = pts3d
+                conf_resized = conf if conf is not None else np.ones((infer_h, infer_w), dtype=np.float32)
+                orig_w, orig_h = infer_w, infer_h
+            
+            # 构建有效性掩码（基于置信度和坐标有效性）
+            valid_mask = conf_resized >= conf_threshold
+            # 过滤无效的 3D 坐标（NaN、Inf、极端值）
+            valid_mask &= np.isfinite(pts3d_resized).all(axis=-1)
+            valid_mask &= np.abs(pts3d_resized).max(axis=-1) < 1e6
+            
+            pixel_3d_mapping[global_idx] = {
+                'pts3d': pts3d_resized,           # (H_orig, W_orig, 3)
+                'conf': conf_resized,             # (H_orig, W_orig)
+                'valid_mask': valid_mask,         # (H_orig, W_orig)
+                'infer_size': (infer_h, infer_w),
+                'orig_size': (orig_h, orig_w),
+            }
+        
+        if verbose and self.verbose:
+            total_pixels = sum(m['valid_mask'].sum() for m in pixel_3d_mapping.values())
+            print(f"  ✓ Built pixel-to-3D mapping for {len(pixel_3d_mapping)} images, "
+                  f"{total_pixels:,} valid pixels total")
+        
+        return pixel_3d_mapping
 
     def _align_current_reconstruction_by_point_cloud(
         self,
@@ -2258,7 +2623,10 @@ class IncrementalFeatureMatcherSfM:
         将最新的reconstruction与之前已合并的reconstruction合并，
         通过重叠影像进行对齐。合并结果存储在 self.merged_reconstruction 中。
         
-        直接使用 merge_construction.py 中的 merge_reconstructions 函数实现。
+        支持三种合并方式 (由 self.merge_method 控制):
+        - 'full': 使用 merge_full_pipeline.py 完整流程
+        - 'confidence': 使用 merge_confidence.py 简单的置信度选择合并
+        - 'confidence_blend': 使用 merge_confidence_blend.py 基于置信度选择 + 重叠区边缘平滑插值过渡
         
         Returns:
             True if successful, False otherwise
@@ -2282,22 +2650,317 @@ class IncrementalFeatureMatcherSfM:
         # 获取当前reconstruction信息
         curr_recon_data = self.inference_reconstructions[-1]
         
-        # 1. 临时保存两个reconstruction到磁盘
+        # 根据 merge_method 选择合并方式
+        if self.merge_method == 'confidence_blend':
+            # 使用基于置信度 + 边缘平滑插值的合并方式
+            merged_recon = self._merge_by_confidence_blend(
+                self.merged_reconstruction,
+                curr_recon_data['reconstruction'],
+                self.output_dir
+            )
+        elif self.merge_method == 'confidence':
+            # 使用简单的置信度选择合并方式
+            merged_recon = self._merge_by_confidence(
+                self.merged_reconstruction,
+                curr_recon_data['reconstruction'],
+                self.output_dir
+            )
+        else:
+            # 使用完整的 merge_full_pipeline 流程 (merge_method == 'full')
+            merged_recon = self._merge_by_full_pipeline(
+                self.merged_reconstruction,
+                curr_recon_data['reconstruction'],
+                self.output_dir
+            )
+        
+        # 检查合并结果
+        if merged_recon is None:
+            if self.verbose:
+                print(f"  ✗ 合并失败")
+            return False
+        
+        # 更新merged_reconstruction
+        self.merged_reconstruction = merged_recon
+        
+        # 提取 merged 点云用于可视化
+        if self.visualizer is not None:
+            self.visualizer.update_merged_point_cloud(merged_recon)
+        
+        # 保存merged_reconstruction
+        temp_path = self.output_dir / "temp_merged" / f"merged_{len(self.inference_reconstructions)}"
+        temp_path.mkdir(parents=True, exist_ok=True)
+        merged_recon.write_text(str(temp_path))
+        merged_recon.export_PLY(str(temp_path / "points3D.ply"))
+        self.export_reconstruction_to_las(merged_recon, str(temp_path / "points3D.las"))
+        
+        if self.verbose:
+            print(f"  ✓ 合并完成:")
+            print(f"    总影像数: {len(merged_recon.images)}")
+            print(f"    总3D点数: {len(merged_recon.points3D)}")
+            print(f"    结果保存到: {temp_path}")
+
+        # 清理不再需要的中间数据以释放内存
+        self._cleanup_intermediate_data(keep_last_n=2)
+
+        return True
+    
+    def _merge_by_confidence_blend(
+        self,
+        prev_recon: pycolmap.Reconstruction,
+        curr_recon: pycolmap.Reconstruction,
+        output_dir: Path
+    ) -> Optional[pycolmap.Reconstruction]:
+        """
+        使用基于置信度 + 边缘平滑插值的方式合并两个 reconstruction
+        
+        该方法结合了多种技术实现高质量的重建合并：
+        
+        1. 基于置信度的点选择：
+           - 使用神经网络输出的 conf 作为置信度依据
+           - 对于相同像素位置，选择置信度更高的 3D 点
+           - 非重叠区域的点全部保留
+        
+        2. 重叠区边缘平滑插值过渡：
+           - 使用多级 2D 匹配半径进行渐进式匹配
+           - 融合带内使用加权平均混合 3D 坐标
+           - 空间插值使用 smoothstep 实现平滑过渡
+           - 避免合并边界处出现明显的不连续
+        
+        3. 密度均衡化：
+           - 使非重叠区点云密度与重叠区一致
+           - 支持网格采样和距离衰减
+        
+        置信度存储结构：
+        - self.inference_reconstructions[i]['pixel_3d_mapping']: 每个批次的逐像素3D对应
+          {global_idx: {'pts3d': (H,W,3), 'conf': (H,W), 'valid_mask': (H,W)}}
+        - conf 已经缩放到原图尺寸，与 reconstruction 中的 2D 点坐标一致
+        
+        Args:
+            prev_recon: 之前已合并的 reconstruction
+            curr_recon: 当前要合并的 reconstruction
+            output_dir: 输出目录
+            
+        Returns:
+            合并后的 reconstruction，失败返回 None
+        """
+        # 从 pixel_3d_mapping 中提取置信度图
+        # prev_recon_conf: 之前所有批次的 conf（batches 0 to N-2）
+        # curr_recon_conf: 当前批次的 conf（batch N-1）
+        prev_recon_conf: Dict[int, np.ndarray] = {}
+        curr_recon_conf: Dict[int, np.ndarray] = {}
+        
+        num_batches = len(self.inference_reconstructions)
+        
+        # 从 pixel_3d_mapping 提取 conf 的辅助函数
+        def extract_conf_from_pixel_3d_mapping(pixel_3d_mapping: Dict) -> Dict[int, np.ndarray]:
+            """从 pixel_3d_mapping 提取 conf 信息，转换为 {global_idx: (H, W) array} 格式"""
+            conf_maps = {}
+            for global_idx, data in pixel_3d_mapping.items():
+                if 'conf' in data:
+                    conf_maps[global_idx] = data['conf']
+            return conf_maps
+        
+        # 前 N-1 个批次的 conf 属于 prev_recon
+        for i in range(num_batches - 1):
+            pixel_3d_mapping = self.inference_reconstructions[i].get('pixel_3d_mapping', {})
+            batch_conf_maps = extract_conf_from_pixel_3d_mapping(pixel_3d_mapping)
+            prev_recon_conf.update(batch_conf_maps)
+        
+        # 最后一个批次的 conf 属于 curr_recon
+        if num_batches > 0:
+            pixel_3d_mapping = self.inference_reconstructions[-1].get('pixel_3d_mapping', {})
+            curr_recon_conf = extract_conf_from_pixel_3d_mapping(pixel_3d_mapping)
+        
+        if self.verbose:
+            print(f"\n=== 使用 confidence_blend 合并 (置信度选择 + 边缘平滑插值) ===")
+            print(f"    prev_recon: {len(prev_recon.images)} images, {len(prev_recon.points3D)} 3D points")
+            print(f"    curr_recon: {len(curr_recon.images)} images, {len(curr_recon.points3D)} 3D points")
+            print(f"    overlap: {self.overlap} images")
+            print(f"    num_batches: {num_batches}")
+            
+            # 显示每个批次的 pixel_3d_mapping 信息
+            for i, recon_data in enumerate(self.inference_reconstructions):
+                pixel_3d_mapping = recon_data.get('pixel_3d_mapping', {})
+                batch_keys = sorted(pixel_3d_mapping.keys()) if pixel_3d_mapping else []
+                print(f"    batch {i} [{recon_data['start_idx']}-{recon_data['end_idx']}]: {len(pixel_3d_mapping)} pixel_3d_mapping, keys={batch_keys}")
+            
+            # 显示分离后的结果
+            prev_keys = sorted(prev_recon_conf.keys())
+            curr_keys = sorted(curr_recon_conf.keys())
+            print(f"    prev_recon_conf: {len(prev_recon_conf)} images, keys={prev_keys}")
+            print(f"    curr_recon_conf: {len(curr_recon_conf)} images, keys={curr_keys}")
+        
+        # 构建 image_name -> global_idx 的映射（用于像素级置信度查询）
+        image_name_to_idx = {ext['image_name']: idx for idx, ext in enumerate(self.ori_extrinsic)}
+
+        # 获取当前批次的 start_idx 和 end_idx（用于输出目录命名）
+        if num_batches > 0:
+            start_idx = self.inference_reconstructions[-1].get('start_idx')
+            end_idx = self.inference_reconstructions[-1].get('end_idx')
+        else:
+            start_idx = None
+            end_idx = None
+        
+        # 调用 reconstruction_merger 中的合并函数
+        # 分别传入 prev_recon 和 curr_recon 的置信度图
+        # 使用多级半径匹配 + 加权平均模式 + 3D匹配补充 + 激进3D匹配 + 边缘位置平滑 + 融合带空间插值
+        merged_recon, info = merge_by_confidence_blend(
+            prev_recon,
+            curr_recon,
+            inlier_threshold=10,
+            min_inliers=5,
+            min_sample_size=5,
+            ransac_iterations=1000,
+            prev_recon_conf=prev_recon_conf,
+            curr_recon_conf=curr_recon_conf,
+            image_name_to_idx=image_name_to_idx,
+            output_dir=output_dir,
+            start_idx=start_idx,
+            end_idx=end_idx,
+            color_by_source=True,
+            match_radii=[1, 2, 3, 5, 8, 10, 20, 30, 40, 50],  # 多级2D匹配半径（从小到大依次匹配）
+            match_3d_threshold=10.0,  # 3D空间匹配阈值（单位与点云坐标一致）
+            aggressive_3d_threshold=3.0,  # 最终阶段激进3D匹配阈值，用于减少重叠区独有点
+            inner_blend_margin=150.0,  # 融合带向内延伸（像素），同时控制空间插值范围
+            outer_blend_margin=200.0,  # 融合带向外延伸（像素），同时控制空间插值范围
+            blend_mode='weighted',   # 加权平均模式，基于置信度计算加权位置
+            keep_unmatched_overlap=True,  # 保留重叠区未匹配点
+            spatial_blend_interpolation=True,  # 启用融合带3D坐标空间插值
+            spatial_blend_k_neighbors=32,  # 空间插值使用的近邻数
+            spatial_blend_smooth_transition=True,  # 使用 smoothstep 实现更平滑过渡
+            spatial_blend_smooth_power=0.7,  # 平滑力度：<1更强效果（建议0.3-0.7）
+            density_equalization=True,  # 启用密度均衡化，使非重叠区密度与重叠区一致
+            density_k_neighbors=10,  # 密度计算使用的近邻数
+            density_target_percentile=50.0,  # 使用重叠区点间距中位数作为目标
+            density_tolerance=1.2,  # 密度容差倍数
+            density_use_grid=True,  # 使用网格采样（更稳定均匀）
+            density_grid_resolution=1.0,  # 网格分辨率因子
+            density_distance_decay=0.5,  # 距离衰减因子（远离重叠区的点保留更多）
+            voxel_size=self.merge_voxel_size,  # 体素降采样大小
+            verbose=self.verbose,
+        )
+        
+        return merged_recon
+    
+    def _merge_by_confidence(
+        self,
+        prev_recon: pycolmap.Reconstruction,
+        curr_recon: pycolmap.Reconstruction,
+        output_dir: Path
+    ) -> Optional[pycolmap.Reconstruction]:
+        """
+        使用简单的置信度选择方式合并两个 reconstruction
+        
+        该方法基于置信度进行点选择：
+        - 对于相同像素位置，选择置信度更高的 3D 点
+        - 非重叠区域的点全部保留
+        
+        与 confidence_blend 相比，此方法更简单直接，不包含边缘平滑插值等高级功能。
+        
+        Args:
+            prev_recon: 之前已合并的 reconstruction
+            curr_recon: 当前要合并的 reconstruction
+            output_dir: 输出目录
+            
+        Returns:
+            合并后的 reconstruction，失败返回 None
+        """
+        # 从 pixel_3d_mapping 中提取置信度图
+        prev_recon_conf: Dict[int, np.ndarray] = {}
+        curr_recon_conf: Dict[int, np.ndarray] = {}
+        
+        num_batches = len(self.inference_reconstructions)
+        
+        def extract_conf_from_pixel_3d_mapping(pixel_3d_mapping: Dict) -> Dict[int, np.ndarray]:
+            """从 pixel_3d_mapping 提取 conf 信息"""
+            conf_maps = {}
+            for global_idx, data in pixel_3d_mapping.items():
+                if 'conf' in data:
+                    conf_maps[global_idx] = data['conf']
+            return conf_maps
+        
+        # 前 N-1 个批次的 conf 属于 prev_recon
+        for i in range(num_batches - 1):
+            pixel_3d_mapping = self.inference_reconstructions[i].get('pixel_3d_mapping', {})
+            batch_conf_maps = extract_conf_from_pixel_3d_mapping(pixel_3d_mapping)
+            prev_recon_conf.update(batch_conf_maps)
+        
+        # 最后一个批次的 conf 属于 curr_recon
+        if num_batches > 0:
+            pixel_3d_mapping = self.inference_reconstructions[-1].get('pixel_3d_mapping', {})
+            curr_recon_conf = extract_conf_from_pixel_3d_mapping(pixel_3d_mapping)
+        
+        if self.verbose:
+            print(f"\n=== 使用 confidence 合并 (简单置信度选择) ===")
+            print(f"    prev_recon: {len(prev_recon.images)} images, {len(prev_recon.points3D)} 3D points")
+            print(f"    curr_recon: {len(curr_recon.images)} images, {len(curr_recon.points3D)} 3D points")
+            print(f"    overlap: {self.overlap} images")
+        
+        # 构建 image_name -> global_idx 的映射
+        image_name_to_idx = {ext['image_name']: idx for idx, ext in enumerate(self.ori_extrinsic)}
+        
+        # 获取当前批次的 start_idx 和 end_idx
+        if num_batches > 0:
+            start_idx = self.inference_reconstructions[-1].get('start_idx')
+            end_idx = self.inference_reconstructions[-1].get('end_idx')
+        else:
+            start_idx = None
+            end_idx = None
+        
+        # 调用简单置信度合并函数
+        merged_recon, info = merge_by_confidence(
+            prev_recon,
+            curr_recon,
+            inlier_threshold=10,
+            min_inliers=5,
+            min_sample_size=5,
+            ransac_iterations=1000,
+            prev_recon_conf=prev_recon_conf,
+            curr_recon_conf=curr_recon_conf,
+            image_name_to_idx=image_name_to_idx,
+            output_dir=output_dir,
+            start_idx=start_idx,
+            end_idx=end_idx,
+            match_radii=[1, 2, 3, 5, 8, 10, 20, 30, 40, 50],
+            k_neighbors=10,  # 查询多个近邻以提高匹配率
+            color_by_match_status=False, # 设为 True 可启用调试着色
+            blend_mode='weighted',
+            blend_weight=0.8,
+            verbose=self.verbose,
+        )
+        
+        return merged_recon
+    
+    def _merge_by_full_pipeline(
+        self,
+        prev_recon: pycolmap.Reconstruction,
+        curr_recon: pycolmap.Reconstruction,
+        output_dir: Path
+    ) -> Optional[pycolmap.Reconstruction]:
+        """
+        使用完整的 merge_construction 流程合并
+        
+        Args:
+            prev_recon: 之前已合并的 reconstruction
+            curr_recon: 当前要合并的 reconstruction
+            output_dir: 输出目录
+            
+        Returns:
+            合并后的 reconstruction，失败返回 None
+        """
+        # 临时保存两个reconstruction到磁盘
         temp_base = self.output_dir / "temp_merge_input"
         temp_base.mkdir(parents=True, exist_ok=True)
         
         # 保存prev_recon (已合并的)
         prev_dir = temp_base / "prev"
         prev_dir.mkdir(parents=True, exist_ok=True)
-        self.merged_reconstruction.write_text(str(prev_dir))
+        prev_recon.write_text(str(prev_dir))
         
         # 保存curr_recon (当前的)
         curr_dir = temp_base / "curr"
         curr_dir.mkdir(parents=True, exist_ok=True)
-        curr_recon_data['reconstruction'].write_text(str(curr_dir))
-        
-        # 输出目录
-        output_dir = self.output_dir / "temp_merged" / f"merged_{len(self.inference_reconstructions)}"
+        curr_recon.write_text(str(curr_dir))
         
         if self.verbose:
             print(f"\n=== 使用 merge_reconstructions 进行合并 ===")
@@ -2305,7 +2968,7 @@ class IncrementalFeatureMatcherSfM:
             print(f"  curr_dir: {curr_dir}")
             print(f"  output_dir: {output_dir}")
         
-        # 2. 调用 merge_reconstructions 函数
+        # 调用 merge_reconstructions 函数
         merged_recon = merge_reconstructions(
             model_dir1=str(prev_dir),
             model_dir2=str(curr_dir),
@@ -2338,29 +3001,7 @@ class IncrementalFeatureMatcherSfM:
             verbose=self.verbose
         )
         
-        # 3. 检查合并结果
-        if merged_recon is None:
-            if self.verbose:
-                print(f"  ✗ 合并失败")
-            return False
-        
-        # 4. 更新merged_reconstruction
-        self.merged_reconstruction = merged_recon
-        
-        # 5. 提取 merged 点云用于可视化
-        if self.visualizer is not None:
-            self.visualizer.update_merged_point_cloud(merged_recon)
-        
-        # 6. 导出LAS格式
-        self.export_reconstruction_to_las(merged_recon, str(output_dir / "points3D.las"))
-        
-        if self.verbose:
-            print(f"  ✓ 合并完成:")
-            print(f"    总影像数: {len(merged_recon.images)}")
-            print(f"    总3D点数: {len(merged_recon.points3D)}")
-            print(f"    结果保存到: {output_dir}")
-
-        return True  
+        return merged_recon  
 
     def _align_merged_reconstruction_to_gps_poses(
         self,
@@ -2567,6 +3208,235 @@ class IncrementalFeatureMatcherSfM:
         # 写入文件
         las.write(output_path)
 
+    def export_georeferenced(self, reconstruction: Optional[pycolmap.Reconstruction] = None, 
+                              output_dir: Optional[Path] = None,
+                              target_crs: str = "auto_utm",
+                              gps_prior: float = 5.0) -> bool:
+        """Export the reconstruction and poses in a target coordinate system.
+
+        This method:
+        1. Extracts camera positions from reconstruction and matches with original GPS data
+        2. Converts original GPS lat/lon/alt to target CRS coordinates using pyproj
+        3. Aligns the reconstruction to target coordinates using pycolmap model_aligner
+        4. Exports the transformed reconstruction
+
+        Args:
+            reconstruction: pycolmap重建对象，默认使用 self.merged_reconstruction
+            output_dir: 输出目录，默认使用 self.output_dir / "georeferenced"
+            target_crs: 目标坐标系，支持以下选项：
+                - "auto_utm": 自动检测UTM区域（默认）
+                - "EPSG:3857": Web Mercator（适合网页地图可视化）
+                - "EPSG:4326": WGS84 经纬度坐标
+                - "EPSG:XXXX": 任意EPSG代码，如 "EPSG:32648" (UTM Zone 48N)
+            gps_prior: GPS先验误差（米），用于alignment_max_error
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not UTM_EXPORT_AVAILABLE:
+            print("Error: pymap3d or pyproj not available. Install with: pip install pymap3d pyproj")
+            return False
+
+        # 使用默认值
+        if reconstruction is None:
+            reconstruction = self.merged_reconstruction
+        if output_dir is None:
+            output_dir = self.output_dir / "temp_merged_reconstruction_georeferenced"
+
+        if reconstruction is None:
+            print("Error: No reconstruction available.")
+            return False
+        
+        if len(self.ori_extrinsic) == 0:
+            print("Error: No original extrinsic data available.")
+            return False
+
+        try:
+            # 1. 建立 image_name -> GPS 的映射（从原始数据）
+            image_name_to_gps = {}
+            for ext in self.ori_extrinsic:
+                img_name = ext['image_name']
+                gps = ext['gps']  # [lat, lon, alt]
+                image_name_to_gps[img_name] = gps
+            
+            # 2. 从 reconstruction 中提取图像名称，并匹配 GPS
+            image_names = []
+            lats = []
+            lons = []
+            alts = []
+            
+            for img_id, img in reconstruction.images.items():
+                img_name = img.name
+                if img_name in image_name_to_gps:
+                    gps = image_name_to_gps[img_name]
+                    image_names.append(img_name)
+                    lats.append(gps[0])
+                    lons.append(gps[1])
+                    alts.append(gps[2])
+                else:
+                    if self.verbose:
+                        print(f"  Warning: No GPS data for image {img_name}, skipping")
+            
+            if len(image_names) < 3:
+                print(f"Error: Not enough images with GPS data ({len(image_names)}). Need at least 3.")
+                return False
+            
+            lats = np.array(lats)
+            lons = np.array(lons)
+            alts = np.array(alts)
+            
+            if self.verbose:
+                print(f"  Matched {len(image_names)} images with GPS data")
+
+            # 3. Determine target CRS
+            try:
+                if target_crs.lower() == "auto_utm":
+                    # 自动检测UTM区域
+                    utm_crs_info = pyproj.database.query_utm_crs_info(
+                        datum_name="WGS 84",
+                        area_of_interest=pyproj.aoi.AreaOfInterest(
+                            west_lon_degree=float(lons[0]) - 0.01,
+                            south_lat_degree=float(lats[0]) - 0.01,
+                            east_lon_degree=float(lons[0]) + 0.01,
+                            north_lat_degree=float(lats[0]) + 0.01,
+                        ),
+                    )
+                    if not utm_crs_info:
+                        print("Error: Could not determine UTM zone for the given coordinates")
+                        return False
+                    target_crs_obj = pyproj.CRS.from_epsg(utm_crs_info[0].code)
+                    self.output_epsg_code = utm_crs_info[0].code
+                elif target_crs.upper().startswith("EPSG:"):
+                    # 使用指定的EPSG代码
+                    epsg_code = int(target_crs.split(":")[1])
+                    target_crs_obj = pyproj.CRS.from_epsg(epsg_code)
+                    self.output_epsg_code = epsg_code
+                else:
+                    # 尝试直接解析为CRS
+                    target_crs_obj = pyproj.CRS.from_user_input(target_crs)
+                    self.output_epsg_code = target_crs_obj.to_epsg() if target_crs_obj.to_epsg() else None
+                
+                if self.verbose:
+                    crs_name = target_crs_obj.name if hasattr(target_crs_obj, 'name') else str(target_crs_obj)
+                    print(f"  Using CRS: {crs_name} (EPSG:{self.output_epsg_code})")
+                    
+            except Exception as e:
+                print(f"Error determining target CRS: {e}")
+                return False
+
+            # Create transformer from WGS84 to target CRS
+            crs_transformer = pyproj.Transformer.from_crs("EPSG:4326", target_crs_obj, always_xy=True)
+
+            # Convert to target CRS coordinates
+            target_x, target_y = crs_transformer.transform(lons, lats)
+            target_coords = np.column_stack([target_x, target_y, alts])
+
+            # 4. Use the mean as center to offset the whole scene (避免坐标值过大)
+            geo_center = np.mean(target_coords, axis=0)
+            geo_center[2] = 0.0  # Set altitude to 0 for center
+            target_coords_offset = target_coords - geo_center
+
+            # 5. Get image names for alignment
+            tgt_image_names = image_names
+            min_common_images = min(len(tgt_image_names), 3)
+
+            # 保存ENU重建到临时目录（用于colmap model_aligner输入）
+            enu_temp_dir = output_dir.parent / "enu_temp"
+            enu_temp_dir.mkdir(parents=True, exist_ok=True)
+            reconstruction.write_text(str(enu_temp_dir))
+
+            # Write reference images file for colmap model_aligner
+            ref_images_path = output_dir.parent / "georef_locations.txt"
+            with open(ref_images_path, "w") as f:
+                for img_name, (x, y, z) in zip(tgt_image_names, target_coords_offset):
+                    f.write(f"{img_name} {x} {y} {z}\n")
+
+            if self.verbose:
+                print(f"  Reference images written to: {ref_images_path}")
+                print(f"  Geo center (offset): [{geo_center[0]:.3f}, {geo_center[1]:.3f}, {geo_center[2]:.3f}]")
+
+            # 6. Use colmap model_aligner to align reconstruction to target CRS
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            cmd = [
+                "colmap",
+                "model_aligner",
+                "--log_to_stderr", "1" if self.verbose else "0",
+                "--input_path", str(enu_temp_dir),
+                "--output_path", str(output_dir),
+                "--ref_images_path", str(ref_images_path),
+                "--alignment_type", "custom",
+                "--min_common_images", str(min_common_images),
+                "--alignment_max_error", str(gps_prior * 3.0),
+                "--ref_is_gps", "0",
+            ]
+
+            try:
+                if self.verbose:
+                    print(f"  Running COLMAP model_aligner...")
+                subprocess.run(cmd, check=True, capture_output=not self.verbose)
+            except subprocess.CalledProcessError as e:
+                print(f"COLMAP model_aligner failed: {e}")
+                return False
+            except FileNotFoundError:
+                print("Error: COLMAP not found. Please install COLMAP and add it to PATH.")
+                return False
+
+            # 7. Load the aligned model
+            try:
+                rec_georef = pycolmap.Reconstruction(str(output_dir))
+            except Exception as e:
+                print(f"Failed to load aligned georeferenced reconstruction: {e}")
+                return False
+
+            # 8. Export as PLY and LAS
+            rec_georef.export_PLY(str(output_dir / "sparse_points.ply"))
+            self.export_reconstruction_to_las(rec_georef, str(output_dir / "sparse_points.las"))
+
+            # Store georeferenced data for later use
+            self.geo_center = geo_center
+            self.rec_georef = rec_georef
+            self.rec_georef_dir = output_dir
+
+            if self.verbose:
+                print(f"  ✓ Georeferenced export completed:")
+                print(f"    EPSG code: {self.output_epsg_code}")
+                print(f"    Geo center (offset): [{geo_center[0]:.3f}, {geo_center[1]:.3f}, {geo_center[2]:.3f}]")
+                print(f"    Output dir: {output_dir}")
+                print(f"    Total images: {len(rec_georef.images)}")
+                print(f"    Total 3D points: {len(rec_georef.points3D)}")
+
+            return True
+
+        except Exception as e:
+            print(f"Error during georeferenced export: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def export_utm(self, reconstruction: Optional[pycolmap.Reconstruction] = None, 
+                   output_dir: Optional[Path] = None,
+                   gps_prior: float = 5.0) -> bool:
+        """Export the reconstruction in auto-detected UTM coordinates.
+        
+        This is a convenience wrapper for export_georeferenced with target_crs="auto_utm".
+        For more options (EPSG:3857, EPSG:4326, etc.), use export_georeferenced directly.
+
+        Args:
+            reconstruction: pycolmap重建对象，默认使用 self.merged_reconstruction
+            output_dir: 输出目录
+            gps_prior: GPS先验误差（米）
+
+        Returns:
+            True if successful, False otherwise
+        """
+        return self.export_georeferenced(
+            reconstruction=reconstruction,
+            output_dir=output_dir,
+            target_crs="auto_utm",
+            gps_prior=gps_prior
+        )
+
 def run_incremental_feature_matching(
     image_paths: List[Path],
     output_dir: Path,
@@ -2576,15 +3446,18 @@ def run_incremental_feature_matching(
     image_interval: int = 2,
     min_images_for_scale: int = 6,
     overlap: int = 2,
-    pred_vis_scores_thres_value: float = 0.6, 
+    pred_vis_scores_thres_value: float = 0.8, 
     max_reproj_error: float = 5.0,
-    max_points3D_val: int = 10000,
+    max_points3D_val: int = 1000000,
     min_inlier_per_frame: int = 32,
     run_global_sfm_first: bool = True,
-    filter_edge_margin: float = 50.0, # 边缘过滤范围（像素），默认50，设为0禁用
-    merge_voxel_size: float = 1.0,  # 点云合并时的体素大小（米）
+    filter_edge_margin: float = 100.0, # 边缘过滤范围（像素），默认50，设为0禁用
+    merge_voxel_size: float = 2.5,  # 点云合并时的体素大小（米）
     merge_boundary_filter: bool = True,  # 是否启用边界过滤
     merge_statistical_filter: bool = False,  # 是否启用统计过滤
+    export_georef: bool = True,  # 是否导出地理坐标系的重建结果
+    target_crs: str = "auto_utm",  # 目标坐标系: "auto_utm", "EPSG:3857", "EPSG:4326", 等
+    merge_method: str = 'full',  # 'full' | 'confidence' | 'confidence_blend' 合并方式
     enable_visualization: bool = True,
     visualization_mode: str = 'merged',  # 'aligned' | 'merged'
     verbose: bool = False,
@@ -2609,6 +3482,17 @@ def run_incremental_feature_matching(
         merge_voxel_size: Voxel size for point cloud merging (in meters), default 1.0
         merge_boundary_filter: Whether to enable boundary filtering during merge, default True
         merge_statistical_filter: Whether to enable statistical filtering during merge, default False
+        export_georef: Whether to export reconstruction in georeferenced coordinates
+        target_crs: Target coordinate system for georeferenced export:
+            - "auto_utm": 自动检测UTM区域（默认）
+            - "EPSG:3857": Web Mercator（适合网页地图可视化）
+            - "EPSG:4326": WGS84 经纬度坐标
+            - "EPSG:XXXX": 任意EPSG代码
+        merge_method: Merge method selection: 
+            'full' - use merge_full_pipeline.py with full pipeline
+            'confidence' - use merge_confidence.py with simple confidence-based selection
+            'confidence_blend' - use merge_confidence_blend.py with confidence-based selection
+                                 and smooth edge blending/interpolation (default)
         enable_visualization: Whether to start viser server for visualization
         visualization_mode: Point cloud visualization mode, 'aligned' (per batch) or 'merged' (unified)
         verbose: Enable verbose logging
@@ -2628,23 +3512,55 @@ def run_incremental_feature_matching(
         # Create output directory for global SfM
         global_sfm_output_dir = output_dir / "global_sfm"
         global_sfm_output_dir.mkdir(parents=True, exist_ok=True)
-        # Create FeatureMatcherSfM instance
-        global_sparse_matcher = FeatureMatcherSfM(
-            input_dir=input_dir,
-            output_dir=global_sfm_output_dir,
-            imgsz=2048,
-            num_features=8192,
-            match_mode="spatial",
-            num_neighbors=10,
-            max_distance=500.0,
-            verbose=verbose,
-        )        
-        success = global_sparse_matcher.run_pipeline()
-        if success:
-            global_sparse_reconstruction = global_sparse_matcher.rec_prior
+        
+        # Check if SfM results already exist (可直接读取已有结果，避免重复计算)
+        # 增量SfM输出到 enu 目录（与直接三角化保持一致）
+        sparse_model_dir = global_sfm_output_dir / "enu"
+        cameras_file = sparse_model_dir / "cameras.txt"
+        images_file = sparse_model_dir / "images.txt"
+        points3D_file = sparse_model_dir / "points3D.txt"
+        
+        if cameras_file.exists() and images_file.exists() and points3D_file.exists():
+            # 已有SfM结果，直接读取
+            if verbose:
+                print(f"  Found existing SfM results in: {sparse_model_dir}")
+                print(f"  Loading reconstruction from files...")
+            try:
+                global_sparse_reconstruction = pycolmap.Reconstruction(str(sparse_model_dir))
+                if verbose:
+                    print(f"  Loaded: {len(global_sparse_reconstruction.images)} images, "
+                          f"{len(global_sparse_reconstruction.points3D)} 3D points, "
+                          f"{len(global_sparse_reconstruction.cameras)} cameras")
+            except Exception as e:
+                print(f"  Warning: Failed to load existing SfM results: {e}")
+                print(f"  Will run SfM from scratch...")
+                global_sparse_reconstruction = None
         else:
-            print("  Warning: Failed to run global SfM")
-            return False
+            global_sparse_reconstruction = None
+        
+        # 如果没有已有结果，运行SfM
+        if global_sparse_reconstruction is None:
+            if verbose:
+                print(f"  No existing SfM results found, running SfM...")
+            # Create FeatureMatcherSfM instance
+            # 增加 num_neighbors 以捕获跨航带匹配（对于转弯场景很重要）
+            global_sparse_matcher = FeatureMatcherSfM(
+                input_dir=input_dir,
+                output_dir=global_sfm_output_dir,
+                imgsz=2048,
+                num_features=8192,
+                match_mode="sequential",
+                num_neighbors=20, 
+                max_distance=1000.0,
+                sfm_mode="incremental",  # Options: "direct", "direct_ba", "incremental"
+                verbose=verbose,
+            )        
+            success = global_sparse_matcher.run_pipeline()
+            if success:
+                global_sparse_reconstruction = global_sparse_matcher.rec_prior
+            else:
+                print("  Warning: Failed to run global SfM")
+                return False
 
     matcher = IncrementalFeatureMatcherSfM(
         output_dir=output_dir,
@@ -2662,6 +3578,7 @@ def run_incremental_feature_matching(
         merge_voxel_size=merge_voxel_size,
         merge_boundary_filter=merge_boundary_filter,
         merge_statistical_filter=merge_statistical_filter,
+        merge_method=merge_method,
         enable_visualization=enable_visualization,
         visualization_mode=visualization_mode,
         verbose=verbose,
@@ -2677,6 +3594,16 @@ def run_incremental_feature_matching(
 
     # Release model
     matcher._release_model()
+
+    # Export georeferenced coordinates if requested
+    if export_georef and matcher.merged_reconstruction is not None:
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"Exporting to georeferenced coordinates (target_crs: {target_crs})...")
+            print(f"{'='*60}")
+        georef_success = matcher.export_georeferenced(target_crs=target_crs)
+        if not georef_success:
+            print("  Warning: Georeferenced export failed, but ENU reconstruction is still available")
 
     if verbose:
         stats = matcher.get_statistics()
@@ -2698,8 +3625,8 @@ if __name__ == "__main__":
     # input_dir = Path(r"drone-map-anything\examples\Comprehensive_building_sel\images")
     # output_dir = Path(r"drone-map-anything\output\Comprehensive_building_sel\sparse_incremental_reconstruction")
     
-    input_dir = Path(r"drone-map-anything\examples\Ganluo_images\images")
-    output_dir = Path(r"drone-map-anything\output\Ganluo_images\sparse_incremental_reconstruction")
+    # input_dir = Path(r"drone-map-anything\examples\Ganluo_images\images")
+    # output_dir = Path(r"drone-map-anything\output\Ganluo_images\sparse_incremental_reconstruction")
     
     # input_dir = Path(r"drone-map-anything\examples\Tazishan\images")
     # output_dir = Path(r"drone-map-anything\output\Tazishan\sparse_incremental_reconstruction")
@@ -2713,10 +3640,13 @@ if __name__ == "__main__":
     # input_dir = Path(r"drone-map-anything\examples\HuaPo\images")
     # output_dir = Path(r"drone-map-anything\output\HuaPo\sparse_incremental_reconstruction")
 
+    input_dir = Path(r"drone-map-anything\examples\WenChuan\images")
+    output_dir = Path(r"drone-map-anything\output\WenChuan\sparse_incremental_reconstruction")
+
     # 模型选择: 'mapanything' 或 'vggt'
     MODEL_TYPE = 'vggt'  # 切换模型类型
     MODEL_PATH = "weights/vggt/model.pt"  # VGGT 模型权重路径，如果使用 VGGT 需要设置，例如: "weights/model.pt"
-        
+    
     # ================================================
 
     # Get all image files and sort them

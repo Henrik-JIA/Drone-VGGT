@@ -386,6 +386,7 @@ def batch_np_matrix_to_pycolmap(
     
     return reconstruction, valid_mask
 
+
 def pycolmap_to_batch_np_matrix(
     reconstruction, device="cpu", camera_type="SIMPLE_PINHOLE"
 ):

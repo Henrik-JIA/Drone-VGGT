@@ -102,11 +102,16 @@ class FeatureMatcherSfM:
         output_dir: Path,
         imgsz: int = 2048,
         num_features: int = 8192,
-        match_mode: str = "exhaustive",  # "exhaustive" or "spatial"
+        match_mode: str = "exhaustive",  # "exhaustive", "spatial", or "sequential"
         num_neighbors: int = 10,
         max_distance: float = 500.0,  # for spatial matching
         min_track_length: int = 2, 
         min_num_matches: int = 15, 
+        sfm_mode: str = "direct",  # "direct", "direct_ba", or "incremental"
+        ba_refine_focal_length: bool = True,
+        ba_refine_principal_point: bool = False,
+        ba_refine_extra_params: bool = True,
+        ba_max_num_iterations: int = 100,
         verbose: bool = False,
     ):
         """Initialize feature matcher.
@@ -116,11 +121,17 @@ class FeatureMatcherSfM:
             output_dir: Directory for output files (database, etc.)
             imgsz: Maximum image size (longest edge) for feature extraction
             num_features: Number of features to extract per image
-            match_mode: Feature matching mode ("exhaustive" or "spatial")
+            match_mode: Feature matching mode ("exhaustive", "spatial", or "sequential")
             num_neighbors: Number of neighbors for spatial matching
             max_distance: Maximum distance for spatial matching (meters)
             min_track_length: Minimum track length for valid tracks (used in build_2D_prior_recon)
             min_num_matches: Minimum number of matches for valid tracks (used in build_2D_prior_recon)
+            sfm_mode: SfM mode - "direct" (triangulation only), "direct_ba" (triangulation + BA), 
+                      or "incremental" (COLMAP-style incremental SfM)
+            ba_refine_focal_length: Whether to refine focal length in BA
+            ba_refine_principal_point: Whether to refine principal point in BA
+            ba_refine_extra_params: Whether to refine extra params (distortion) in BA
+            ba_max_num_iterations: Maximum number of BA iterations
             verbose: Enable verbose logging
         """
         self.input_dir = Path(input_dir)
@@ -132,6 +143,11 @@ class FeatureMatcherSfM:
         self.max_distance = max_distance
         self.min_track_length = min_track_length
         self.min_num_matches = min_num_matches
+        self.sfm_mode = sfm_mode
+        self.ba_refine_focal_length = ba_refine_focal_length
+        self.ba_refine_principal_point = ba_refine_principal_point
+        self.ba_refine_extra_params = ba_refine_extra_params
+        self.ba_max_num_iterations = ba_max_num_iterations
         self.verbose = verbose
 
         # Class member variables
@@ -337,19 +353,71 @@ class FeatureMatcherSfM:
                 )
             elif self.match_mode == "spatial" and self.image_gps_locations is not None:
                 # Spatial matching using GPS data
+                # SIFT matching options (General Options)
                 sift_options = pycolmap.SiftMatchingOptions()
+                sift_options.max_ratio = 0.80
+                sift_options.max_distance = 0.70
+                sift_options.cross_check = True
+                sift_options.max_num_matches = 32768
+                sift_options.guided_matching = False
 
+                # Spatial matching options
                 spatial_options = pycolmap.SpatialMatchingOptions()
-                spatial_options.max_distance = self.max_distance
-                spatial_options.max_num_neighbors = self.num_neighbors
                 spatial_options.ignore_z = True
+                spatial_options.max_num_neighbors = 50  # COLMAP 默认 50
+                spatial_options.max_distance = 100.0  # COLMAP 默认 100 米
 
+                # Two-view geometry verification options
                 verification_options = pycolmap.TwoViewGeometryOptions()
+                verification_options.ransac.max_error = 4.0
+                verification_options.ransac.confidence = 0.999
+                verification_options.ransac.max_num_trials = 10000
+                verification_options.ransac.min_inlier_ratio = 0.25
+                verification_options.min_num_inliers = 15
+                verification_options.multiple_models = False
             
                 pycolmap.match_spatial(
                     database_path=str(self.database_path),
                     sift_options=sift_options,
                     matching_options=spatial_options,
+                    verification_options=verification_options,
+                    device=pycolmap.Device.auto
+                )
+
+            elif self.match_mode == "sequential":
+                # Sequential matching (for ordered image sequences)
+                # SIFT matching options (General Options)
+                sift_options = pycolmap.SiftMatchingOptions()
+                sift_options.max_ratio = 0.80
+                sift_options.max_distance = 0.70
+                sift_options.cross_check = True
+                sift_options.max_num_matches = 32768
+                sift_options.guided_matching = False
+
+                # Sequential matching options
+                sequential_options = pycolmap.SequentialMatchingOptions()
+                sequential_options.overlap = 10  # 连续图像重叠数
+                sequential_options.quadratic_overlap = True  # 二次重叠
+                sequential_options.loop_detection = False  # 回环检测
+                sequential_options.loop_detection_num_images = 50  # 回环检测图像数
+                sequential_options.loop_detection_num_nearest_neighbors = 1  # 最近邻数
+                sequential_options.loop_detection_num_checks = 256  # 检查次数
+                sequential_options.loop_detection_num_images_after_verification = 0  # 验证后图像数
+                sequential_options.loop_detection_max_num_features = -1  # 最大特征数
+
+                # Two-view geometry verification options
+                verification_options = pycolmap.TwoViewGeometryOptions()
+                verification_options.ransac.max_error = 4.0
+                verification_options.ransac.confidence = 0.999
+                verification_options.ransac.max_num_trials = 10000
+                verification_options.ransac.min_inlier_ratio = 0.25
+                verification_options.min_num_inliers = 15
+                verification_options.multiple_models = False
+
+                pycolmap.match_sequential(
+                    database_path=str(self.database_path),
+                    sift_options=sift_options,
+                    matching_options=sequential_options,
                     verification_options=verification_options,
                     device=pycolmap.Device.auto
                 )
@@ -502,74 +570,108 @@ class FeatureMatcherSfM:
             ignore_watermarks=True, 
             image_names=image_names_set
         )
-        images = dbcache.images
+        db_images = dbcache.images
         correspondence_graph = dbcache.correspondence_graph
         num_all_matches = correspondence_graph.num_correspondences_between_all_images()
+        
+        # Build mapping between database image IDs and reconstruction image IDs
+        # db_id -> recon_id mapping via image name
+        db_name_to_db_img = {img.name: img for img in db_images.values()}
+        recon_name_to_recon_id = {img.name: img_id for img_id, img in reconstruction.images.items()}
+        db_id_to_recon_id = {}
+        for db_img in db_images.values():
+            if db_img.name in recon_name_to_recon_id:
+                db_id_to_recon_id[db_img.image_id] = recon_name_to_recon_id[db_img.name]
+        
+        if self.verbose:
+            print(f"  Mapped {len(db_id_to_recon_id)} images between database and reconstruction")
+        
         graph = nx.Graph()
 
         for pair_id, num_matches in num_all_matches.items():
-            image_id1, image_id2 = pair_id_to_image_ids(pair_id)
+            db_image_id1, db_image_id2 = pair_id_to_image_ids(pair_id)
+            
+            # Skip if images not in our reconstruction
+            if db_image_id1 not in db_id_to_recon_id or db_image_id2 not in db_id_to_recon_id:
+                continue
+                
             if num_matches < self.min_num_matches:
-                print(
-                    f"Image pair ({image_id1}, {image_id2}) has too few matches ({num_matches}), skipping"
-                )
                 continue
 
             # (m, 2) ndarray of uint32
-            matches = correspondence_graph.find_correspondences_between_images(image_id1, image_id2)
-            # add nodes and edges to the graph
-            if matches is None:
-                print(f"No matches found between images {image_id1} and {image_id2}, skipping")
+            matches = correspondence_graph.find_correspondences_between_images(db_image_id1, db_image_id2)
+            if matches is None or len(matches) == 0:
                 continue
+            
+            # Use reconstruction image IDs for the graph nodes
+            recon_id1 = db_id_to_recon_id[db_image_id1]
+            recon_id2 = db_id_to_recon_id[db_image_id2]
+            
             # Add all edges from matches at once for efficiency
-            edges = [((image_id1, int(idx1)), (image_id2, int(idx2))) for idx1, idx2 in matches]
+            edges = [((recon_id1, int(idx1)), (recon_id2, int(idx2))) for idx1, idx2 in matches]
             graph.add_edges_from(edges)
 
         # 3. 查找连通分量
         components = list(nx.connected_components(graph))
         print(f"Found {len(components)} connected components in correspondence graph")
 
-        # 4. 为每个连通分量创建3D点
+        # 4. 为每个图像加载关键点
         try:
-            point3D_id = 0
-            tracks = []
-
-            db_name_to_image = {img.name: img for img in images.values()}
             for recon_img_id, recon_img in reconstruction.images.items():
                 img_name = recon_img.name
-                if img_name in db_name_to_image:
-                    db_img = db_name_to_image[img_name]
+                if img_name in db_name_to_db_img:
+                    db_img = db_name_to_db_img[img_name]
                     kps = database.read_keypoints(db_img.image_id)
                     pts2d = [
-                            pycolmap.Point2D(xy=np.array([float(x), float(y)], dtype=np.float64))
-                            for x, y in kps[:, :2]
-                        ]
+                        pycolmap.Point2D(xy=np.array([float(x), float(y)], dtype=np.float64))
+                        for x, y in kps[:, :2]
+                    ]
                     reconstruction.images[recon_img_id].points2D = pts2d
                 else:
                     print(f"No keypoints found for {img_name}")
 
-            for comp_idx, component in enumerate(components):
-                if len(component) < self.min_track_length: # 允许只在 2 张图中匹配的点
+            # 5. 为每个连通分量创建3D点
+            valid_tracks_count = 0
+            for component in components:
+                if len(component) < self.min_track_length:
                     continue
+                
+                # 验证所有节点都有效
+                valid_component = True
+                for node in component:
+                    recon_img_id, point2D_idx = node
+                    if recon_img_id not in reconstruction.images:
+                        valid_component = False
+                        break
+                    if point2D_idx >= len(reconstruction.images[recon_img_id].points2D):
+                        valid_component = False
+                        break
+                
+                if not valid_component:
+                    continue
+                
                 # 添加到重建
-                xyz = np.zeros(3).astype(np.float64)  # Initialize 3D point at origin
-                tracks = []
+                xyz = np.zeros(3, dtype=np.float64)
                 point3D_id = reconstruction.add_point3D(xyz, pycolmap.Track())
 
                 # 创建Track对象（包含所有观测）
+                track_elements = []
                 for node in component:
-                    image_id, point2D_idx = node
-                    tracks.append(pycolmap.TrackElement(image_id=image_id, point2D_idx=point2D_idx))
-                    reconstruction.images[image_id].points2D[
-                        point2D_idx
-                    ].point3D_id = point3D_id  # Assign track ID to point2D
-                reconstruction.points3D[point3D_id].track = pycolmap.Track(tracks)
+                    recon_img_id, point2D_idx = node
+                    track_elements.append(pycolmap.TrackElement(image_id=recon_img_id, point2D_idx=point2D_idx))
+                    reconstruction.images[recon_img_id].points2D[point2D_idx].point3D_id = point3D_id
+                
+                reconstruction.points3D[point3D_id].track = pycolmap.Track(track_elements)
+                valid_tracks_count += 1
+
+            print(f"Successfully added {valid_tracks_count} 3D points to reconstruction")
+            return True
 
         except Exception as e:
+            import traceback
             print(f"Error initializing point tracks: {e}")
-            return
-        print(f"Successfully added {len(components)} 3D points to reconstruction")
-        return True
+            traceback.print_exc()
+            return False
 
     def export_reconstruction(self) -> bool:
         """Export reconstruction to text format.
@@ -645,15 +747,443 @@ class FeatureMatcherSfM:
 
         return True
 
+    def run_bundle_adjustment(self, reconstruction: pycolmap.Reconstruction) -> bool:
+        """Run global bundle adjustment to optimize camera poses and 3D points.
+        
+        Args:
+            reconstruction: The reconstruction to optimize
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        if reconstruction is None:
+            print("Error: No reconstruction provided for bundle adjustment.")
+            return False
+
+        try:
+            if self.verbose:
+                print("Running global bundle adjustment to refine poses...")
+                print(f"  Before BA: {len(reconstruction.images)} images, {len(reconstruction.points3D)} 3D points")
+
+            # Configure bundle adjustment options
+            ba_options = pycolmap.BundleAdjustmentOptions()
+            ba_options.refine_focal_length = self.ba_refine_focal_length
+            ba_options.refine_principal_point = self.ba_refine_principal_point
+            ba_options.refine_extra_params = self.ba_refine_extra_params
+            
+            # Solver options
+            ba_options.solver_options.max_num_iterations = self.ba_max_num_iterations
+            ba_options.solver_options.function_tolerance = 1e-6
+            ba_options.solver_options.gradient_tolerance = 1e-10
+            ba_options.solver_options.parameter_tolerance = 1e-8
+
+            # Run bundle adjustment
+            ba_report = pycolmap.bundle_adjustment(
+                reconstruction=reconstruction,
+                options=ba_options
+            )
+
+            if ba_report is None:
+                print("Warning: Bundle adjustment returned None (may have already converged or no valid points)")
+            elif self.verbose:
+                print(f"  BA completed: cost changed from {ba_report.initial_cost:.4f} to {ba_report.final_cost:.4f}")
+                print(f"  BA iterations: {ba_report.num_iterations}")
+
+            # Filter outlier points after BA
+            obs = pycolmap.ObservationManager(reconstruction)
+            num_filtered = obs.filter_all_points3D(max_reproj_error=4.0, min_tri_angle=1.5)
+            
+            if self.verbose:
+                print(f"  Filtered {num_filtered} outlier points")
+                print(f"  After BA: {len(reconstruction.images)} images, {len(reconstruction.points3D)} 3D points")
+
+            return True
+
+        except Exception as e:
+            print(f"Error: Bundle adjustment failed: {e}")
+            return False
+
+    def run_triangulation_with_ba(self) -> bool:
+        """Run triangulation followed by global bundle adjustment.
+        
+        This method first performs triangulation on the prior reconstruction,
+        then runs bundle adjustment to optimize both camera poses and 3D points.
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self.database_path or not self.database_path.exists():
+            print("Database not found. Call extract_features/match_features() first.")
+            return False
+
+        tri_dir = self.output_dir / "enu_ba"
+        tri_dir.mkdir(exist_ok=True)
+
+        try:
+            # Step 1: Triangulation
+            if self.verbose:
+                print("Step 1: Running triangulation...")
+            
+            opts = pycolmap.IncrementalPipelineOptions()
+            opts.ba_global_max_num_iterations = 75
+            tri_opts = pycolmap.IncrementalTriangulatorOptions()
+            tri_opts.ignore_two_view_tracks = True
+            tri_opts.min_angle = 1.5
+            tri_opts.complete_max_reproj_error = 4.0
+            tri_opts.merge_max_reproj_error = 4.0
+            opts.triangulation = tri_opts
+
+            result_reconstruction = pycolmap.triangulate_points(
+                reconstruction=self.rec_prior,
+                database_path=str(self.database_path),
+                image_path=str(self.input_dir),
+                output_path=str(tri_dir),
+                clear_points=True,
+                options=opts,
+                refine_intrinsics=True
+            )
+
+            if result_reconstruction is None:
+                print("Triangulation returned None")
+                return False
+
+            if self.verbose:
+                print(f"  Triangulation completed: {len(result_reconstruction.images)} images, {len(result_reconstruction.points3D)} 3D points")
+
+            # Step 2: Bundle Adjustment
+            if self.verbose:
+                print("Step 2: Running bundle adjustment...")
+            
+            if not self.run_bundle_adjustment(result_reconstruction):
+                print("Warning: Bundle adjustment failed, using triangulation result only")
+            
+            # Save results
+            result_reconstruction.write_text(str(tri_dir))
+            result_reconstruction.export_PLY(tri_dir / "sparse_points.ply")
+            
+            self.rec_prior = result_reconstruction
+            self.rec_prior_dir = tri_dir
+            
+            if self.verbose:
+                print(f"Triangulation + BA completed: {tri_dir}")
+                print(f"  Final: {len(result_reconstruction.images)} images, {len(result_reconstruction.points3D)} 3D points")
+
+            return True
+
+        except Exception as e:
+            print(f"Triangulation with BA failed: {e}")
+            return False
+
+    def run_incremental_sfm(self) -> bool:
+        """Run COLMAP-style incremental SfM reconstruction.
+        
+        This method uses COLMAP's incremental mapping pipeline which:
+        1. Selects optimal initial image pair
+        2. Incrementally adds images using PnP + RANSAC
+        3. Performs local and global bundle adjustment
+        4. Continuously optimizes camera poses and 3D points
+        5. Aligns to ENU coordinate system using GPS data
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self.database_path or not self.database_path.exists():
+            print("Database not found. Call extract_features/match_features() first.")
+            return False
+
+        # 输出到 enu 目录，与直接三角化保持一致
+        sfm_dir = self.output_dir / "enu"
+        sfm_dir.mkdir(exist_ok=True)
+
+        try:
+            if self.verbose:
+                print("Running incremental SfM (COLMAP-style)...")
+
+            # Configure incremental mapping options (与 COLMAP GUI 一致)
+            opts = pycolmap.IncrementalPipelineOptions()
+            opts.min_num_matches = self.min_num_matches
+            
+            # Camera parameters
+            opts.ba_refine_focal_length = True
+            opts.ba_refine_principal_point = False
+            opts.ba_refine_extra_params = True
+            
+            # Local Bundle Adjustment
+            opts.ba_local_num_images = 6
+            opts.ba_local_max_num_iterations = 25
+            opts.ba_local_max_refinements = 2
+            opts.ba_local_max_refinement_change = 0.001
+            
+            # Global Bundle Adjustment
+            opts.ba_global_images_ratio = 1.1
+            opts.ba_global_images_freq = 500
+            opts.ba_global_points_ratio = 1.1
+            opts.ba_global_points_freq = 250000
+            opts.ba_global_max_num_iterations = 50
+            opts.ba_global_max_refinements = 5
+            opts.ba_global_max_refinement_change = 0.0005
+
+            # Run incremental mapping
+            reconstructions = pycolmap.incremental_mapping(
+                database_path=str(self.database_path),
+                image_path=str(self.input_dir),
+                output_path=str(sfm_dir),
+                options=opts
+            )
+
+            if not reconstructions:
+                print("Error: Incremental SfM produced no reconstructions")
+                return False
+
+            # Get the largest reconstruction
+            best_recon = max(reconstructions.values(), key=lambda r: len(r.images))
+            
+            if self.verbose:
+                print(f"Incremental SfM completed with {len(reconstructions)} reconstruction(s)")
+                print(f"  Best reconstruction: {len(best_recon.images)} images, {len(best_recon.points3D)} 3D points")
+
+            # Align to ENU coordinate system using GPS data
+            if self.image_enu_locations is not None:
+                if self.verbose:
+                    print("Aligning reconstruction to ENU coordinate system...")
+                self._align_to_enu(best_recon)
+
+            # Save results
+            best_recon.write_text(str(sfm_dir))
+            best_recon.export_PLY(sfm_dir / "sparse_points.ply")
+            
+            self.rec_prior = best_recon
+            self.rec_prior_dir = sfm_dir
+
+            return True
+
+        except Exception as e:
+            print(f"Incremental SfM failed: {e}")
+            return False
+
+    def _align_to_enu(self, reconstruction: pycolmap.Reconstruction) -> bool:
+        """Align reconstruction to ENU coordinate system using GPS data.
+        
+        Uses Sim3 (similarity transformation: scale + rotation + translation)
+        to align the SfM reconstruction to the ENU coordinate system derived from GPS.
+        After Sim3 alignment, applies an additional translation to ensure the first
+        camera is exactly at the world origin (0, 0, 0).
+        
+        Args:
+            reconstruction: The reconstruction to align
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Collect corresponding points: SfM camera centers vs ENU positions
+            sfm_positions = []
+            enu_positions = []
+            image_indices = []  # Track which image index each position corresponds to
+            
+            for i, image_path in enumerate(self.image_paths):
+                image_name = image_path.name
+                
+                # Find this image in the reconstruction
+                recon_image = None
+                for img in reconstruction.images.values():
+                    if img.name == image_name:
+                        recon_image = img
+                        break
+                
+                if recon_image is None:
+                    continue
+                
+                # Get camera center in SfM coordinate system
+                # cam_from_world: world point -> camera point
+                # Camera center in world: -R^T @ t
+                cam_from_world = recon_image.cam_from_world
+                R = cam_from_world.rotation.matrix()
+                t = cam_from_world.translation
+                sfm_center = -R.T @ t
+                
+                # Get corresponding ENU position
+                enu_pos = self.image_enu_locations[i]
+                
+                sfm_positions.append(sfm_center)
+                enu_positions.append(enu_pos)
+                image_indices.append(i)
+            
+            if len(sfm_positions) < 3:
+                print("Warning: Not enough corresponding points for alignment")
+                return False
+            
+            sfm_positions = np.array(sfm_positions)
+            enu_positions = np.array(enu_positions)
+            
+            # Compute Sim3 transformation using Umeyama algorithm
+            # This finds scale, rotation, translation to align sfm_positions to enu_positions
+            scale, R_align, t_align = self._umeyama_alignment(sfm_positions, enu_positions)
+            
+            if self.verbose:
+                print(f"  Sim3 alignment scale: {scale:.4f}")
+                print(f"  Sim3 alignment translation: [{t_align[0]:.2f}, {t_align[1]:.2f}, {t_align[2]:.2f}]")
+            
+            # Apply Sim3 transformation to all cameras and points
+            self._apply_sim3_transform(reconstruction, scale, R_align, t_align)
+            
+            # Step 2: Find the first image in the reconstruction and compute its current position
+            first_img_name = self.image_paths[0].name
+            first_camera_center = None
+            
+            for img in reconstruction.images.values():
+                if img.name == first_img_name:
+                    cam_from_world = img.cam_from_world
+                    R = cam_from_world.rotation.matrix()
+                    t = cam_from_world.translation
+                    first_camera_center = -R.T @ t
+                    break
+            
+            if first_camera_center is not None:
+                # Calculate the offset needed to move first camera to origin
+                # We want first_camera_center to be at [0, 0, 0]
+                offset = -first_camera_center
+                
+                if self.verbose:
+                    print(f"  First camera position after Sim3: [{first_camera_center[0]:.4f}, {first_camera_center[1]:.4f}, {first_camera_center[2]:.4f}]")
+                    print(f"  Applying additional translation: [{offset[0]:.4f}, {offset[1]:.4f}, {offset[2]:.4f}]")
+                
+                # Apply pure translation (scale=1, R=identity) to move first camera to origin
+                identity_R = np.eye(3)
+                self._apply_sim3_transform(reconstruction, 1.0, identity_R, offset)
+                
+                if self.verbose:
+                    # Verify first camera is now at origin
+                    for img in reconstruction.images.values():
+                        if img.name == first_img_name:
+                            cam_from_world = img.cam_from_world
+                            R = cam_from_world.rotation.matrix()
+                            t = cam_from_world.translation
+                            new_center = -R.T @ t
+                            print(f"  First camera final position: [{new_center[0]:.6f}, {new_center[1]:.6f}, {new_center[2]:.6f}]")
+                            break
+            else:
+                print("Warning: First image not found in reconstruction, cannot center at origin")
+            
+            return True
+            
+        except Exception as e:
+            print(f"Warning: Failed to align to ENU: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def _umeyama_alignment(self, src: np.ndarray, dst: np.ndarray) -> tuple:
+        """Compute Sim3 transformation using Umeyama algorithm.
+        
+        Finds scale s, rotation R, translation t such that:
+        dst ≈ s * R @ src + t
+        
+        Args:
+            src: Source points (N, 3)
+            dst: Destination points (N, 3)
+            
+        Returns:
+            Tuple of (scale, rotation_matrix, translation_vector)
+        """
+        n = src.shape[0]
+        
+        # Compute centroids
+        src_mean = src.mean(axis=0)
+        dst_mean = dst.mean(axis=0)
+        
+        # Center the points
+        src_centered = src - src_mean
+        dst_centered = dst - dst_mean
+        
+        # Compute variances
+        src_var = np.sum(src_centered ** 2) / n
+        
+        # Compute covariance matrix
+        H = (dst_centered.T @ src_centered) / n
+        
+        # SVD
+        U, S, Vt = np.linalg.svd(H)
+        
+        # Compute rotation
+        R = U @ Vt
+        
+        # Handle reflection case
+        if np.linalg.det(R) < 0:
+            Vt[-1, :] *= -1
+            S[-1] *= -1
+            R = U @ Vt
+        
+        # Compute scale
+        scale = np.sum(S) / src_var
+        
+        # Compute translation
+        t = dst_mean - scale * R @ src_mean
+        
+        return scale, R, t
+
+    def _apply_sim3_transform(self, reconstruction: pycolmap.Reconstruction, 
+                               scale: float, R: np.ndarray, t: np.ndarray):
+        """Apply Sim3 transformation to reconstruction.
+        
+        Transforms all camera poses and 3D points.
+        New_point = scale * R @ old_point + t
+        
+        Args:
+            reconstruction: The reconstruction to transform
+            scale: Scale factor
+            R: 3x3 rotation matrix
+            t: 3D translation vector
+        """
+        # Transform all 3D points
+        for point3D_id in list(reconstruction.points3D.keys()):
+            point3D = reconstruction.points3D[point3D_id]
+            old_xyz = point3D.xyz
+            new_xyz = scale * R @ old_xyz + t
+            point3D.xyz = new_xyz
+        
+        # Transform all camera poses
+        for image_id in reconstruction.images:
+            image = reconstruction.images[image_id]
+            cam_from_world = image.cam_from_world
+            
+            # Get old rotation and translation
+            R_old = cam_from_world.rotation.matrix()
+            t_old = cam_from_world.translation
+            
+            # Old camera center: C_old = -R_old^T @ t_old
+            C_old = -R_old.T @ t_old
+            
+            # New camera center: C_new = scale * R @ C_old + t
+            C_new = scale * R @ C_old + t
+            
+            # New rotation: R_new = R_old @ R^T (camera orientation in new world frame)
+            R_new = R_old @ R.T
+            
+            # New translation: t_new = -R_new @ C_new
+            t_new = -R_new @ C_new
+            
+            # Update camera pose
+            new_cam_from_world = pycolmap.Rigid3d(
+                rotation=pycolmap.Rotation3d(R_new),
+                translation=t_new
+            )
+            image.cam_from_world = new_cam_from_world
+
     def run_pipeline(self) -> bool:
         """Run the complete feature extraction and matching pipeline.
+        
+        The pipeline behavior depends on sfm_mode:
+        - "direct": Use GPS/gimbal poses for triangulation only (original behavior)
+        - "direct_ba": Use GPS/gimbal poses + triangulation + bundle adjustment
+        - "incremental": Use COLMAP-style incremental SfM (ignores GPS/gimbal poses)
         
         Returns:
             True if successful, False otherwise
         """
         try:
             if self.verbose:
-                print("Feature Matcher: Starting pipeline")
+                print(f"Feature Matcher: Starting pipeline (mode: {self.sfm_mode})")
             
             if self.verbose:
                 print("Feature Matcher: Initializing images...")
@@ -671,20 +1201,37 @@ class FeatureMatcherSfM:
             if not self.match_features():
                 return False
             
-            if self.verbose:
-                print("Feature Matcher: Saving prior reconstruction...")
-            if not self.build_2D_prior_recon():
-                return False
-            
-            if self.verbose:
-                print("Feature Matcher: Exporting reconstruction...")
-            if not self.export_reconstruction():
-                return False
-            
-            if self.verbose:
-                print("Feature Matcher: Running triangulation...")
-            if not self.run_triangulation():
-                return False
+            # Branch based on sfm_mode
+            if self.sfm_mode == "incremental":
+                # Incremental SfM (COLMAP-style) - doesn't need prior poses
+                if self.verbose:
+                    print("Feature Matcher: Running incremental SfM...")
+                if not self.run_incremental_sfm():
+                    return False
+            else:
+                # Direct triangulation modes - need prior poses
+                if self.verbose:
+                    print("Feature Matcher: Building prior reconstruction...")
+                if not self.build_2D_prior_recon():
+                    return False
+                
+                if self.verbose:
+                    print("Feature Matcher: Exporting prior reconstruction...")
+                if not self.export_reconstruction():
+                    return False
+                
+                if self.sfm_mode == "direct_ba":
+                    # Triangulation + Bundle Adjustment
+                    if self.verbose:
+                        print("Feature Matcher: Running triangulation with BA...")
+                    if not self.run_triangulation_with_ba():
+                        return False
+                else:
+                    # Direct triangulation only (default, original behavior)
+                    if self.verbose:
+                        print("Feature Matcher: Running triangulation...")
+                    if not self.run_triangulation():
+                        return False
 
             if self.verbose:
                 print("Feature Matcher: Pipeline completed successfully")
@@ -703,6 +1250,11 @@ def run_feature_matching(
     match_mode: str = "exhaustive",
     num_neighbors: int = 10,
     max_distance: float = 500.0,
+    sfm_mode: str = "direct",
+    ba_refine_focal_length: bool = True,
+    ba_refine_principal_point: bool = False,
+    ba_refine_extra_params: bool = True,
+    ba_max_num_iterations: int = 100,
     verbose: bool = False,
 ) -> bool:
     """Run feature extraction and matching pipeline.
@@ -712,9 +1264,15 @@ def run_feature_matching(
         output_dir: Directory for output files
         imgsz: Maximum image size (longest edge)
         num_features: Number of features to extract per image
-        match_mode: Feature matching mode ("exhaustive" or "spatial")
+        match_mode: Feature matching mode ("exhaustive", "spatial", or "sequential")
         num_neighbors: Number of neighbors for spatial matching
         max_distance: Maximum distance for spatial matching (meters)
+        sfm_mode: SfM mode - "direct" (triangulation only), "direct_ba" (triangulation + BA),
+                  or "incremental" (COLMAP-style incremental SfM)
+        ba_refine_focal_length: Whether to refine focal length in BA
+        ba_refine_principal_point: Whether to refine principal point in BA
+        ba_refine_extra_params: Whether to refine extra params (distortion) in BA
+        ba_max_num_iterations: Maximum number of BA iterations
         verbose: Enable verbose logging
         
     Returns:
@@ -728,6 +1286,11 @@ def run_feature_matching(
         match_mode=match_mode,
         num_neighbors=num_neighbors,
         max_distance=max_distance,
+        sfm_mode=sfm_mode,
+        ba_refine_focal_length=ba_refine_focal_length,
+        ba_refine_principal_point=ba_refine_principal_point,
+        ba_refine_extra_params=ba_refine_extra_params,
+        ba_max_num_iterations=ba_max_num_iterations,
         verbose=verbose,
     )
     return matcher.run_pipeline()
@@ -738,6 +1301,11 @@ if __name__ == "__main__":
     input_dir = Path(r"drone-map-anything\examples\Ganluo_images\images")
     output_dir = Path(r"drone-map-anything\output\Ganluo_images\sparse_reconstruction")
     
+    # SfM mode options:
+    # - "direct": Use GPS/gimbal poses for triangulation only (fastest, but may have drift)
+    # - "direct_ba": Use GPS/gimbal poses + triangulation + bundle adjustment (recommended)
+    # - "incremental": COLMAP-style incremental SfM (best quality, but slower)
+    
     success = run_feature_matching(
         input_dir=input_dir,
         output_dir=output_dir,
@@ -746,6 +1314,11 @@ if __name__ == "__main__":
         match_mode="spatial",
         num_neighbors=10,
         max_distance=500.0,
+        sfm_mode="direct",  # Options: "direct", "direct_ba", "incremental"
+        ba_refine_focal_length=True,
+        ba_refine_principal_point=False,
+        ba_refine_extra_params=True,
+        ba_max_num_iterations=100,
         verbose=True,
     )
     
