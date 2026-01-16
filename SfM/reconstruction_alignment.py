@@ -7,10 +7,106 @@ using various methods including point cloud matching and GPS-based alignment.
 """
 
 from typing import Optional, List, Dict, Tuple
-from collections import defaultdict
 
 import numpy as np
 import pycolmap
+
+# 尝试导入 scipy 的 KDTree（更快的最近邻搜索）
+try:
+    from scipy.spatial import cKDTree
+    HAS_KDTREE = True
+except ImportError:
+    HAS_KDTREE = False
+
+# 模块级常量
+MAX_VALID_POINT3D_ID = 2**31  # pycolmap 无效 ID 是大整数，合理 ID 应小于此值
+
+
+def _extract_valid_points2d(image, max_valid_id: int = MAX_VALID_POINT3D_ID):
+    """
+    快速提取图像中有效的 2D 点及其 3D 点 ID。
+    
+    Returns:
+        (coords_list, pt3d_ids_list): 坐标列表和 ID 列表
+    """
+    coords = []
+    pt3d_ids = []
+    for point2D in image.points2D:
+        pt3d_id = point2D.point3D_id
+        if 0 <= pt3d_id < max_valid_id:
+            coords.append((point2D.xy[0], point2D.xy[1]))
+            pt3d_ids.append(int(pt3d_id))
+    return coords, pt3d_ids
+
+
+def find_single_images_pair_matches_kdtree(
+    prev_image,
+    curr_image,
+    curr_coords,
+    curr_pt3d_ids,
+    pixel_threshold: float,
+) -> list:
+    """
+    使用 KD-Tree 进行快速最近邻匹配（优化版本）。
+    
+    Args:
+        prev_image: 前一个重建的影像对象
+        curr_coords: curr_image 的 2D 坐标数组 (M, 2) 或列表
+        curr_pt3d_ids: curr_image 的 3D 点 ID 列表
+        pixel_threshold: 像素距离阈值
+        
+    Returns:
+        对应关系列表 [(prev_point3D_id, curr_point3D_id, dist)]
+    """
+    # 确保 curr_coords 是 numpy 数组
+    if not isinstance(curr_coords, np.ndarray):
+        curr_coords = np.asarray(curr_coords, dtype=np.float64)
+    
+    if len(curr_coords) == 0:
+        return []
+    
+    # 构建 KD-Tree
+    tree = cKDTree(curr_coords)
+    
+    # 批量提取 prev_image 的有效 2D 点
+    prev_coords_list, prev_pt3d_ids = _extract_valid_points2d(prev_image)
+    
+    if not prev_coords_list:
+        return []
+    
+    prev_coords = np.asarray(prev_coords_list, dtype=np.float64)
+    
+    # 批量查询最近邻
+    distances, indices = tree.query(prev_coords, k=1, distance_upper_bound=pixel_threshold)
+    
+    # 过滤有效匹配：距离有限且未超出边界
+    valid_mask = distances < pixel_threshold  # 比 isfinite 更快
+    if not np.any(valid_mask):
+        return []
+    
+    valid_indices = np.flatnonzero(valid_mask)
+    valid_distances = distances[valid_indices]
+    valid_curr_indices = indices[valid_indices]
+    
+    # 按距离排序索引
+    sorted_order = np.argsort(valid_distances)
+    
+    # 去重并构建结果
+    correspondences = []
+    used_curr_ids = set()
+    
+    for order_idx in sorted_order:
+        prev_idx = valid_indices[order_idx]
+        curr_idx = valid_curr_indices[order_idx]
+        
+        curr_pt3d_id = curr_pt3d_ids[curr_idx]
+        if curr_pt3d_id in used_curr_ids:
+            continue
+        
+        correspondences.append((prev_pt3d_ids[prev_idx], curr_pt3d_id, valid_distances[order_idx]))
+        used_curr_ids.add(curr_pt3d_id)
+    
+    return correspondences
 
 
 def find_single_images_pair_matches(
@@ -22,6 +118,8 @@ def find_single_images_pair_matches(
     """
     在给定的 prev_image 与 curr_image 之间建立 3D 点对应关系（单对影像）。
     
+    优化版本：使用平方距离和预生成邻域偏移。
+    
     Args:
         prev_image: 前一个重建的影像对象
         curr_image: 当前重建的影像对象  
@@ -31,45 +129,55 @@ def find_single_images_pair_matches(
     Returns:
         对应关系列表 [(prev_point3D_id, curr_point3D_id, dist)]
     """
-    correspondences = []
+    search_radius_sq = pixel_threshold * pixel_threshold
+    window = int(pixel_threshold) + 1
+    used_curr_ids = set()
 
-    search_radius = float(pixel_threshold)
-    window = int(np.ceil(search_radius))
-    used_curr_ids = set()  # 避免 curr 侧重复匹配
+    # 预生成邻域偏移列表
+    neighbor_offsets = [(dx, dy) for dx in range(-window, window + 1) 
+                                 for dy in range(-window, window + 1)]
 
-    for point2D in prev_image.points2D:
-        prev_pt3d_id = int(point2D.point3D_id)
-        if prev_pt3d_id == -1:
-            continue
+    # 批量提取 prev_image 的有效 2D 点
+    prev_coords_list, prev_pt3d_ids = _extract_valid_points2d(prev_image)
+    
+    if not prev_coords_list:
+        return []
 
-        prev_xy = np.asarray(point2D.xy, dtype=np.float64)
-        cx, cy = int(round(prev_xy[0])), int(round(prev_xy[1]))
-
+    # 收集所有匹配候选，然后排序去重
+    all_matches = []
+    
+    for i, (px, py) in enumerate(prev_coords_list):
+        prev_pt3d_id = prev_pt3d_ids[i]
+        cx, cy = int(round(px)), int(round(py))
+        
         best_curr_id = None
-        best_dist = search_radius
+        best_dist_sq = search_radius_sq
 
-        # 在 curr 图像索引中按窗口搜索邻域
-        for dx in range(-window, window + 1):
-            for dy in range(-window, window + 1):
-                search_key = (cx + dx, cy + dy)
-                if search_key not in curr_spatial_index:
+        # 搜索邻域
+        for dx, dy in neighbor_offsets:
+            candidates = curr_spatial_index.get((cx + dx, cy + dy))
+            if candidates is None:
+                continue
+
+            for curr_pt3d_id, curr_xy in candidates:
+                if curr_pt3d_id in used_curr_ids:
                     continue
 
-                for curr_pt3d_id, curr_xy in curr_spatial_index[search_key]:
-                    curr_pt3d_id = int(curr_pt3d_id)
-                    if curr_pt3d_id in used_curr_ids:
-                        continue
-
-                    dist = float(np.linalg.norm(prev_xy - np.asarray(curr_xy, dtype=np.float64)))
-                    if dist < best_dist and dist < search_radius:
-                        best_dist = dist
-                        best_curr_id = curr_pt3d_id
+                # 使用平方距离避免 sqrt
+                diff_x = px - curr_xy[0]
+                diff_y = py - curr_xy[1]
+                dist_sq = diff_x * diff_x + diff_y * diff_y
+                
+                if dist_sq < best_dist_sq:
+                    best_dist_sq = dist_sq
+                    best_curr_id = curr_pt3d_id
 
         if best_curr_id is not None:
-            correspondences.append((prev_pt3d_id, best_curr_id, best_dist))
+            all_matches.append((best_dist_sq, prev_pt3d_id, best_curr_id))
             used_curr_ids.add(best_curr_id)
 
-    return correspondences
+    # 转换为最终格式（只在最后计算 sqrt）
+    return [(prev_id, curr_id, np.sqrt(dist_sq)) for dist_sq, prev_id, curr_id in all_matches]
 
 
 def umeyama_alignment(src: np.ndarray, dst: np.ndarray, with_scale: bool = True) -> Tuple[float, np.ndarray, np.ndarray]:
@@ -146,10 +254,16 @@ def estimate_sim3_with_ransac(
     tgt_points: np.ndarray,
     max_iterations: int = 1000,
     inlier_threshold: float = 0.5,  # 米
-    min_inliers: int = 10
+    min_inliers: int = 10,
+    early_stop_ratio: float = 0.8,  # 早停阈值：内点比例达到此值时停止
 ) -> Tuple[Optional[pycolmap.Sim3d], np.ndarray]:
     """
-    使用 RANSAC 鲁棒估计 Sim3 变换。
+    使用 RANSAC 鲁棒估计 Sim3 变换（优化版本）。
+    
+    优化：
+    - 向量化残差计算
+    - 早停策略
+    - 一次性预生成所有随机采样索引
     
     Args:
         src_points: 源点云 (N, 3)
@@ -157,6 +271,7 @@ def estimate_sim3_with_ransac(
         max_iterations: RANSAC 最大迭代次数
         inlier_threshold: 内点阈值（米）
         min_inliers: 最小内点数
+        early_stop_ratio: 早停内点比例
         
     Returns:
         (sim3_transform, inlier_mask)
@@ -165,19 +280,34 @@ def estimate_sim3_with_ransac(
     if n_points < 3:
         return None, np.zeros(n_points, dtype=bool)
     
+    best_inlier_count = 0
     best_inliers = np.zeros(n_points, dtype=bool)
     best_sim3 = None
     
-    for _ in range(max_iterations):
-        # 随机采样3个点
-        sample_idx = np.random.choice(n_points, 3, replace=False)
+    # 早停阈值
+    early_stop_count = int(n_points * early_stop_ratio)
+    
+    # 预计算平方阈值
+    inlier_threshold_sq = inlier_threshold * inlier_threshold
+    
+    # 一次性预生成所有随机采样索引（更高效）
+    # 使用 random generator 的 integers 方法批量生成
+    rng = np.random.default_rng()
+    # 生成 (max_iterations, 3) 的随机索引
+    all_indices = np.empty((max_iterations, 3), dtype=np.int64)
+    for i in range(max_iterations):
+        all_indices[i] = rng.choice(n_points, 3, replace=False)
+    
+    for iteration in range(max_iterations):
+        sample_idx = all_indices[iteration]
         src_sample = src_points[sample_idx]
         tgt_sample = tgt_points[sample_idx]
         
-        # 检查是否共线
+        # 检查是否共线（使用向量化叉积）
         v1 = src_sample[1] - src_sample[0]
         v2 = src_sample[2] - src_sample[0]
-        if np.linalg.norm(np.cross(v1, v2)) < 1e-6:
+        cross = np.cross(v1, v2)
+        if cross @ cross < 1e-12:  # 使用点积代替 norm
             continue
         
         # 估计 Sim3
@@ -186,17 +316,20 @@ def estimate_sim3_with_ransac(
         except:
             continue
         
-        # 计算所有点的残差
+        # 向量化计算残差（使用平方距离）
         transformed = scale * (src_points @ R.T) + t
-        residuals = np.linalg.norm(transformed - tgt_points, axis=1)
-        inliers = residuals < inlier_threshold
+        diff = transformed - tgt_points
+        residuals_sq = np.einsum('ij,ij->i', diff, diff)
+        inliers = residuals_sq < inlier_threshold_sq
+        inlier_count = np.count_nonzero(inliers)  # 比 .sum() 快
         
         # 更新最佳结果
-        if inliers.sum() > best_inliers.sum():
+        if inlier_count > best_inlier_count:
+            best_inlier_count = inlier_count
             best_inliers = inliers
             
             # 使用所有内点重新估计
-            if inliers.sum() >= min_inliers:
+            if inlier_count >= min_inliers:
                 scale, R, t = umeyama_alignment(
                     src_points[inliers], 
                     tgt_points[inliers], 
@@ -204,6 +337,10 @@ def estimate_sim3_with_ransac(
                 )
                 rotation = pycolmap.Rotation3d(R)
                 best_sim3 = pycolmap.Sim3d(scale, rotation, t)
+                
+                # 早停检查
+                if inlier_count >= early_stop_count:
+                    break
     
     return best_sim3, best_inliers
 
@@ -272,26 +409,46 @@ def rescale_reconstruction_to_original_size(
             point_correspondences = []
             pixel_threshold = 3.0
             
+            # 预缓存字典引用
+            tgt_images = tgt_reconstruction.images
+            src_images = src_reconstruction.images
+            
             for index in sel_image_idx:
-                tgt_image_obj = tgt_reconstruction.images[index]
-                src_image_obj = src_reconstruction.images[index]
+                tgt_image_obj = tgt_images[index]
+                src_image_obj = src_images[index]
 
-                # 使用 defaultdict 简化空间索引构建
-                src_spatial_index = defaultdict(list)
+                # 使用辅助函数提取有效点
+                src_coords, src_pt3d_ids = _extract_valid_points2d(src_image_obj)
                 
-                for point2D in src_image_obj.points2D:
-                    if point2D.point3D_id != -1:
-                        grid_key = (int(round(point2D.xy[0])), int(round(point2D.xy[1])))
-                        src_spatial_index[grid_key].append(
-                            (int(point2D.point3D_id), np.asarray(point2D.xy, dtype=np.float64))
-                        )
+                if not src_coords:
+                    continue
+                
+                if HAS_KDTREE:
+                    # 使用 KD-Tree 进行快速匹配
+                    src_coords_arr = np.asarray(src_coords, dtype=np.float64)
+                    correspondences = find_single_images_pair_matches_kdtree(
+                        tgt_image_obj, 
+                        src_image_obj, 
+                        src_coords_arr,
+                        src_pt3d_ids,
+                        pixel_threshold, 
+                    )
+                else:
+                    # 回退到网格搜索方法：构建空间索引
+                    src_spatial_index = {}
+                    for i, (x, y) in enumerate(src_coords):
+                        grid_key = (int(round(x)), int(round(y)))
+                        if grid_key in src_spatial_index:
+                            src_spatial_index[grid_key].append((src_pt3d_ids[i], (x, y)))
+                        else:
+                            src_spatial_index[grid_key] = [(src_pt3d_ids[i], (x, y))]
 
-                correspondences = find_single_images_pair_matches(
-                    tgt_image_obj, 
-                    src_image_obj, 
-                    src_spatial_index, 
-                    pixel_threshold, 
-                )
+                    correspondences = find_single_images_pair_matches(
+                        tgt_image_obj, 
+                        src_image_obj, 
+                        src_spatial_index, 
+                        pixel_threshold, 
+                    )
                 point_correspondences.extend(correspondences)
 
             if len(point_correspondences) == 0:
@@ -309,9 +466,14 @@ def rescale_reconstruction_to_original_size(
                 ]
                 
                 if len(valid_pairs) >= 3:
-                    # 批量提取坐标
-                    tgt_pts3d = np.array([tgt_points3D[pid].xyz for pid, _ in valid_pairs], dtype=np.float64)
-                    src_pts3d = np.array([src_points3D[pid].xyz for _, pid in valid_pairs], dtype=np.float64)
+                    # 批量提取坐标（使用预分配数组更快）
+                    n_pairs = len(valid_pairs)
+                    tgt_pts3d = np.empty((n_pairs, 3), dtype=np.float64)
+                    src_pts3d = np.empty((n_pairs, 3), dtype=np.float64)
+                    
+                    for i, (tgt_pid, src_pid) in enumerate(valid_pairs):
+                        tgt_pts3d[i] = tgt_points3D[tgt_pid].xyz
+                        src_pts3d[i] = src_points3D[src_pid].xyz
 
                     # 估计 Sim3（src → tgt）
                     try:
@@ -342,42 +504,30 @@ def rescale_reconstruction_to_original_size(
     if use_method2 and not alignment_success:
         if verbose:
             print(f"  Using GPS-based alignment...")
-    
-        # 使用列表推导式提取影像名称
-        tgt_image_names = [image.name for image in reconstruction.images.values()]
         
-        # 向量化计算相机位置
         num_images = end_idx - start_idx
-        indices = range(start_idx, end_idx)
         
-        # 预提取所有外参数据
-        R_cameras = []
-        tvecs = []
-        for idx in indices:
+        if num_images == 0:
+            print("  Warning: No matching images found for alignment")
+            return reconstruction
+
+        # 优化：预分配数组并一次性填充（避免列表追加和多次转换）
+        R_cameras = np.empty((num_images, 3, 3), dtype=np.float64)
+        tvecs = np.empty((num_images, 3, 1), dtype=np.float64)
+        
+        for i, idx in enumerate(range(start_idx, end_idx)):
             extrinsic_info = ori_extrinsics[idx]
-            R_cameras.append(extrinsic_info['R_camera'])
-            tvecs.append(extrinsic_info['tvec'])
-        
-        # 转为 numpy 数组进行向量化计算
-        R_cameras = np.array(R_cameras, dtype=np.float64)  # (N, 3, 3)
-        tvecs = np.array(tvecs, dtype=np.float64)  # (N, 3) or (N, 3, 1)
-        
-        # 确保 tvecs 形状正确
-        if tvecs.ndim == 2:
-            tvecs = tvecs[..., np.newaxis]  # (N, 3, 1)
+            R_cameras[i] = extrinsic_info['R_camera']
+            t = extrinsic_info['tvec']
+            # 直接处理 tvec 形状
+            tvecs[i] = t.reshape(3, 1) if t.ndim == 1 else t
         
         # 向量化计算：camera_center = -R^T @ t
-        R_cameras_T = np.transpose(R_cameras, (0, 2, 1))  # (N, 3, 3)
-        camera_centers = -np.matmul(R_cameras_T, tvecs).squeeze(-1)  # (N, 3)
-        
-        tgt_locations = camera_centers
+        # 使用 einsum 比 transpose + matmul 更快
+        camera_centers = -np.einsum('nij,njk->nik', R_cameras.transpose(0, 2, 1), tvecs).squeeze(-1)
         
         # 生成有效名称列表
         valid_names = [f"image_{fidx + 1}" for fidx in range(num_images)]
-        
-        if len(valid_names) == 0:
-            print("  Warning: No matching images found for alignment")
-            return reconstruction
 
         # RANSAC 对齐
         ransac_options = pycolmap.RANSACOptions()
@@ -388,7 +538,7 @@ def rescale_reconstruction_to_original_size(
             sim3d = pycolmap.align_reconstruction_to_locations(
                 src=reconstruction,
                 tgt_image_names=valid_names,
-                tgt_locations=tgt_locations,
+                tgt_locations=camera_centers,
                 min_common_points=3,
                 ransac_options=ransac_options
             )
@@ -398,7 +548,7 @@ def rescale_reconstruction_to_original_size(
                 if verbose:
                     print(f"  ✓ Reconstruction aligned to known poses")
                     print(f"    Scale: {sim3d.scale}")
-                    print(f"    Number of aligned images: {len(valid_names)}")
+                    print(f"    Number of aligned images: {num_images}")
             else:
                 print("  Warning: Failed to align reconstruction")
                 

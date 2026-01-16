@@ -66,6 +66,7 @@ from mapanything.third_party.track_predict import predict_tracks
 from mapanything.third_party.np_to_pycolmap import (
     batch_np_matrix_to_pycolmap,
     batch_np_matrix_to_pycolmap_wo_track,
+    batch_np_matrix_to_pycolmap_with_rename,
 )
 from mapanything.utils.image import rgb
 
@@ -785,9 +786,12 @@ class IncrementalFeatureMatcherSfM:
                     points_rgb_filtered = points_rgb[combined_mask_np]
                     points_rgb_for_tracks = points_rgb_filtered[valid_point_indices]
 
-                    print("Converting to COLMAP format")
-                    # 使用batch_np_matrix_to_pycolmap替代batch_np_matrix_to_pycolmap_wo_track
-                    reconstruction, valid_track_mask = batch_np_matrix_to_pycolmap(
+                    # 准备 image_paths 列表（文件名）
+                    image_paths_list = [self.image_paths[idx].name for idx in range(start_idx, end_idx)]
+
+                    print("Converting to COLMAP format (with rename and rescale)")
+                    # 使用合并优化版本，直接构建带正确图像名和缩放参数的 reconstruction
+                    reconstruction, valid_track_mask = batch_np_matrix_to_pycolmap_with_rename(
                         points3d=points3d_for_tracks,  # (P, 3)
                         extrinsics=extrinsic,          # (N, 3, 4)
                         intrinsics=intrinsic,          # (N, 3, 3)
@@ -800,31 +804,17 @@ class IncrementalFeatureMatcherSfM:
                         camera_type=camera_type,
                         min_inlier_per_frame=self.min_inlier_per_frame,
                         points_rgb=points_rgb_for_tracks,  # (P, 3)
+                        # 新增参数：直接在构建时完成重命名和缩放
+                        image_paths=image_paths_list,
+                        original_coords=original_coords,
+                        shift_point2d_to_original_res=True,
                     )
 
                 if reconstruction is None:
                     print("  Warning: Failed to build pycolmap reconstruction")
-                
-                # 准备 image_paths 列表（文件名）
-                image_paths_list = []
-                for idx in range(start_idx, end_idx):
-                    image_paths_list.append(self.image_paths[idx].name)
-                
-                # 获取预处理后的图像尺寸（img_size）
-                proc_w = self.scale_info[start_idx]['output_size'][0]
-                proc_h = self.scale_info[start_idx]['output_size'][1]
-                
-                # 重命名和缩放相机参数
-                reconstruction = rename_colmap_recons_and_rescale_camera(
-                    reconstruction=reconstruction,
-                    image_paths=image_paths_list,
-                    original_coords=original_coords,
-                    img_size=(proc_w, proc_h),
-                    shift_point2d_to_original_res=True,
-                    shared_camera=shared_camera,
-                )
 
                 # 对齐到原始图像尺寸（基本对齐），对齐到已知的影像pose位置
+                print(" align to sfm original size")
                 if self.global_sparse_reconstruction is not None and len(self.sfm_reconstructions) > 0:
                     reconstruction = rescale_reconstruction_to_original_size(
                         reconstruction=reconstruction,
@@ -852,6 +842,7 @@ class IncrementalFeatureMatcherSfM:
                 temp_path.mkdir(parents=True, exist_ok=True)
                 reconstruction.write_text(str(temp_path))
                 reconstruction.export_PLY(str(temp_path / "points3D.ply"))
+                print(" save reconstruction to sfm original size")
                 
                 # 对齐到前一个重建 reconstruction：支持平移和缩放，不旋转，基于重叠影像的相机位置对齐。
                 # 注意：对于 merge_method == 'confidence'，跳过此步骤，由 merge_by_confidence 一步到位完成更精确的对齐
@@ -2923,7 +2914,7 @@ class IncrementalFeatureMatcherSfM:
             end_idx=end_idx,
             match_radii=[1, 2, 3, 5, 8, 10, 20, 30, 40, 50],
             k_neighbors=10,  # 查询多个近邻以提高匹配率
-            color_by_match_status=False, # 设为 True 可启用调试着色
+            color_by_match_status=True, # 设为 True 可启用调试着色
             blend_mode='weighted',
             blend_weight=0.8,
             verbose=self.verbose,
@@ -3457,7 +3448,7 @@ def run_incremental_feature_matching(
     merge_statistical_filter: bool = False,  # 是否启用统计过滤
     export_georef: bool = True,  # 是否导出地理坐标系的重建结果
     target_crs: str = "auto_utm",  # 目标坐标系: "auto_utm", "EPSG:3857", "EPSG:4326", 等
-    merge_method: str = 'full',  # 'full' | 'confidence' | 'confidence_blend' 合并方式
+    merge_method: str = 'confidence',  # 'full' | 'confidence' | 'confidence_blend' 合并方式
     enable_visualization: bool = True,
     visualization_mode: str = 'merged',  # 'aligned' | 'merged'
     verbose: bool = False,

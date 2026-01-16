@@ -610,3 +610,293 @@ def _build_pycolmap_intri(fidx, intrinsics, camera_type, extra_params=None):
         raise ValueError(f"Camera type {camera_type} is not supported yet")
 
     return pycolmap_intri
+
+
+def batch_np_matrix_to_pycolmap_with_rename(
+    points3d,
+    extrinsics,
+    intrinsics,
+    tracks,
+    image_size,
+    masks=None,
+    max_reproj_error=None,
+    max_points3D_val=3000,
+    shared_camera=False,
+    camera_type="SIMPLE_PINHOLE",
+    extra_params=None,
+    min_inlier_per_frame=64,
+    points_rgb=None,
+    # 新增参数：用于重命名和缩放
+    image_paths=None,
+    original_coords=None,
+    shift_point2d_to_original_res=True,
+):
+    """
+    Convert Batched NumPy Arrays to PyCOLMAP with optional rename and rescale.
+    
+    合并了 batch_np_matrix_to_pycolmap 和 rename_colmap_recons_and_rescale_camera 的功能，
+    在构建 reconstruction 时直接使用正确的图像名称、相机参数和 2D 坐标，避免二次遍历。
+
+    Args:
+        points3d: (P, 3) 3D点坐标
+        extrinsics: (N, 3, 4) 外参矩阵
+        intrinsics: (N, 3, 3) 内参矩阵
+        tracks: (N, P, 2) 2D特征点轨迹（处理分辨率下的坐标）
+        image_size: (2,) 处理时的图像尺寸 [width, height]
+        masks: (N, P) 可见性掩码
+        max_reproj_error: 最大重投影误差阈值
+        max_points3D_val: 3D点坐标最大值阈值
+        shared_camera: 是否共享相机
+        camera_type: 相机类型
+        extra_params: 额外相机参数
+        min_inlier_per_frame: 每帧最小内点数
+        points_rgb: (P, 3) 点云RGB颜色
+        image_paths: 图像路径列表（可选，不提供则使用 image_{id}）
+        original_coords: (N, 4+) 原始坐标数组 [x1, y1, ..., W_orig, H_orig]（可选）
+        shift_point2d_to_original_res: 是否将 2D 点坐标变换到原始分辨率
+
+    Returns:
+        reconstruction: pycolmap.Reconstruction 对象
+        valid_mask: 有效3D点掩码
+    """
+    N, P, _ = tracks.shape
+    assert len(extrinsics) == N
+    assert len(intrinsics) == N
+    assert len(points3d) == P
+    assert image_size.shape[0] == 2
+
+    # ========== 预计算缩放参数（如果需要）==========
+    do_rescale = original_coords is not None
+    proc_w = float(image_size[0])
+    proc_h = float(image_size[1])
+    
+    if do_rescale:
+        original_coords_np = np.asarray(original_coords)
+        real_sizes = original_coords_np[:, -2:].astype(np.float64)  # (N, 2) [W_orig, H_orig]
+        inv_proc_w = 1.0 / max(1e-8, proc_w)
+        inv_proc_h = 1.0 / max(1e-8, proc_h)
+        scale_factors = real_sizes * np.array([inv_proc_w, inv_proc_h])  # (N, 2) [sx, sy]
+        
+        if shift_point2d_to_original_res:
+            top_lefts = original_coords_np[:, :2].astype(np.float32)  # (N, 2) [x1, y1]
+            scale_factors_f32 = scale_factors.astype(np.float32)  # (N, 2)
+
+    reproj_mask = None
+
+    # 计算重投影误差（向量化优化）
+    if max_reproj_error is not None:
+        projected_points_2d, projected_points_cam = project_3D_points_np(
+            points3d, extrinsics, intrinsics
+        )
+        projected_diff = np.linalg.norm(projected_points_2d - tracks, axis=-1)
+        projected_diff = np.where(projected_points_cam[:, -1:, :].transpose(0, 2, 1)[..., 0] <= 0, 1e6, projected_diff)
+        reproj_mask = projected_diff < max_reproj_error
+
+    if masks is not None and reproj_mask is not None:
+        masks = masks & reproj_mask
+    elif masks is None:
+        masks = reproj_mask
+
+    assert masks is not None
+
+    # 检查每帧是否有足够的有效点
+    if masks.sum(1).min() < min_inlier_per_frame:
+        print("Not enough inliers per frame, skip BA.")
+        return None, None
+
+    # Reconstruction object
+    reconstruction = pycolmap.Reconstruction()
+
+    # 只添加在至少2张图像中可见的3D点（向量化）
+    inlier_num = masks.sum(0)
+    valid_mask = inlier_num >= 2
+    valid_idx = np.flatnonzero(valid_mask)
+    num_points3D = len(valid_idx)
+
+    if num_points3D == 0:
+        print("No valid 3D points found, skip BA.")
+        return None, None
+
+    # 预计算3D点坐标有效性
+    valid_points3d = points3d[valid_idx]  # (num_points3D, 3)
+    coords_valid_mask = np.abs(valid_points3d).max(axis=1) < max_points3D_val
+
+    # 批量添加3D点
+    if points_rgb is not None:
+        rgb_array = points_rgb[valid_idx]
+    else:
+        rgb_array = np.zeros((num_points3D, 3), dtype=np.uint8)
+
+    add_point3D = reconstruction.add_point3D
+    Track = pycolmap.Track
+    for i in range(num_points3D):
+        add_point3D(valid_points3d[i], Track(), rgb_array[i])
+
+    # 预计算每帧的有效观测
+    masks_valid = masks[:, valid_idx]  # (N, num_points3D)
+    tracks_valid = tracks[:, valid_idx, :]  # (N, num_points3D, 2)
+    combined_valid = masks_valid & coords_valid_mask
+
+    frame_valid_indices = [np.flatnonzero(combined_valid[fidx]) for fidx in range(N)]
+
+    # 缓存字典和track引用
+    points3D_dict = reconstruction.points3D
+    track_refs = [points3D_dict[i + 1].track for i in range(num_points3D)]
+
+    # 缓存 pycolmap 类引用
+    Camera = pycolmap.Camera
+    Rigid3d = pycolmap.Rigid3d
+    Rotation3d = pycolmap.Rotation3d
+    Image = pycolmap.Image
+    Point2D = pycolmap.Point2D
+    ListPoint2D = pycolmap.ListPoint2D
+
+    camera = None
+    image_id_base = 1
+    processed_camera_ids = set()
+
+    # 遍历每张图像
+    for fidx in range(N):
+        # ========== 计算当前帧的缩放参数 ==========
+        if do_rescale:
+            sx, sy = scale_factors[fidx]
+            real_w, real_h = real_sizes[fidx]
+            cam_width = int(real_w)
+            cam_height = int(real_h)
+        else:
+            sx, sy = 1.0, 1.0
+            cam_width = int(proc_w)
+            cam_height = int(proc_h)
+
+        # ========== 设置相机（直接使用缩放后的参数）==========
+        camera_id = fidx + 1 if not shared_camera else 1
+        
+        if camera is None or (not shared_camera):
+            pycolmap_intri = _build_pycolmap_intri(
+                fidx, intrinsics, camera_type, extra_params
+            )
+            
+            # 直接缩放相机内参
+            if do_rescale:
+                pycolmap_intri = _scale_pycolmap_intri(
+                    pycolmap_intri, sx, sy, camera_type
+                )
+            
+            camera = Camera(
+                model=camera_type,
+                width=cam_width,
+                height=cam_height,
+                params=pycolmap_intri,
+                camera_id=camera_id,
+            )
+            reconstruction.add_camera(camera)
+            processed_camera_ids.add(camera_id)
+
+        # 设置图像位姿
+        extr = extrinsics[fidx]
+        cam_from_world = Rigid3d(Rotation3d(extr[:3, :3]), extr[:3, 3])
+
+        image_id = fidx + image_id_base
+        # 直接使用正确的图像名称
+        if image_paths is not None:
+            img_name = image_paths[fidx]
+        else:
+            img_name = f"image_{image_id}"
+            
+        image = Image(
+            id=image_id,
+            name=img_name,
+            camera_id=camera.camera_id,
+            cam_from_world=cam_from_world,
+        )
+
+        # 获取有效点索引
+        valid_point_indices = frame_valid_indices[fidx]
+        num_valid = len(valid_point_indices)
+
+        if num_valid == 0:
+            image.points2D = ListPoint2D([])
+            reconstruction.add_image(image)
+            continue
+
+        # 批量获取2D坐标
+        valid_2d_coords = tracks_valid[fidx, valid_point_indices].copy()  # (num_valid, 2)
+
+        # ========== 直接变换2D坐标到原始分辨率 ==========
+        if do_rescale and shift_point2d_to_original_res:
+            top_left = top_lefts[fidx]
+            scale_xy = scale_factors_f32[fidx]
+            valid_2d_coords = (valid_2d_coords.astype(np.float32) - top_left) * scale_xy
+
+        # 计算 point3D_id
+        point3D_ids = valid_point_indices + 1
+
+        # 创建 Point2D 对象
+        points2D_list = [Point2D(valid_2d_coords[i], point3D_ids[i]) for i in range(num_valid)]
+
+        # 添加 track elements
+        for local_idx, point_local_idx in enumerate(valid_point_indices):
+            track_refs[point_local_idx].add_element(image_id, local_idx)
+
+        try:
+            image.points2D = ListPoint2D(points2D_list)
+        except:  # noqa
+            print(f"frame {fidx + 1} is out of BA")
+
+        reconstruction.add_image(image)
+
+    # 清理无效3D点
+    points_to_remove = [i + 1 for i, track in enumerate(track_refs) if len(track.elements) == 0]
+
+    if points_to_remove:
+        for point3D_id in points_to_remove:
+            del points3D_dict[point3D_id]
+        print(f"Removed {len(points_to_remove)} points without 2D associations")
+
+    return reconstruction, valid_mask
+
+
+def _scale_pycolmap_intri(pycolmap_intri, sx, sy, camera_type):
+    """
+    缩放相机内参到原始分辨率。
+    
+    Args:
+        pycolmap_intri: numpy array，相机内参
+        sx: x方向缩放因子
+        sy: y方向缩放因子
+        camera_type: 相机类型字符串
+    
+    Returns:
+        缩放后的相机内参
+    """
+    params = pycolmap_intri.copy()
+    num_params = len(params)
+    
+    if camera_type == "PINHOLE" or num_params == 4:
+        # PINHOLE: [fx, fy, cx, cy]
+        params[0] *= sx  # fx
+        params[1] *= sy  # fy
+        params[2] *= sx  # cx
+        params[3] *= sy  # cy
+    elif camera_type == "SIMPLE_PINHOLE" or num_params == 3:
+        # SIMPLE_PINHOLE: [f, cx, cy]
+        # 使用平均缩放因子处理焦距
+        params[0] *= (sx + sy) / 2  # f
+        params[1] *= sx  # cx
+        params[2] *= sy  # cy
+    elif camera_type == "SIMPLE_RADIAL" or num_params == 4:
+        # SIMPLE_RADIAL: [f, cx, cy, k]
+        params[0] *= (sx + sy) / 2  # f
+        params[1] *= sx  # cx
+        params[2] *= sy  # cy
+        # k (radial distortion) 不需要缩放
+    else:
+        # 通用处理
+        if num_params >= 2:
+            params[0] *= sx
+            params[1] *= sy
+        if num_params >= 4:
+            params[-2] *= sx
+            params[-1] *= sy
+    
+    return params
