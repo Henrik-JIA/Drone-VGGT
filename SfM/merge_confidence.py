@@ -43,6 +43,72 @@ from merge_confidence_blend import (
 )
 
 
+# 缓存 pycolmap 类引用（模块级别，避免重复查找）
+_Point2D = pycolmap.Point2D
+_Camera = pycolmap.Camera
+_Image = pycolmap.Image
+
+
+def _add_cameras_and_images_batch(
+    merged: pycolmap.Reconstruction,
+    recon: pycolmap.Reconstruction,
+    img_ids_to_add: List[int],
+    camera_id_map: Dict[int, int],
+    image_name_to_new_id: Dict[str, int],
+    image_id_map: Dict[int, int],
+    merged_img_pt2d_len: Dict[int, int],
+    new_cam_id: int,
+    new_img_id: int
+) -> Tuple[int, int]:
+    """
+    批量添加多个影像及其相机到合并的 Reconstruction 中（优化版）。
+    
+    Returns:
+        更新后的 (new_cam_id, new_img_id)
+    """
+    # 缓存本地引用
+    recon_cameras = recon.cameras
+    recon_images = recon.images
+    add_camera = merged.add_camera
+    add_image = merged.add_image
+    
+    for img_id in img_ids_to_add:
+        img = recon_images[img_id]
+        old_cam_id = img.camera_id
+        
+        # 添加相机（如果尚未添加）
+        if old_cam_id not in camera_id_map:
+            cam = recon_cameras[old_cam_id]
+            add_camera(_Camera(
+                camera_id=new_cam_id,
+                model=cam.model,
+                width=cam.width,
+                height=cam.height,
+                params=cam.params
+            ))
+            camera_id_map[old_cam_id] = new_cam_id
+            new_cam_id += 1
+        
+        # 添加影像（直接使用列表推导式，避免函数调用开销）
+        points2D = img.points2D
+        new_points2D = [_Point2D(pt.xy) for pt in points2D]
+        
+        add_image(_Image(
+            image_id=new_img_id,
+            name=img.name,
+            camera_id=camera_id_map[old_cam_id],
+            cam_from_world=img.cam_from_world,
+            points2D=new_points2D
+        ))
+        
+        image_name_to_new_id[img.name] = new_img_id
+        image_id_map[img_id] = new_img_id
+        merged_img_pt2d_len[new_img_id] = len(points2D)
+        new_img_id += 1
+    
+    return new_cam_id, new_img_id
+
+
 def _add_camera_and_image(
     merged: pycolmap.Reconstruction,
     recon: pycolmap.Reconstruction,
@@ -56,47 +122,32 @@ def _add_camera_and_image(
 ) -> Tuple[int, int]:
     """
     添加单个影像及其相机到合并的 Reconstruction 中。
-    
-    Args:
-        merged: 目标合并 Reconstruction
-        recon: 源 Reconstruction
-        img_id: 原始影像 ID
-        img: 影像对象
-        camera_id_map: 相机 ID 映射字典（会被原地修改）
-        image_name_to_new_id: 影像名到新 ID 的映射（会被原地修改）
-        image_id_map: 影像 ID 映射字典（会被原地修改）
-        new_cam_id: 当前可用的新相机 ID
-        new_img_id: 当前可用的新影像 ID
-    
-    Returns:
-        更新后的 (new_cam_id, new_img_id)
+    保留此函数以兼容其他调用。
     """
     old_cam_id = img.camera_id
     
     # 添加相机（如果尚未添加）
     if old_cam_id not in camera_id_map:
         cam = recon.cameras[old_cam_id]
-        new_camera = pycolmap.Camera(
+        merged.add_camera(_Camera(
             camera_id=new_cam_id,
             model=cam.model,
             width=cam.width,
             height=cam.height,
             params=cam.params
-        )
-        merged.add_camera(new_camera)
+        ))
         camera_id_map[old_cam_id] = new_cam_id
         new_cam_id += 1
     
     # 添加影像
-    new_points2D = [pycolmap.Point2D(pt.xy) for pt in img.points2D]
-    new_image = pycolmap.Image(
+    new_points2D = [_Point2D(pt.xy) for pt in img.points2D]
+    merged.add_image(_Image(
         image_id=new_img_id,
         name=img.name,
         camera_id=camera_id_map[old_cam_id],
         cam_from_world=img.cam_from_world,
         points2D=new_points2D
-    )
-    merged.add_image(new_image)
+    ))
     
     image_name_to_new_id[img.name] = new_img_id
     image_id_map[img_id] = new_img_id
@@ -617,40 +668,52 @@ def merge_by_simple_confidence(
         print(f"\n  Overlap camera choice: {'R1' if use_r1_for_overlap else 'R2'} "
               f"(R1 kept: {r1_kept}, R2 kept: {r2_kept})")
     
-    # 3.1 & 3.2 添加相机和影像（同时构建 merged_img_pt2d_len）
+    # 3.1 & 3.2 添加相机和影像（优化版：预筛选 + 批量处理）
     camera_id_map_r1, camera_id_map_r2 = {}, {}
     image_id_map_r1, image_id_map_r2 = {}, {}
     image_name_to_new_id = {}
-    merged_img_pt2d_len = {}  # 在添加影像时同步构建
+    merged_img_pt2d_len = {}
     
     new_cam_id, new_img_id = 1, 1
     
-    # 添加 recon1 的影像
-    for img_id, img in recon1.images.items():
-        if img.name in overlap_img_names and not use_r1_for_overlap:
-            continue
-        new_cam_id, new_img_id = _add_camera_and_image(
-            merged, recon1, img_id, img,
-            camera_id_map_r1, image_name_to_new_id, image_id_map_r1,
-            new_cam_id, new_img_id
-        )
-        merged_img_pt2d_len[image_id_map_r1[img_id]] = len(img.points2D)
+    # 预筛选 recon1 需要添加的影像 ID（避免循环中重复检查）
+    if use_r1_for_overlap:
+        r1_img_ids_to_add = list(recon1.images.keys())
+    else:
+        r1_img_ids_to_add = [
+            img_id for img_id, img in recon1.images.items()
+            if img.name not in overlap_img_names
+        ]
     
-    # 添加 recon2 的影像（合并重叠影像映射逻辑）
+    # 批量添加 recon1 的影像
+    new_cam_id, new_img_id = _add_cameras_and_images_batch(
+        merged, recon1, r1_img_ids_to_add,
+        camera_id_map_r1, image_name_to_new_id, image_id_map_r1,
+        merged_img_pt2d_len, new_cam_id, new_img_id
+    )
+    
+    # 处理 recon2 的影像：分离重叠和非重叠
+    r2_overlap_ids = []  # 重叠影像（需要映射）
+    r2_new_ids = []      # 非重叠影像（需要添加）
+    
     for img_id, img in recon2_aligned.images.items():
-        img_name = img.name
-        if img_name in image_name_to_new_id:
-            # 重叠影像：直接建立映射
-            image_id_map_r2[img_id] = image_name_to_new_id[img_name]
-            _, _, r1_cam_id, _ = overlap_name_to_ids[img_name]
-            camera_id_map_r2[img.camera_id] = camera_id_map_r1[r1_cam_id]
+        if img.name in image_name_to_new_id:
+            r2_overlap_ids.append((img_id, img))
         else:
-            new_cam_id, new_img_id = _add_camera_and_image(
-                merged, recon2_aligned, img_id, img,
-                camera_id_map_r2, image_name_to_new_id, image_id_map_r2,
-                new_cam_id, new_img_id
-            )
-            merged_img_pt2d_len[image_id_map_r2[img_id]] = len(img.points2D)
+            r2_new_ids.append(img_id)
+    
+    # 处理重叠影像映射
+    for img_id, img in r2_overlap_ids:
+        image_id_map_r2[img_id] = image_name_to_new_id[img.name]
+        _, _, r1_cam_id, _ = overlap_name_to_ids[img.name]
+        camera_id_map_r2[img.camera_id] = camera_id_map_r1[r1_cam_id]
+    
+    # 批量添加 recon2 的非重叠影像
+    new_cam_id, new_img_id = _add_cameras_and_images_batch(
+        merged, recon2_aligned, r2_new_ids,
+        camera_id_map_r2, image_name_to_new_id, image_id_map_r2,
+        merged_img_pt2d_len, new_cam_id, new_img_id
+    )
     
     # 补充 recon1 被跳过的重叠影像映射
     if not use_r1_for_overlap:
@@ -861,6 +924,7 @@ def merge_two_reconstructions(
     color_by_match_status: Optional[bool] = None,  # 兼容旧参数名
     blend_mode: str = 'select',
     blend_weight: float = 0.7,
+    rotation_mode: str = 'yaw_roll',  # 旋转模式
     verbose: bool = True,
     **kwargs,  # 忽略其他高级参数（为了接口兼容）
 ) -> Tuple[Optional[pycolmap.Reconstruction], Dict]:
@@ -908,6 +972,12 @@ def merge_two_reconstructions(
         blend_weight: 高置信度点的权重（仅 weighted 模式，默认 0.7）
             - 高置信度点权重 = blend_weight（如 70%）
             - 低置信度点权重 = 1 - blend_weight（如 30%）
+        rotation_mode: 旋转模式（默认 'yaw_roll'），控制对齐时使用哪些旋转分量
+            - 'full': 使用完整旋转（yaw + pitch + roll）
+            - 'yaw_roll': 只使用 yaw + roll，不做俯仰（适合无人机俯拍）
+            - 'yaw_pitch': 只使用 yaw + pitch，不做横滚
+            - 'yaw': 只使用 yaw（水平旋转）
+            - 'none': 不旋转（只缩放和平移）
         verbose: 是否打印详细信息
         **kwargs: 忽略其他高级参数（为了与 confidence_blend 接口兼容）
         
@@ -995,23 +1065,67 @@ def merge_two_reconstructions(
     if verbose:
         print(f"    Inliers: {info['num_inliers']}, Scale: {scale:.6f}")
     
-    # 5. 复制 recon2 并应用变换（只平移和缩放，不旋转）
+    # 5. 复制 recon2 并应用变换
     if verbose:
-        print(f"  Step 5: Applying scale + translation to recon2 (no rotation)...")
+        print(f"  Step 5: Applying rotation ({rotation_mode}) + scale + translation to recon2...")
     recon2_aligned = copy.deepcopy(recon2)
     
-    # 重新计算平移：使用单位旋转，基于质心对齐
-    # 平移 = 目标质心 - 缩放后的源质心
+    # 从完整旋转矩阵中提取欧拉角（ZYX 顺序）
+    # R = Rz(yaw) * Ry(pitch) * Rx(roll)
+    yaw = np.arctan2(R[1, 0], R[0, 0])
+    pitch = np.arcsin(-np.clip(R[2, 0], -1.0, 1.0))  # clip 防止数值误差
+    roll = np.arctan2(R[2, 1], R[2, 2])
+    
+    # 根据 rotation_mode 构建旋转矩阵
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cr, sr = np.cos(roll), np.sin(roll)
+    
+    if rotation_mode == 'full':
+        # 使用完整旋转
+        R_final = R.copy()
+        rot_info = f"Yaw: {np.degrees(yaw):.2f}°, Pitch: {np.degrees(pitch):.2f}°, Roll: {np.degrees(roll):.2f}°"
+    elif rotation_mode == 'yaw_roll':
+        # Rz(yaw) @ Rx(roll)，pitch = 0
+        R_final = np.array([
+            [cy,  -sy * cr,  sy * sr],
+            [sy,   cy * cr, -cy * sr],
+            [0,    sr,       cr     ]
+        ], dtype=np.float64)
+        rot_info = f"Yaw: {np.degrees(yaw):.2f}°, Roll: {np.degrees(roll):.2f}°"
+    elif rotation_mode == 'yaw_pitch':
+        # Rz(yaw) @ Ry(pitch)，roll = 0
+        R_final = np.array([
+            [cy * cp, -sy, cy * sp],
+            [sy * cp,  cy, sy * sp],
+            [-sp,      0,  cp     ]
+        ], dtype=np.float64)
+        rot_info = f"Yaw: {np.degrees(yaw):.2f}°, Pitch: {np.degrees(pitch):.2f}°"
+    elif rotation_mode == 'yaw':
+        # Rz(yaw) only
+        R_final = np.array([
+            [cy, -sy, 0],
+            [sy,  cy, 0],
+            [0,   0,  1]
+        ], dtype=np.float64)
+        rot_info = f"Yaw: {np.degrees(yaw):.2f}°"
+    elif rotation_mode == 'none':
+        # 不旋转
+        R_final = np.eye(3, dtype=np.float64)
+        rot_info = "No rotation"
+    else:
+        raise ValueError(f"Unknown rotation_mode: {rotation_mode}. "
+                        f"Choose from: 'full', 'yaw_roll', 'yaw_pitch', 'yaw', 'none'")
+    
+    # 重新计算平移：基于选定的旋转和质心对齐
     src_centroid = pts2.mean(axis=0)
     tgt_centroid = pts1.mean(axis=0)
-    translation_no_rot = tgt_centroid - scale * src_centroid
+    translation_final = tgt_centroid - scale * (R_final @ src_centroid)
     
-    # 使用单位旋转矩阵（不旋转）
-    R_identity = np.eye(3)
-    apply_sim3_to_reconstruction(recon2_aligned, R_identity, translation_no_rot, scale)
+    apply_sim3_to_reconstruction(recon2_aligned, R_final, translation_final, scale)
     
     if verbose:
-        print(f"    Scale: {scale:.6f}, Translation: {translation_no_rot}")
+        print(f"    {rot_info}, Scale: {scale:.6f}")
     
     # 输出保存变换后的 recon2（可选）
     if output_dir is not None:

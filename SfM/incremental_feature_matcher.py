@@ -2912,11 +2912,12 @@ class IncrementalFeatureMatcherSfM:
             output_dir=output_dir,
             start_idx=start_idx,
             end_idx=end_idx,
-            match_radii=[1, 2, 3, 5, 8, 10, 20, 30, 40, 50],
-            k_neighbors=10,  # 查询多个近邻以提高匹配率
-            color_by_match_status=True, # 设为 True 可启用调试着色
+            match_radii=[1, 2, 3, 5, 8, 10, 20, 30, 40, 50, 60],
+            k_neighbors=15,  # 查询多个近邻以提高匹配率
+            color_by_match_status=False, # 设为 True 可启用调试着色
             blend_mode='weighted',
-            blend_weight=0.8,
+            blend_weight=0.7,
+            rotation_mode='full',
             verbose=self.verbose,
         )
         
