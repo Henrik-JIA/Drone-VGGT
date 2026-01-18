@@ -70,15 +70,16 @@ from mapanything.third_party.np_to_pycolmap import (
 )
 from mapanything.utils.image import rgb
 
-# VGGT model imports (conditional)
-try:
-    from vggt.models.vggt import VGGT
-    from vggt.utils.load_fn import load_and_preprocess_images
-    from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-    VGGT_AVAILABLE = True
-except ImportError:
-    VGGT_AVAILABLE = False
-    print("Warning: VGGT model not available. Install vggt package to use VGGT model.")
+# Model loader imports
+from load_model import (
+    create_model_loader,
+    is_vggt_available,
+    is_fastvggt_available,
+)
+
+# Check model availability
+VGGT_AVAILABLE = is_vggt_available()
+FASTVGGT_AVAILABLE = is_fastvggt_available()
 
 def cam_from_enu_transform(roll, pitch, yaw):
     """
@@ -121,8 +122,8 @@ class IncrementalFeatureMatcherSfM:
         self,
         output_dir: Path,
         reconstruction_type: str = 'dense_feature_points',  # 'dense_feature_points' | 'each_pixel_feature_points'
-        model_type: str = 'mapanything',  # 'mapanything' | 'vggt'
-        model_path: Optional[str] = None,  # 模型权重路径（VGGT需要）
+        model_type: str = 'mapanything',  # 'mapanything' | 'vggt' | 'fastvggt'
+        model_path: Optional[str] = None,  # 模型权重路径（VGGT/FastVGGT需要）
         global_sparse_reconstruction: Optional[pycolmap.Reconstruction] = None,
         min_images_for_scale: int = 2,
         overlap: int = 1,
@@ -137,6 +138,10 @@ class IncrementalFeatureMatcherSfM:
         merge_method: str = 'confidence_blend',  # 'full' | 'confidence' | 'confidence_blend' 合并方式
         enable_visualization: bool = True,
         visualization_mode: str = 'merged',  # 'aligned' | 'merged'，点云可视化模式
+        # FastVGGT 特有参数
+        fastvggt_merging: int = 0,  # FastVGGT token merging 参数
+        fastvggt_merge_ratio: float = 0.9,  # FastVGGT token merge ratio (0.0-1.0)
+        fastvggt_depth_conf_thresh: float = 3.0,  # FastVGGT 深度置信度阈值
         verbose: bool = False,
     ):
         """Initialize incremental feature matcher.
@@ -170,18 +175,25 @@ class IncrementalFeatureMatcherSfM:
             verbose: Enable verbose logging
         """
         # Model type validation
-        if model_type not in ['mapanything', 'vggt']:
-            raise ValueError(f"model_type must be 'mapanything' or 'vggt', got: {model_type}")
+        if model_type not in ['mapanything', 'vggt', 'fastvggt']:
+            raise ValueError(f"model_type must be 'mapanything', 'vggt', or 'fastvggt', got: {model_type}")
         if model_type == 'vggt' and not VGGT_AVAILABLE:
             raise ValueError("VGGT model is not available. Please install the vggt package.")
+        if model_type == 'fastvggt' and not FASTVGGT_AVAILABLE:
+            raise ValueError("FastVGGT model is not available. Please check the fastvggt installation.")
         
         self.model_type = model_type
         self.model_path = model_path
         
-        # Model (lazy loading)
-        self.model = None
+        # FastVGGT 特有参数
+        self.fastvggt_merging = fastvggt_merging
+        self.fastvggt_merge_ratio = fastvggt_merge_ratio
+        self.fastvggt_depth_conf_thresh = fastvggt_depth_conf_thresh
+        
+        # Model loader (lazy loading)
+        self.model_loader = None
         self.device = None
-        self.dtype = None  # For VGGT mixed precision
+        self.dtype = None  # For VGGT/FastVGGT mixed precision
 
         self.output_dir = Path(output_dir)
         
@@ -260,73 +272,40 @@ class IncrementalFeatureMatcherSfM:
     def _load_model(self):
         """Load model (lazy loading).
         
-        Supports both MapAnything and VGGT models.
+        使用 load_model 模块的工厂函数创建模型加载器。
         
         Returns:
-            Loaded model
+            ModelLoader 实例
         """
-        if self.model is None:
+        if self.model_loader is None:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
             if self.verbose:
                 print(f"Using device: {self.device}")
             
-            if self.model_type == 'mapanything':
-                model_name = "facebook/map-anything"
-                if self.verbose:
-                    print(f"Loading MapAnything model: {model_name}...")
-                self.model = MapAnything.from_pretrained(model_name).to(self.device)
-                if self.verbose:
-                    print("✓ MapAnything model loaded")
+            # 使用工厂函数创建模型加载器
+            self.model_loader = create_model_loader(
+                model_type=self.model_type,
+                model_path=self.model_path,
+                device=self.device,
+                verbose=self.verbose,
+                # FastVGGT 特有参数
+                fastvggt_merging=self.fastvggt_merging,
+                fastvggt_merge_ratio=self.fastvggt_merge_ratio,
+                fastvggt_depth_conf_thresh=self.fastvggt_depth_conf_thresh,
+            )
             
-            elif self.model_type == 'vggt':
-                if self.verbose:
-                    print("Loading VGGT model...")
-                
-                # Determine dtype for mixed precision
-                if torch.cuda.is_available():
-                    self.dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-                else:
-                    self.dtype = torch.float32
-                
-                self.model = VGGT()
-                
-                # Load weights if provided
-                if self.model_path:
-                    # 处理相对路径：基于项目根目录解析
-                    model_path = Path(self.model_path)
-                    if not model_path.is_absolute():
-                        model_path = project_root / model_path
-                    
-                    if self.verbose:
-                        print(f"Loading weights from: {model_path}")
-                    state_dict = torch.load(str(model_path), map_location='cpu')
-                    self.model.load_state_dict(state_dict)
-                else:
-                    # Try to load from default location or huggingface
-                    try:
-                        # Try loading from huggingface hub
-                        self.model = VGGT.from_pretrained("facebook/vggt")
-                        if self.verbose:
-                            print("Loaded VGGT model from Hugging Face Hub")
-                    except Exception as e:
-                        if self.verbose:
-                            print(f"Warning: Could not load pretrained weights: {e}")
-                            print("Using randomly initialized VGGT model")
-                
-                self.model.to(self.device)
-                if self.verbose:
-                    print("✓ VGGT model loaded")
+            # 预加载模型
+            self.model_loader.load_model()
+            self.dtype = self.model_loader.dtype
         
-        return self.model
+        return self.model_loader
 
     def _release_model(self):
         """Release model from memory to free GPU resources."""
-        if self.model is not None:
-            del self.model
-            self.model = None
+        if self.model_loader is not None:
+            self.model_loader.release_model()
+            self.model_loader = None
             self.dtype = None
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
             if self.verbose:
                 print("✓ Model released from memory")
 
@@ -714,7 +693,8 @@ class IncrementalFeatureMatcherSfM:
                 
                 # ==================== 图像RGB处理 ====================
                 # 处理图像和 original_coords
-                if self.model_type == 'vggt':
+                if self.model_type in ['vggt', 'fastvggt']:
+                    # VGGT 和 FastVGGT 都使用 vggt_image 输出
                     vggt_images = []
                     original_coords = np.empty((n, 6), dtype=np.float32)
                     
@@ -747,7 +727,7 @@ class IncrementalFeatureMatcherSfM:
                         else:
                             points_rgb = points_rgb_np.astype(np.uint8)
                     else:
-                        raise ValueError("No VGGT images available for color extraction")
+                        raise ValueError("No VGGT/FastVGGT images available for color extraction")
                 else:
                     batch_images = []
                     original_coords = np.empty((n, 6), dtype=np.float32)
@@ -768,8 +748,9 @@ class IncrementalFeatureMatcherSfM:
                         images, size=(height, width),
                         mode="bilinear", align_corners=False,
                     )
-                    model = self._load_model()
-                    points_rgb_float = rgb(points_rgb_images, model.encoder.data_norm_type)
+                    model_loader = self._load_model()
+                    # MapAnything 模型需要访问 encoder.data_norm_type
+                    points_rgb_float = rgb(points_rgb_images, model_loader.model.encoder.data_norm_type)
                     points_rgb = (points_rgb_float * 255).astype(np.uint8)
                 
                 # ==================== 提取RGB颜色并构建COLMAP ====================
@@ -1218,18 +1199,19 @@ class IncrementalFeatureMatcherSfM:
         Returns:
             True if successful, False otherwise
         """
-        # Load model
-        model = self._load_model()
+        # Load model loader
+        model_loader = self._load_model()
 
         # 判断是第几张图像
         num_images = len(self.preprocessed_views)
 
-        if self.model_type == 'mapanything':
-            outputs = self._run_mapanything_inference(model, num_images)
-        elif self.model_type == 'vggt':
-            outputs = self._run_vggt_inference(model, num_images)
-        else:
-            raise ValueError(f"Unknown model type: {self.model_type}")
+        # 使用模型加载器运行推理
+        outputs = model_loader.run_inference(
+            preprocessed_views=self.preprocessed_views,
+            image_paths=self.image_paths,
+            num_images=num_images,
+            min_images_for_scale=self.min_images_for_scale,
+        )
 
         # ==================== 计算 scale_ratio =====================
         scale_ratio = 1.0
@@ -1302,186 +1284,6 @@ class IncrementalFeatureMatcherSfM:
             torch.cuda.empty_cache()
 
         return True
-
-    def _run_mapanything_inference(self, model, num_images: int) -> List[Dict]:
-        """Run MapAnything model inference.
-        
-        Args:
-            model: Loaded MapAnything model
-            num_images: Number of images to process
-            
-        Returns:
-            List of output dictionaries in unified format
-        """
-        if self.verbose:
-            print("Running MapAnything inference...")
-
-        if num_images == 1:
-            # 第一张图像，只推理单张
-            views_to_infer = [self.preprocessed_views[0]]
-            if self.verbose:
-                print("  Inferring first image (no scale calculation)")
-        elif num_images < self.min_images_for_scale:
-            # 图像数量不足 min_images_for_scale，推理从第一张到当前张的所有图像
-            views_to_infer = self.preprocessed_views[:]  # 所有图像
-            if self.verbose:
-                print(f"  Inferring images 1 to {num_images} ({num_images} images, building up to {self.min_images_for_scale})")
-        else:
-            # 图像数量已达到 min_images_for_scale，使用滑动窗口
-            views_to_infer = self.preprocessed_views[-self.min_images_for_scale:]
-            start_idx = num_images - self.min_images_for_scale + 1
-            if self.verbose:
-                print(f"  Inferring images {start_idx} to {num_images} ({self.min_images_for_scale} images, sliding window)")
-
-        outputs = model.infer(
-            views_to_infer,
-            memory_efficient_inference=False,
-            ignore_calibration_inputs=False,
-            ignore_depth_inputs=True,
-            ignore_pose_inputs=False,
-            ignore_depth_scale_inputs=True,
-            ignore_pose_scale_inputs=True,
-            use_amp=True,
-            amp_dtype="bf16",
-            apply_mask=True,
-            mask_edges=True,
-        )
-        
-        return outputs
-
-    def _run_vggt_inference(self, model, num_images: int) -> List[Dict]:
-        """Run VGGT model inference.
-        
-        Args:
-            model: Loaded VGGT model
-            num_images: Number of images to process
-            
-        Returns:
-            List of output dictionaries in unified format (compatible with MapAnything output)
-        """
-        if self.verbose:
-            print("Running VGGT inference...")
-
-        # Determine which images to infer
-        if num_images == 1:
-            image_paths_to_infer = [self.image_paths[0]]
-            view_indices = [0]
-            if self.verbose:
-                print("  Inferring first image (no scale calculation)")
-        elif num_images < self.min_images_for_scale:
-            image_paths_to_infer = self.image_paths[:]
-            view_indices = list(range(num_images))
-            if self.verbose:
-                print(f"  Inferring images 1 to {num_images} ({num_images} images, building up to {self.min_images_for_scale})")
-        else:
-            image_paths_to_infer = self.image_paths[-self.min_images_for_scale:]
-            view_indices = list(range(num_images - self.min_images_for_scale, num_images))
-            start_idx = num_images - self.min_images_for_scale + 1
-            if self.verbose:
-                print(f"  Inferring images {start_idx} to {num_images} ({self.min_images_for_scale} images, sliding window)")
-
-        # Preprocess images for VGGT
-        image_paths_str = [str(p) for p in image_paths_to_infer]
-        images = load_and_preprocess_images(image_paths_str).to(self.device)
-        
-        # Get image size for pose decoding
-        _, _, H, W = images.shape  # [S, 3, H, W]
-        image_size_hw = (H, W)
-
-        # Run inference
-        with torch.no_grad():
-            with torch.cuda.amp.autocast(dtype=self.dtype):
-                predictions = model(images)
-
-        # Convert VGGT output to unified format
-        # VGGT outputs: world_points [B, S, H, W, 3], pose_enc [B, S, 9], etc.
-        outputs = self._convert_vggt_output_to_unified_format(
-            predictions, 
-            image_size_hw, 
-            view_indices,
-            images  # 传递原始图像用于颜色提取
-        )
-        
-        return outputs
-
-    def _convert_vggt_output_to_unified_format(
-        self, 
-        predictions: Dict, 
-        image_size_hw: Tuple[int, int],
-        view_indices: List[int],
-        images: torch.Tensor = None  # VGGT 预处理后的图像 [S, 3, H, W]
-    ) -> List[Dict]:
-        """Convert VGGT predictions to unified output format compatible with MapAnything.
-        
-        Args:
-            predictions: VGGT model predictions
-            image_size_hw: Tuple of (height, width) of preprocessed images
-            view_indices: List of view indices in original image list
-            images: VGGT preprocessed images tensor [S, 3, H, W] for color extraction
-            
-        Returns:
-            List of dictionaries with unified output format:
-                - pts3d: [1, H, W, 3] - 3D points
-                - conf: [1, H, W] - confidence
-                - camera_poses: [1, 4, 4] - camera pose (cam2world)
-                - intrinsics: [1, 3, 3] - camera intrinsics
-                - metric_scaling_factor: scalar - metric scaling factor
-                - vggt_image: [3, H, W] - VGGT preprocessed image for color (VGGT only)
-        """
-        # Extract predictions
-        world_points = predictions['world_points']  # [B, S, H, W, 3]
-        world_points_conf = predictions['world_points_conf']  # [B, S, H, W]
-        pose_enc = predictions['pose_enc']  # [B, S, 9]
-        
-        # Convert pose encoding to extrinsics and intrinsics
-        # extrinsics: [B, S, 3, 4] (cam from world)
-        # intrinsics: [B, S, 3, 3]
-        extrinsics, intrinsics = pose_encoding_to_extri_intri(
-            pose_enc, 
-            image_size_hw=image_size_hw,
-            pose_encoding_type="absT_quaR_FoV",
-            build_intrinsics=True
-        )
-        
-        # Convert extrinsics (cam from world) to camera poses (cam2world / world from cam)
-        # cam2world = inverse of extrinsics
-        B, S = extrinsics.shape[:2]
-        camera_poses = torch.zeros(B, S, 4, 4, device=extrinsics.device, dtype=extrinsics.dtype)
-        
-        for b in range(B):
-            for s in range(S):
-                # extrinsics is [R|t] where camera_coords = R @ world_coords + t
-                # cam2world: world_coords = R.T @ (camera_coords - t) = R.T @ camera_coords - R.T @ t
-                R = extrinsics[b, s, :3, :3]
-                t = extrinsics[b, s, :3, 3]
-                
-                R_inv = R.T
-                t_inv = -R_inv @ t
-                
-                camera_poses[b, s, :3, :3] = R_inv
-                camera_poses[b, s, :3, 3] = t_inv
-                camera_poses[b, s, 3, 3] = 1.0
-        
-        # Build unified output list
-        outputs = []
-        for s in range(S):
-            output = {
-                'pts3d': world_points[:, s, :, :, :],  # [B, H, W, 3] -> keep B dim for consistency
-                'conf': world_points_conf[:, s, :, :],  # [B, H, W]
-                'camera_poses': camera_poses[:, s, :, :],  # [B, 4, 4]
-                'intrinsics': intrinsics[:, s, :, :],  # [B, 3, 3]
-                'metric_scaling_factor': torch.tensor(1.0),  # VGGT doesn't output this, use 1.0
-                # Additional VGGT-specific outputs
-                'depth': predictions.get('depth', None),
-                'depth_conf': predictions.get('depth_conf', None),
-                'view_index': view_indices[s],
-                # 保存 VGGT 预处理后的图像用于颜色提取
-                'vggt_image': images[s] if images is not None else None,  # [3, H, W]
-            }
-            outputs.append(output)
-        
-        return outputs
-
 
     def _batch_recover_original_poses(self, image_path: Path, start_idx: int, end_idx: int, transform_tracks: bool = True) -> bool:
         """Batch recover original poses for a range of images.
@@ -3433,8 +3235,8 @@ def run_incremental_feature_matching(
     image_paths: List[Path],
     output_dir: Path,
     reconstruction_type: str = 'each_pixel_feature_points', # 'dense_feature_points' | 'each_pixel_feature_points'
-    model_type: str = 'mapanything',  # 'mapanything' | 'vggt'
-    model_path: Optional[str] = None,  # 模型权重路径（VGGT需要）
+    model_type: str = 'mapanything',  # 'mapanything' | 'vggt' | 'fastvggt'
+    model_path: Optional[str] = None,  # 模型权重路径（VGGT/FastVGGT需要）
     image_interval: int = 2,
     min_images_for_scale: int = 6,
     overlap: int = 2,
@@ -3452,6 +3254,10 @@ def run_incremental_feature_matching(
     merge_method: str = 'confidence',  # 'full' | 'confidence' | 'confidence_blend' 合并方式
     enable_visualization: bool = True,
     visualization_mode: str = 'merged',  # 'aligned' | 'merged'
+    # FastVGGT 特有参数
+    fastvggt_merging: int = 0,  # FastVGGT token merging 参数
+    fastvggt_merge_ratio: float = 0.9,  # FastVGGT token merge ratio (0.0-1.0)
+    fastvggt_depth_conf_thresh: float = 3.0,  # FastVGGT 深度置信度阈值
     verbose: bool = False,
 ) -> bool:
     """Run incremental image initialization pipeline.
@@ -3460,8 +3266,8 @@ def run_incremental_feature_matching(
         image_paths: List of image file paths in processing order
         output_dir: Directory for output files
         reconstruction_type: Type of reconstruction, 'dense_feature_points' or 'each_pixel_feature_points'
-        model_type: Type of model to use, 'mapanything' or 'vggt'
-        model_path: Path to model weights (required for VGGT, optional for MapAnything)
+        model_type: Type of model to use, 'mapanything', 'vggt', or 'fastvggt'
+        model_path: Path to model weights (required for VGGT/FastVGGT, optional for MapAnything)
         image_interval: Interval for selecting images (1=all, 2=every 2nd, etc.)
         min_images_for_scale: Minimum number of images required for scale estimation
         overlap: Number of overlapping images between consecutive reconstructions
@@ -3487,6 +3293,9 @@ def run_incremental_feature_matching(
                                  and smooth edge blending/interpolation (default)
         enable_visualization: Whether to start viser server for visualization
         visualization_mode: Point cloud visualization mode, 'aligned' (per batch) or 'merged' (unified)
+        fastvggt_merging: FastVGGT token merging parameter (0=disabled, default)
+        fastvggt_merge_ratio: FastVGGT token merge ratio (0.0-1.0, default 0.9)
+        fastvggt_depth_conf_thresh: FastVGGT depth confidence threshold (default 3.0)
         verbose: Enable verbose logging
     
     Returns:
@@ -3572,6 +3381,10 @@ def run_incremental_feature_matching(
         merge_statistical_filter=merge_statistical_filter,
         merge_method=merge_method,
         enable_visualization=enable_visualization,
+        # FastVGGT 参数
+        fastvggt_merging=fastvggt_merging,
+        fastvggt_merge_ratio=fastvggt_merge_ratio,
+        fastvggt_depth_conf_thresh=fastvggt_depth_conf_thresh,
         visualization_mode=visualization_mode,
         verbose=verbose,
     )
@@ -3635,9 +3448,18 @@ if __name__ == "__main__":
     input_dir = Path(r"drone-map-anything\examples\WenChuan\images")
     output_dir = Path(r"drone-map-anything\output\WenChuan\sparse_incremental_reconstruction")
 
-    # 模型选择: 'mapanything' 或 'vggt'
-    MODEL_TYPE = 'vggt'  # 切换模型类型
-    MODEL_PATH = "weights/vggt/model.pt"  # VGGT 模型权重路径，如果使用 VGGT 需要设置，例如: "weights/model.pt"
+    # 模型选择: 'mapanything', 'vggt', 或 'fastvggt'
+    MODEL_TYPE = 'vggt'  # 切换模型类型: 'mapanything' | 'vggt' | 'fastvggt'
+    
+    # 模型权重路径
+    # - VGGT: "weights/vggt/model.pt"
+    # - FastVGGT: "weights/fastvggt/model_tracker_fixed_e20.pt" (参考 eval_custom_colmap.py 默认路径)
+    MODEL_PATH = "weights/vggt/model.pt"
+    
+    # FastVGGT 特有参数（仅当 MODEL_TYPE='fastvggt' 时生效）
+    FASTVGGT_MERGING = 0  # Token merging 参数，0=禁用
+    FASTVGGT_MERGE_RATIO = 0.5  # Token merge ratio (0.0-1.0)
+    FASTVGGT_DEPTH_CONF_THRESH = 1.0  # 深度置信度阈值
     
     # ================================================
 
@@ -3657,6 +3479,10 @@ if __name__ == "__main__":
         output_dir=output_dir,
         model_type=MODEL_TYPE,
         model_path=MODEL_PATH,
+        # FastVGGT 参数（仅当 model_type='fastvggt' 时生效）
+        fastvggt_merging=FASTVGGT_MERGING,
+        fastvggt_merge_ratio=FASTVGGT_MERGE_RATIO,
+        fastvggt_depth_conf_thresh=FASTVGGT_DEPTH_CONF_THRESH,
         verbose=True,
     )
     
