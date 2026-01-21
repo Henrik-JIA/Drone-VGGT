@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Incremental feature extraction and matching for SfM using pycolmap.
-Process images one by one: extract features, match with previous images, 
-build tracks, and triangulate.
+Hierarchical feature extraction and matching for SfM using pycolmap.
+Process images in a hierarchical manner:
+  - Level 1: Single image inference
+  - Level 2: Small batch reconstruction (min_images_for_scale images per batch)
+  - Level 3: Merge all batch reconstructions into final result
 """
 
 import os
@@ -112,10 +114,13 @@ def cam_from_enu_transform(roll, pitch, yaw):
     cam_from_enu = cam_from_ned @ gimbal_from_ned @ ned_from_enu
     return cam_from_enu
 
-class IncrementalFeatureMatcherSfM:
-    """Incremental feature extraction and matching using pycolmap.
+class HierarchicalFeatureMatcherSfM:
+    """Hierarchical feature extraction and matching using pycolmap.
     
-    This class processes images one by one and stores their intrinsic and extrinsic parameters.
+    This class processes images in a hierarchical manner:
+    - Level 1: Single image inference (one by one)
+    - Level 2: Small batch reconstruction (min_images_for_scale images per batch)
+    - Level 3: Merge all batch reconstructions into final result
     """
 
     def __init__(
@@ -127,6 +132,7 @@ class IncrementalFeatureMatcherSfM:
         global_sparse_reconstruction: Optional[pycolmap.Reconstruction] = None,
         min_images_for_scale: int = 2,
         overlap: int = 1,
+        cleanup_keep_last_n: int = 3,  # 内存清理时保留的批次数量
         max_reproj_error: float = 10.0,
         max_points3D_val: int = 5000,
         min_inlier_per_frame: int = 32,
@@ -135,7 +141,7 @@ class IncrementalFeatureMatcherSfM:
         merge_voxel_size: float = 1.0,  # 点云合并时的体素大小（米）
         merge_boundary_filter: bool = True,  # 是否启用边界过滤
         merge_statistical_filter: bool = False,  # 是否启用统计过滤
-        merge_method: str = 'confidence_blend',  # 'full' | 'confidence' | 'confidence_blend' 合并方式
+        merge_method: str = 'confidence_blend',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only' 合并方式
         enable_visualization: bool = True,
         visualization_mode: str = 'merged',  # 'aligned' | 'merged'，点云可视化模式
         # FastVGGT 特有参数
@@ -157,6 +163,11 @@ class IncrementalFeatureMatcherSfM:
                                   4 = calculate from 4th image
                                   etc.
             overlap: Number of overlapping images between consecutive reconstructions
+            cleanup_keep_last_n: 内存清理时保留的最近批次数量，默认3。
+                                 实际保留的图像数 = cleanup_keep_last_n * min_images_for_scale
+                                 例如: keep_last_n=3, min_images_for_scale=3 → 保留最近9张图像的推理数据
+                                 设置过小会导致重叠批次访问已清理的数据，设置过大会占用更多内存
+                                 建议值: 2-4，内存紧张时用2，内存充足时用3-4
             max_reproj_error: Maximum reprojection error (in pixels) for filtering tracks
             max_points3D_val: Per-component absolute-value threshold for 3D points (a point is kept only if |x|, |y|, and |z| are all less than this value).
             min_inlier_per_frame: Minimum inlier count per frame for valid BA
@@ -170,6 +181,8 @@ class IncrementalFeatureMatcherSfM:
                 'confidence' - use merge_confidence.py with simple confidence-based selection
                 'confidence_blend' - use merge_confidence_blend.py with confidence-based selection 
                                      and smooth edge blending/interpolation (default)
+                'points_only' - use merge_points_only.py for lightweight point cloud output only
+                                (faster, no Reconstruction structure, outputs PLY directly)
             enable_visualization: Whether to start viser server for visualization
             visualization_mode: Point cloud visualization mode, 'aligned' (per batch) or 'merged' (unified)
             verbose: Enable verbose logging
@@ -207,7 +220,8 @@ class IncrementalFeatureMatcherSfM:
         self.global_sparse_reconstruction = global_sparse_reconstruction
         self.verbose = verbose
         self.min_images_for_scale = max(2, min_images_for_scale)
-        self.overlap = overlap       
+        self.overlap = overlap
+        self.cleanup_keep_last_n = max(2, cleanup_keep_last_n)  # 至少保留2个批次
         self.pred_vis_scores_thres_value = pred_vis_scores_thres_value
         self.max_reproj_error = max_reproj_error
         self.max_points3D_val = max_points3D_val
@@ -310,14 +324,39 @@ class IncrementalFeatureMatcherSfM:
                 print("✓ Model released from memory")
 
     def _cleanup_intermediate_data(self, keep_last_n: int = 2):
-        """清理中间数据以释放内存，只保留最新的 N 个批次。
+        """清理已处理完成的中间数据以释放内存。
+        
+        清理策略：基于已处理的批次，清理不再需要的数据。
+        - 对于批量推理场景：清理已处理批次的数据，保留未处理批次和重叠区域的数据
+        - 对于逐张推理场景：清理最早的数据，保留最新的 keep_last_n 个批次
         
         Args:
-            keep_last_n: 保留最新的批次数量，默认为2（用于重叠处理）
+            keep_last_n: 保留的批次数量缓冲，默认为2
+                         用于确保重叠批次有足够的数据访问
         """
         import gc
         
         cleaned_items = []
+        
+        # ========== 计算可安全清理的索引范围 ==========
+        # 基于已处理的批次来确定清理边界，而不是简单地保留"最新"的数据
+        
+        if len(self.inference_reconstructions) > 0:
+            # 获取已处理批次的信息
+            # 保留最后 keep_last_n 个批次需要的数据
+            num_processed_batches = len(self.inference_reconstructions)
+            batches_to_keep = min(keep_last_n, num_processed_batches)
+            
+            if num_processed_batches > batches_to_keep:
+                # 找到可以安全清理的最大索引
+                # 保留最后 batches_to_keep 个批次的起始索引之后的数据
+                keep_from_batch_idx = num_processed_batches - batches_to_keep
+                safe_cleanup_end_idx = self.inference_reconstructions[keep_from_batch_idx]['start_idx']
+            else:
+                safe_cleanup_end_idx = 0
+        else:
+            # 没有处理过任何批次，不清理 inference_outputs
+            safe_cleanup_end_idx = 0
         
         # 1. 清理 batch_tracks - 只保留最新的 keep_last_n 个批次
         if len(self.batch_tracks) > keep_last_n:
@@ -331,18 +370,17 @@ class IncrementalFeatureMatcherSfM:
             self.batch_tracks = self.batch_tracks[-keep_last_n:]
             cleaned_items.append(f"batch_tracks: 删除 {num_to_remove} 个")
         
-        # 2. 清理 image_tracks - 只保留最新的 keep_last_n * min_images_for_scale 个
-        max_image_tracks = keep_last_n * self.min_images_for_scale
-        if len(self.image_tracks) > max_image_tracks:
-            num_to_remove = len(self.image_tracks) - max_image_tracks
+        # 2. 清理 image_tracks - 基于安全清理索引
+        if safe_cleanup_end_idx > 0 and len(self.image_tracks) > 0:
+            num_to_remove = min(safe_cleanup_end_idx, len(self.image_tracks))
             for i in range(num_to_remove):
                 track_info = self.image_tracks[i]
                 # 显式删除大型数组
                 for key in ['tracks_2d', 'vis_scores', 'confs', 'points_3d', 'points_rgb']:
                     if key in track_info and track_info[key] is not None:
                         del track_info[key]
-            self.image_tracks = self.image_tracks[-max_image_tracks:]
-            cleaned_items.append(f"image_tracks: 删除 {num_to_remove} 个")
+            if num_to_remove > 0:
+                cleaned_items.append(f"image_tracks: 清理 {num_to_remove} 个")
         
         # 3. 清理 inference_reconstructions 中的 pixel_3d_mapping（保留 reconstruction 对象）
         if len(self.inference_reconstructions) > keep_last_n:
@@ -358,24 +396,25 @@ class IncrementalFeatureMatcherSfM:
                     recon_data['pixel_3d_mapping'] = {}
             cleaned_items.append(f"pixel_3d_mapping: 清理 {len(self.inference_reconstructions) - keep_last_n} 个批次")
         
-        # 4. 清理 recovered_inference_outputs - 只保留最新的
-        max_recovered = keep_last_n * self.min_images_for_scale
-        if len(self.recovered_inference_outputs) > max_recovered:
-            num_to_remove = len(self.recovered_inference_outputs) - max_recovered
+        # 4. 清理 recovered_inference_outputs - 基于安全清理索引
+        if safe_cleanup_end_idx > 0 and len(self.recovered_inference_outputs) > 0:
+            num_to_remove = min(safe_cleanup_end_idx, len(self.recovered_inference_outputs))
             for i in range(num_to_remove):
                 output = self.recovered_inference_outputs[i]
                 # 清理 tensor 数据
                 for key in ['pts3d', 'pts3d_cam', 'camera_poses', 'cam_trans', 'cam_quats', 'conf']:
                     if key in output and output[key] is not None:
                         del output[key]
-            self.recovered_inference_outputs = self.recovered_inference_outputs[-max_recovered:]
-            cleaned_items.append(f"recovered_inference_outputs: 删除 {num_to_remove} 个")
+            if num_to_remove > 0:
+                cleaned_items.append(f"recovered_inference_outputs: 清理 {num_to_remove} 个")
         
-        # 5. 清理 inference_outputs 中的大型 tensor（保留元数据）
-        if len(self.inference_outputs) > keep_last_n * self.min_images_for_scale:
-            keep_from_idx = len(self.inference_outputs) - keep_last_n * self.min_images_for_scale
+        # 5. 清理 inference_outputs 中的大型 tensor（基于已处理批次，而非简单保留最新）
+        # 关键改动：只清理 safe_cleanup_end_idx 之前的数据，确保未处理批次的数据可用
+        if safe_cleanup_end_idx > 0:
             cleaned_count = 0
-            for i in range(keep_from_idx):
+            for i in range(safe_cleanup_end_idx):
+                if i >= len(self.inference_outputs):
+                    break
                 output = self.inference_outputs[i]
                 # 清理 current_output 中的 tensor
                 if 'current_output' in output and output['current_output'] is not None:
@@ -388,19 +427,19 @@ class IncrementalFeatureMatcherSfM:
                     output['outputs'] = None
                 cleaned_count += 1
             if cleaned_count > 0:
-                cleaned_items.append(f"inference_outputs: 清理 {cleaned_count} 个的 tensor")
+                cleaned_items.append(f"inference_outputs: 清理索引 [0, {safe_cleanup_end_idx}) 共 {cleaned_count} 个")
         
-        # 6. 清理 input_views 和 preprocessed_views 中的图像 tensor
-        keep_views_from = max(0, len(self.input_views) - keep_last_n * self.min_images_for_scale)
-        views_cleaned = 0
-        for i in range(keep_views_from):
-            if i < len(self.input_views) and 'img' in self.input_views[i]:
-                self.input_views[i]['img'] = None
-                views_cleaned += 1
-            if i < len(self.preprocessed_views) and 'img' in self.preprocessed_views[i]:
-                self.preprocessed_views[i]['img'] = None
-        if views_cleaned > 0:
-            cleaned_items.append(f"input/preprocessed_views: 清理 {views_cleaned} 个图像 tensor")
+        # 6. 清理 input_views 和 preprocessed_views 中的图像 tensor（基于安全清理索引）
+        if safe_cleanup_end_idx > 0:
+            views_cleaned = 0
+            for i in range(safe_cleanup_end_idx):
+                if i < len(self.input_views) and 'img' in self.input_views[i] and self.input_views[i]['img'] is not None:
+                    self.input_views[i]['img'] = None
+                    views_cleaned += 1
+                if i < len(self.preprocessed_views) and 'img' in self.preprocessed_views[i] and self.preprocessed_views[i]['img'] is not None:
+                    self.preprocessed_views[i]['img'] = None
+            if views_cleaned > 0:
+                cleaned_items.append(f"input/preprocessed_views: 清理 {views_cleaned} 个图像 tensor")
         
         # 7. 强制垃圾回收
         gc.collect()
@@ -411,9 +450,9 @@ class IncrementalFeatureMatcherSfM:
         
         if self.verbose and cleaned_items:
             print(f"  ✓ 内存清理完成: {', '.join(cleaned_items)}")
-
-    def add_image(self, image_path: Path) -> bool:
-        """Add a new image and store its intrinsic and extrinsic parameters.
+    
+    def inference_image(self, image_path: Path) -> bool:
+        """Inference a single image.
         
         Args:
             image_path: Path to the image file
@@ -455,7 +494,17 @@ class IncrementalFeatureMatcherSfM:
 
         # Run inference
         inference_success = self._run_inference(image_path, self.preprocessed_views)
+        return inference_success
 
+    def add_image(self, image_path: Path) -> bool:
+        """Add a new image and store its intrinsic and extrinsic parameters.
+        
+        Args:
+            image_path: Path to the image file
+        
+        Returns:
+            True if successful, False otherwise
+        """
         # ==================== 批量恢复原始位姿 ====================
         # # 检查是否达到批量恢复的条件
         # num_images = len(self.inference_outputs)
@@ -517,9 +566,6 @@ class IncrementalFeatureMatcherSfM:
                     end_idx=end_idx
                 )
 
-                # ==================== 合并reconstruction中间结果 ====================
-                merge_reconstruction_success = self._merge_reconstruction_intermediate_results()
-
                 # # ==================== 批量恢复位姿和3D点到真实坐标系 ====================
                 # batch_recover_success = self._batch_recover_original_poses(
                 #     image_path=image_path,
@@ -539,19 +585,24 @@ class IncrementalFeatureMatcherSfM:
                 img_height, img_width = height, width
                 image_size = np.array([height, width])
 
-                latest_inference = self.inference_outputs[-1]
-                latest_outputs = latest_inference['outputs']
-                num_images = len(self.inference_outputs)
-                num_outputs = len(latest_outputs)
-                latest_start_idx = num_images - num_outputs
-                latest_end_idx = num_images
+                # 获取该批次最后一张图像的推理结果（它的 outputs 包含整个窗口）
+                # 支持两种场景：
+                # 1. 逐张推理+处理：inference_outputs[-1] 就是当前批次
+                # 2. 先批量推理再处理：需要根据 end_idx 找到对应的推理结果
+                batch_inference = self.inference_outputs[end_idx - 1]
+                batch_outputs = batch_inference['outputs']
+                num_outputs = len(batch_outputs)
                 
-                use_latest_outputs = (latest_start_idx == start_idx and latest_end_idx == end_idx)
+                # 该推理结果对应的图像范围
+                batch_start_idx = end_idx - num_outputs
+                batch_end_idx = end_idx
+                
+                use_batch_outputs = (batch_start_idx == start_idx and batch_end_idx == end_idx)
                 
                 # 统一数据源，消除代码重复
-                if use_latest_outputs:
-                    outputs_list = latest_outputs
-                    indices = list(range(start_idx, start_idx + len(latest_outputs)))
+                if use_batch_outputs:
+                    outputs_list = batch_outputs
+                    indices = list(range(start_idx, start_idx + len(batch_outputs)))
                 else:
                     if self.verbose:
                         print(f"  Warning: Using outputs from different inference batches, points may be in different coordinate systems")
@@ -560,98 +611,173 @@ class IncrementalFeatureMatcherSfM:
                 
                 n = len(outputs_list)
                 
-                # ==================== GPU全流程优化 ====================
-                # 核心思想: 尽可能在GPU上完成计算，减少CPU-GPU传输
+                # ==================== GPU全流程优化 (加速版) ====================
+                # 核心思想: 尽可能在GPU上完成计算，减少CPU-GPU传输和同步点
+                # 优化策略: 
+                # 1. 使用 non_blocking 异步传输
+                # 2. 内联投影计算避免函数调用开销
+                # 3. 使用 float32 代替 double 精度
+                # 4. 减少 GPU-CPU 同步点（避免 .item()）
+                # 5. 融合操作减少 kernel launch 开销
                 
-                # 步骤1: 在GPU上stack所有tensor（零拷贝）
-                pts3d_gpu = torch.stack([output['pts3d'][0] for output in outputs_list])  # (n, H, W, 3)
-                conf_gpu = torch.stack([output['conf'][0] for output in outputs_list])    # (n, H, W)
-                cam_gpu = torch.stack([output['camera_poses'][0] for output in outputs_list])  # (n, 4, 4)
-                K_gpu = torch.stack([output['intrinsics'][0] for output in outputs_list])      # (n, 3, 3)
+                # 步骤1: 确定目标设备并异步堆叠传输
+                use_gpu = torch.cuda.is_available()
+                if use_gpu:
+                    target_device = torch.device('cuda')
+                    # 使用 non_blocking 异步传输，减少等待时间
+                    pts3d_list = [output['pts3d'][0].to(target_device, non_blocking=True) for output in outputs_list]
+                    conf_list = [output['conf'][0].to(target_device, non_blocking=True) for output in outputs_list]
+                    cam_list = [output['camera_poses'][0].to(target_device, non_blocking=True) for output in outputs_list]
+                    K_list = [output['intrinsics'][0].to(target_device, non_blocking=True) for output in outputs_list]
+                    
+                    pts3d_gpu = torch.stack(pts3d_list)   # (n, H, W, 3)
+                    conf_gpu = torch.stack(conf_list)     # (n, H, W)
+                    cam_gpu = torch.stack(cam_list)       # (n, 4, 4)
+                    K_gpu = torch.stack(K_list).float()   # (n, 3, 3) 确保 float32
+                    
+                    del pts3d_list, conf_list, cam_list, K_list
+                else:
+                    target_device = torch.device('cpu')
+                    pts3d_gpu = torch.stack([output['pts3d'][0] for output in outputs_list])
+                    conf_gpu = torch.stack([output['conf'][0] for output in outputs_list])
+                    cam_gpu = torch.stack([output['camera_poses'][0] for output in outputs_list])
+                    K_gpu = torch.stack([output['intrinsics'][0] for output in outputs_list])
                 
                 device = pts3d_gpu.device
-                use_gpu = pts3d_gpu.is_cuda
                 
-                # 步骤2: 在GPU上进行置信度过滤（避免传输全部数据到CPU）
+                # 步骤2: 在GPU上进行置信度过滤
                 conf_mask_gpu = conf_gpu >= conf_thres_value  # (n, H, W)
+                del conf_gpu  # 立即释放
                 
-                # 步骤3: GPU上随机采样（如果点数超过限制）
-                true_count = conf_mask_gpu.sum().item()
-                if true_count > max_points_for_colmap:
-                    # 在GPU上高效随机采样
-                    flat_mask = conf_mask_gpu.view(-1)
-                    true_indices = torch.nonzero(flat_mask, as_tuple=True)[0]
-                    # 随机选择 max_points_for_colmap 个索引
-                    perm = torch.randperm(true_indices.size(0), device=device)[:max_points_for_colmap]
-                    sampled_indices = true_indices[perm]
-                    # 重建mask
-                    combined_mask_gpu = torch.zeros_like(flat_mask)
-                    combined_mask_gpu[sampled_indices] = True
-                    combined_mask_gpu = combined_mask_gpu.view(conf_mask_gpu.shape)
+                # 步骤3: GPU上随机采样（优化：避免 .item() 同步，使用概率采样）
+                total_elements = conf_mask_gpu.numel()
+                # 使用概率采样避免精确计数的同步开销
+                if total_elements > max_points_for_colmap:
+                    # 估算采样率，留一点余量
+                    sample_rate = max_points_for_colmap / total_elements * 1.2
+                    if sample_rate < 1.0:
+                        # 概率采样：生成随机mask与conf_mask取交集
+                        random_mask = torch.rand(conf_mask_gpu.shape, device=device) < sample_rate
+                        combined_mask_gpu = conf_mask_gpu & random_mask
+                        del random_mask
+                        # 如果采样后仍超过限制，再做精确采样
+                        true_count = combined_mask_gpu.sum().item()
+                        if true_count > max_points_for_colmap:
+                            flat_mask = combined_mask_gpu.view(-1)
+                            true_indices = torch.nonzero(flat_mask, as_tuple=True)[0]
+                            perm = torch.randperm(true_indices.size(0), device=device)[:max_points_for_colmap]
+                            sampled_indices = true_indices[perm]
+                            combined_mask_gpu = torch.zeros_like(flat_mask)
+                            combined_mask_gpu[sampled_indices] = True
+                            combined_mask_gpu = combined_mask_gpu.view(conf_mask_gpu.shape)
+                            del flat_mask, true_indices, perm, sampled_indices
+                    else:
+                        combined_mask_gpu = conf_mask_gpu
                 else:
                     combined_mask_gpu = conf_mask_gpu
                 
-                # 步骤4: 提取过滤后的3D点（仍在GPU上）
-                points_3d_filtered_gpu = pts3d_gpu[combined_mask_gpu]  # (N_filtered, 3)
+                if combined_mask_gpu is not conf_mask_gpu:
+                    del conf_mask_gpu
                 
-                # 步骤5: 在GPU上构建extrinsic（利用旋转矩阵正交性）
-                R_gpu = cam_gpu[:, :3, :3]  # (n, 3, 3)
-                t_gpu = cam_gpu[:, :3, 3:4]  # (n, 3, 1)
-                R_inv_gpu = R_gpu.transpose(-1, -2)  # R^T
-                t_inv_gpu = -torch.bmm(R_inv_gpu, t_gpu)  # -R^T @ t
-                extrinsic_gpu = torch.cat([R_inv_gpu, t_inv_gpu], dim=2)  # (n, 3, 4)
+                # 步骤4: 提取过滤后的3D点
+                points_3d_filtered_gpu = pts3d_gpu[combined_mask_gpu].float()  # (N_filtered, 3), 确保 float32
                 
-                # 步骤6: 在GPU上执行投影（核心加速点）
+                # 步骤5: 在GPU上构建extrinsic（融合操作）
+                R_gpu = cam_gpu[:, :3, :3]
+                t_gpu = cam_gpu[:, :3, 3:4]
+                R_inv_gpu = R_gpu.transpose(-1, -2)
+                t_inv_gpu = -torch.bmm(R_inv_gpu, t_gpu)
+                extrinsic_gpu = torch.cat([R_inv_gpu, t_inv_gpu], dim=2).float()  # (n, 3, 4), 确保 float32
+                del R_gpu, t_gpu, R_inv_gpu, t_inv_gpu
+                
+                # 步骤6: GPU投影（内联优化版，使用 float32 代替 double）
                 if use_gpu and points_3d_filtered_gpu.size(0) > 0:
-                    projected_points2d_gpu, points_cam_gpu = project_3D_points(
-                        points_3d_filtered_gpu,  # (N, 3)
-                        extrinsic_gpu,           # (n, 3, 4)
-                        K_gpu,                   # (n, 3, 3)
-                    )
+                    combined_mask_np = combined_mask_gpu.cpu().numpy()
+                    del pts3d_gpu, combined_mask_gpu
                     
-                    # 步骤7: 在GPU上计算可见性mask
+                    # ★ 内联投影计算（避免函数调用和 double 精度开销）
+                    N_pts = points_3d_filtered_gpu.size(0)
+                    B = extrinsic_gpu.size(0)
+                    
+                    # 使用 float32 进行投影计算
+                    points3D_h = torch.cat([points_3d_filtered_gpu, 
+                                           torch.ones(N_pts, 1, device=device, dtype=torch.float32)], dim=1)  # (N, 4)
+                    points3D_h = points3D_h.unsqueeze(0).expand(B, -1, -1)  # (B, N, 4)
+                    
+                    # 批量矩阵乘法: extrinsic @ points
+                    points_cam_gpu = torch.bmm(extrinsic_gpu, points3D_h.transpose(-1, -2))  # (B, 3, N)
+                    
+                    # 透视除法和内参投影（融合操作）
+                    z = points_cam_gpu[:, 2:3, :]  # (B, 1, N)
+                    points_cam_norm = points_cam_gpu / z  # (B, 3, N)
+                    uv = points_cam_norm[:, :2, :]  # (B, 2, N)
+                    
+                    # 添加齐次坐标并应用内参
+                    ones = torch.ones_like(uv[:, :1, :])
+                    points_cam_homo = torch.cat([uv, ones], dim=1)  # (B, 3, N)
+                    points2D_homo = torch.bmm(K_gpu, points_cam_homo)  # (B, 3, N)
+                    projected_points2d_gpu = points2D_homo[:, :2, :].transpose(1, 2)  # (B, N, 2)
+                    
+                    del points3D_h, points_cam_norm, uv, ones, points_cam_homo, points2D_homo
+                    
+                    # 步骤7: 计算可见性mask（融合边界检查）
                     depths_gpu = points_cam_gpu[:, 2, :]  # (n, N)
-                    proj_x_gpu = projected_points2d_gpu[:, :, 0]
-                    proj_y_gpu = projected_points2d_gpu[:, :, 1]
+                    proj_x = projected_points2d_gpu[:, :, 0]
+                    proj_y = projected_points2d_gpu[:, :, 1]
                     
-                    visible_mask_gpu = (
-                        (depths_gpu > 0) &
-                        (proj_x_gpu >= 0) & (proj_x_gpu < img_width) &
-                        (proj_y_gpu >= 0) & (proj_y_gpu < img_height)
-                    )  # (n, N)
+                    del points_cam_gpu
                     
-                    # 步骤8: 在GPU上筛选有效点
-                    points_visible_count_gpu = visible_mask_gpu.sum(dim=0)  # (N,)
-                    valid_points_mask_gpu = points_visible_count_gpu > 0
+                    # 融合的可见性判断
+                    visible_mask_gpu = (depths_gpu > 0) & \
+                                       (proj_x >= 0) & (proj_x < img_width) & \
+                                       (proj_y >= 0) & (proj_y < img_height)
+                    
+                    del depths_gpu, proj_x, proj_y
+                    
+                    # 步骤8: 筛选有效点
+                    valid_points_mask_gpu = visible_mask_gpu.any(dim=0)  # 使用 any 代替 sum > 0，更快
                     valid_point_indices_gpu = torch.nonzero(valid_points_mask_gpu, as_tuple=True)[0]
                     num_tracks = valid_point_indices_gpu.size(0)
                     
-                    # 步骤9: 只传输需要的数据到CPU（大幅减少传输量）
+                    del valid_points_mask_gpu
+                    
+                    # 步骤9: 批量传输到CPU
                     if num_tracks > 0:
-                        # 提取有效点的数据并传输到CPU
-                        tracks_gpu = projected_points2d_gpu[:, valid_point_indices_gpu, :].float()
-                        masks_gpu = visible_mask_gpu[:, valid_point_indices_gpu]
-                        points3d_valid_gpu = points_3d_filtered_gpu[valid_point_indices_gpu]
+                        # 一次性索引提取，减少 kernel launches
+                        valid_idx = valid_point_indices_gpu
+                        tracks_gpu = projected_points2d_gpu[:, valid_idx, :].float()
+                        masks_gpu = visible_mask_gpu[:, valid_idx]
+                        points3d_valid_gpu = points_3d_filtered_gpu[valid_idx]
                         
-                        # 设置不可见位置为NaN（在GPU上完成）
+                        del projected_points2d_gpu, visible_mask_gpu
+                        
+                        # NaN 设置
                         tracks_gpu[~masks_gpu] = float('nan')
                         
-                        # 一次性传输到CPU
+                        # 使用 non_blocking 异步传输
                         tracks = tracks_gpu.cpu().numpy()
                         masks = masks_gpu.cpu().numpy()
                         all_points_3d = points_3d_filtered_gpu.cpu().numpy()
-                        points3d_for_tracks = points3d_valid_gpu.double().cpu().numpy()
+                        points3d_for_tracks = points3d_valid_gpu.float().cpu().numpy().astype(np.float64)
                         valid_point_indices = valid_point_indices_gpu.cpu().numpy()
                         
-                        # extrinsic和intrinsic也传输（用于COLMAP）
                         extrinsic = extrinsic_gpu.cpu().numpy().astype(np.float32)
                         intrinsic = K_gpu.cpu().numpy().astype(np.float32)
+                        
+                        del tracks_gpu, masks_gpu, points3d_valid_gpu, valid_point_indices_gpu
+                        del points_3d_filtered_gpu, extrinsic_gpu, K_gpu, cam_gpu
+                        torch.cuda.empty_cache()
+                    else:
+                        del projected_points2d_gpu, visible_mask_gpu, valid_point_indices_gpu
+                        del points_3d_filtered_gpu, extrinsic_gpu, K_gpu, cam_gpu
                 else:
-                    # CPU fallback（数据不在GPU或无有效点）
+                    # CPU fallback
                     pts3d_batch = pts3d_gpu.cpu().numpy()
-                    conf_batch = conf_gpu.cpu().numpy()
                     cam_batch = cam_gpu.cpu().numpy()
                     K_batch = K_gpu.cpu().numpy()
+                    conf_batch = torch.stack([output['conf'][0] for output in outputs_list]).cpu().numpy()
+                    
+                    del pts3d_gpu, cam_gpu, K_gpu, extrinsic_gpu, points_3d_filtered_gpu, combined_mask_gpu
                     
                     points_3d = pts3d_batch.astype(np.float32)
                     depth_conf = conf_batch.astype(np.float32)
@@ -675,12 +801,9 @@ class IncrementalFeatureMatcherSfM:
                         depths = points_cam[:, 2, :]
                         proj_x = projected_points2d[:, :, 0]
                         proj_y = projected_points2d[:, :, 1]
-                        visible_mask = (
-                            (depths > 0) & (proj_x >= 0) & (proj_x < img_width) &
-                            (proj_y >= 0) & (proj_y < img_height)
-                        )
-                        points_visible_count = visible_mask.sum(axis=0)
-                        valid_point_indices = np.flatnonzero(points_visible_count > 0)
+                        visible_mask = (depths > 0) & (proj_x >= 0) & (proj_x < img_width) & \
+                                       (proj_y >= 0) & (proj_y < img_height)
+                        valid_point_indices = np.flatnonzero(visible_mask.any(axis=0))
                         num_tracks = len(valid_point_indices)
                         
                         if num_tracks > 0:
@@ -759,10 +882,10 @@ class IncrementalFeatureMatcherSfM:
                     reconstruction = None
                     valid_track_mask = None
                 else:
-                    # 获取过滤点对应的RGB（使用combined_mask_gpu或combined_mask）
-                    if use_gpu:
-                        combined_mask_np = combined_mask_gpu.cpu().numpy()
-                    else:
+                    # 获取过滤点对应的RGB
+                    # GPU 路径: combined_mask_np 已在步骤6保存到 CPU
+                    # CPU 路径: 使用 combined_mask
+                    if not use_gpu:
                         combined_mask_np = combined_mask
                     points_rgb_filtered = points_rgb[combined_mask_np]
                     points_rgb_for_tracks = points_rgb_filtered[valid_point_indices]
@@ -1024,23 +1147,322 @@ class IncrementalFeatureMatcherSfM:
                 
                 if self.verbose:
                     print(f"  ✓ Added {len(indices)} images to recovered_inference_outputs for visualization")
+                
+                # ==================== 清理已处理完成的中间数据 ====================
+                # 在每个批次处理完成后清理不再需要的数据，释放内存
+                # 保留 merge_image 所需的数据（inference_reconstructions 中的 reconstruction 和 pixel_3d_mapping）
+                self._cleanup_after_add_image(keep_last_n=self.cleanup_keep_last_n)
 
-                # ==================== 合并reconstruction中间结果 ====================
-                merge_reconstruction_success = self._merge_reconstruction_intermediate_results()
+        return True
 
-            # Viser visualization
-            if self.enable_visualization and self.visualizer is not None:
-                self.visualizer.update(
-                    recovered_inference_outputs=self.recovered_inference_outputs,
-                    merged_reconstruction=self.merged_reconstruction,
-                    input_views=self.input_views,
-                    image_paths=self.image_paths,
-                )
+    def _cleanup_after_add_image(self, keep_last_n: int = 2):
+        """清理 add_image 处理完成后不再需要的中间数据。
         
-        if not success:
-            print(f"Failed to process image: {image_path}")
-            return False
+        与 _cleanup_intermediate_data 不同，这个方法专门用于 add_image 后的清理，
+        确保保留 merge_image 所需的数据。
+        
+        Args:
+            keep_last_n: 保留的批次数量缓冲，默认为2
+        """
+        import gc
+        
+        cleaned_items = []
+        
+        # 计算可安全清理的索引范围
+        if len(self.inference_reconstructions) > 0:
+            num_processed_batches = len(self.inference_reconstructions)
+            batches_to_keep = min(keep_last_n, num_processed_batches)
+            
+            if num_processed_batches > batches_to_keep:
+                keep_from_batch_idx = num_processed_batches - batches_to_keep
+                safe_cleanup_end_idx = self.inference_reconstructions[keep_from_batch_idx]['start_idx']
+            else:
+                safe_cleanup_end_idx = 0
+        else:
+            safe_cleanup_end_idx = 0
+        
+        # 1. 清理 inference_outputs 中的大型 tensor（保留 merge_image 所需的元数据）
+        if safe_cleanup_end_idx > 0:
+            cleaned_count = 0
+            for i in range(safe_cleanup_end_idx):
+                if i >= len(self.inference_outputs):
+                    break
+                output = self.inference_outputs[i]
+                # 清理 current_output 中的 tensor
+                if 'current_output' in output and output['current_output'] is not None:
+                    for key in ['pts3d', 'pts3d_cam', 'conf', 'camera_poses', 'intrinsics']:
+                        if key in output['current_output']:
+                            del output['current_output'][key]
+                    output['current_output'] = None
+                # 清理 outputs 列表（这是最大的内存占用）
+                if 'outputs' in output and output['outputs'] is not None:
+                    for out in output['outputs']:
+                        if out is not None:
+                            for key in ['pts3d', 'pts3d_cam', 'conf', 'camera_poses', 'intrinsics', 'vggt_image']:
+                                if key in out:
+                                    del out[key]
+                    output['outputs'] = None
+                cleaned_count += 1
+            if cleaned_count > 0:
+                cleaned_items.append(f"inference_outputs: 清理 {cleaned_count} 个")
+        
+        # 2. 清理 input_views 和 preprocessed_views 中的图像 tensor
+        if safe_cleanup_end_idx > 0:
+            views_cleaned = 0
+            for i in range(safe_cleanup_end_idx):
+                if i < len(self.input_views) and 'img' in self.input_views[i] and self.input_views[i]['img'] is not None:
+                    self.input_views[i]['img'] = None
+                    views_cleaned += 1
+                if i < len(self.preprocessed_views) and 'img' in self.preprocessed_views[i] and self.preprocessed_views[i]['img'] is not None:
+                    self.preprocessed_views[i]['img'] = None
+            if views_cleaned > 0:
+                cleaned_items.append(f"views: 清理 {views_cleaned} 个图像")
+        
+        # 3. 清理 batch_tracks
+        if len(self.batch_tracks) > keep_last_n:
+            num_to_remove = len(self.batch_tracks) - keep_last_n
+            for i in range(num_to_remove):
+                batch = self.batch_tracks[i]
+                for key in ['pred_tracks', 'pred_vis_scores', 'pred_confs', 'points_3d', 'points_rgb']:
+                    if key in batch and batch[key] is not None:
+                        del batch[key]
+            self.batch_tracks = self.batch_tracks[-keep_last_n:]
+            cleaned_items.append(f"batch_tracks: 删除 {num_to_remove} 个")
+        
+        # 4. 清理 image_tracks
+        if safe_cleanup_end_idx > 0 and len(self.image_tracks) > 0:
+            num_to_remove = min(safe_cleanup_end_idx, len(self.image_tracks))
+            for i in range(num_to_remove):
+                track_info = self.image_tracks[i]
+                for key in ['tracks_2d', 'vis_scores', 'confs', 'points_3d', 'points_rgb']:
+                    if key in track_info and track_info[key] is not None:
+                        del track_info[key]
+            if num_to_remove > 0:
+                cleaned_items.append(f"image_tracks: 清理 {num_to_remove} 个")
+        
+        # 5. 强制垃圾回收
+        gc.collect()
+        
+        # 6. 清理 CUDA 缓存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        if self.verbose and cleaned_items:
+            print(f"  ✓ add_image 内存清理: {', '.join(cleaned_items)}")
 
+    def merge_image(self, image_path: Path) -> bool:
+        """Merge reconstruction intermediate results if needed.
+        
+        This method checks if there are new reconstruction results to merge
+        and performs the merge operation. It should be called after add_image.
+        Each call merges one reconstruction at a time, in order.
+        
+        对于 points_only 模式：在最后一个 reconstruction 时执行批量合并。
+        对于其他模式：每次调用合并一个 reconstruction。
+        
+        Args:
+            image_path: Path to the image file (used for error messages)
+        
+        Returns:
+            True if successful (or no merge needed), False otherwise
+        """
+        # Check if there are reconstructions to merge
+        if len(self.inference_reconstructions) == 0:
+            # No reconstructions to merge
+            return True
+        
+        # Get the next reconstruction index to merge
+        next_merge_idx = getattr(self, '_last_merged_reconstruction_idx', -1) + 1
+        
+        # Check if all reconstructions have been merged
+        if next_merge_idx >= len(self.inference_reconstructions):
+            # All reconstructions already merged, no action needed
+            return True
+        
+        # ==================== points_only 模式：批量合并 ====================
+        if self.merge_method == 'points_only':
+            # points_only 模式：在最后一个 reconstruction 时执行批量合并
+            total_recons = len(self.inference_reconstructions)
+            is_last = (next_merge_idx == total_recons - 1)
+            
+            if not is_last:
+                # 还没到最后一个，更新索引并跳过
+                self._last_merged_reconstruction_idx = next_merge_idx
+                if self.verbose:
+                    print(f"\n  [points_only] 累积 reconstruction {next_merge_idx + 1}/{total_recons}，等待批量合并...")
+                return True
+            
+            # 最后一个 reconstruction，执行批量合并
+            if self.verbose:
+                print(f"\n  [points_only] 到达最后一个 reconstruction ({next_merge_idx + 1}/{total_recons})，开始批量合并...")
+            
+            merged_xyz, merged_colors, merge_info = self.merge_all_points_only()
+            
+            if merged_xyz is None or len(merged_xyz) == 0:
+                print(f"  ✗ points_only 批量合并失败")
+                return False
+            
+            if self.verbose:
+                print(f"\n  ✓ points_only 批量合并完成:")
+                print(f"    总输入 reconstruction: {total_recons}")
+                print(f"    总输出点数: {len(merged_xyz)}")
+                if 'pairwise_alignments' in merge_info:
+                    successful = sum(1 for a in merge_info['pairwise_alignments'] if a.get('success', False))
+                    print(f"    成功对齐的 reconstruction 对: {successful}/{len(merge_info['pairwise_alignments'])}")
+            
+            # 更新索引
+            self._last_merged_reconstruction_idx = next_merge_idx
+            return True
+        
+        # ==================== 其他模式：增量合并 ====================
+        # Get the reconstruction to merge
+        recon_data = self.inference_reconstructions[next_merge_idx]
+        curr_recon = recon_data['reconstruction']
+        
+        # ==================== 合并reconstruction中间结果 ====================
+        if next_merge_idx == 0:
+            # 第一个 reconstruction，直接设置为 merged
+            self.merged_reconstruction = curr_recon
+            merged_recon = self.merged_reconstruction
+            
+            # 提取 merged 点云用于可视化
+            if self.visualizer is not None:
+                self.visualizer.update_merged_point_cloud(merged_recon)
+            
+            # 保存 merged_reconstruction
+            temp_path = self.output_dir / "temp_merged" / f"merged_{next_merge_idx + 1}"
+            temp_path.mkdir(parents=True, exist_ok=True)
+            
+            # 输出完整的 COLMAP 格式
+            merged_recon.write_text(str(temp_path))
+            merged_recon.export_PLY(str(temp_path / "points3D.ply"))
+            self.export_reconstruction_to_las(merged_recon, str(temp_path / "points3D.las"))
+            
+            if self.verbose:
+                print(f"\n  ✓ 第一个 reconstruction 设置为 merged:")
+                print(f"    总影像数: {len(merged_recon.images)}")
+                print(f"    总3D点数: {len(merged_recon.points3D)}")
+                print(f"    结果保存到: {temp_path}")
+            
+            merge_reconstruction_success = True
+        else:
+            # 后续 reconstruction，调用合并方法
+            merge_reconstruction_success = self._merge_reconstruction_at_index(next_merge_idx)
+        
+        if merge_reconstruction_success:
+            # Update the last merged index
+            self._last_merged_reconstruction_idx = next_merge_idx
+        
+        # Viser visualization
+        if self.enable_visualization and self.visualizer is not None:
+            self.visualizer.update(
+                recovered_inference_outputs=self.recovered_inference_outputs,
+                merged_reconstruction=self.merged_reconstruction,
+                input_views=self.input_views,
+                image_paths=self.image_paths,
+            )
+        
+        if not merge_reconstruction_success:
+            print(f"Failed to merge reconstruction for image: {image_path}")
+            return False
+        
+        return True
+    
+    def merge_all_points_only(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Dict]:
+        """
+        points_only 模式的批量合并入口点
+        
+        在所有影像处理完成后调用此方法，执行：
+        1. 计算所有相邻 reconstruction 之间的关系
+        2. 顺序对齐所有 reconstruction 到第一个的坐标系
+        3. 收集所有对齐后的 3D 点并去重
+        4. 输出合并后的点云
+        
+        Returns:
+            merged_xyz: (N, 3) 合并后的点云坐标
+            merged_colors: (N, 3) 合并后的颜色
+            info: 合并信息字典
+        """
+        if self.merge_method != 'points_only':
+            if self.verbose:
+                print(f"  Warning: merge_all_points_only called but merge_method is '{self.merge_method}'")
+            return None, None, {'success': False, 'error': 'Not in points_only mode'}
+        
+        if len(self.inference_reconstructions) == 0:
+            if self.verbose:
+                print(f"  ✗ 没有 reconstruction 可合并")
+            return None, None, {'success': False, 'error': 'No reconstructions'}
+        
+        return self._merge_by_points_only_batch(self.output_dir)
+    
+    def _merge_reconstruction_at_index(self, merge_idx: int) -> bool:
+        """Merge reconstruction at specified index with merged_reconstruction.
+        
+        Args:
+            merge_idx: Index of the reconstruction to merge in inference_reconstructions
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        if merge_idx >= len(self.inference_reconstructions):
+            return False
+        
+        curr_recon_data = self.inference_reconstructions[merge_idx]
+        curr_recon = curr_recon_data['reconstruction']
+        
+        # 根据 merge_method 选择合并方式，传递 merge_idx 以正确提取 conf 信息
+        if self.merge_method == 'confidence_blend':
+            merged_recon = self._merge_by_confidence_blend(
+                self.merged_reconstruction,
+                curr_recon,
+                self.output_dir,
+                merge_idx=merge_idx
+            )
+        elif self.merge_method == 'confidence':
+            merged_recon = self._merge_by_confidence(
+                self.merged_reconstruction,
+                curr_recon,
+                self.output_dir,
+                merge_idx=merge_idx
+            )
+        else:
+            merged_recon = self._merge_by_full_pipeline(
+                self.merged_reconstruction,
+                curr_recon,
+                self.output_dir
+            )
+        
+        # 检查合并结果
+        if merged_recon is None:
+            if self.verbose:
+                print(f"  ✗ 合并失败 (index={merge_idx})")
+            return False
+        
+        # 更新 merged_reconstruction
+        self.merged_reconstruction = merged_recon
+        
+        # 提取 merged 点云用于可视化
+        if self.visualizer is not None:
+            self.visualizer.update_merged_point_cloud(merged_recon)
+        
+        # 保存 merged_reconstruction
+        temp_path = self.output_dir / "temp_merged" / f"merged_{merge_idx + 1}"
+        temp_path.mkdir(parents=True, exist_ok=True)
+        
+        # 输出完整的 COLMAP 格式
+        merged_recon.write_text(str(temp_path))
+        merged_recon.export_PLY(str(temp_path / "points3D.ply"))
+        self.export_reconstruction_to_las(merged_recon, str(temp_path / "points3D.las"))
+        
+        if self.verbose:
+            print(f"  ✓ 合并完成 (index={merge_idx}):")
+            print(f"    总影像数: {len(merged_recon.images)}")
+            print(f"    总3D点数: {len(merged_recon.points3D)}")
+            print(f"    结果保存到: {temp_path}")
+        
+        # 清理不再需要的中间数据以释放内存
+        self._cleanup_intermediate_data(keep_last_n=self.cleanup_keep_last_n)
+        
         return True
 
     def _initialize_image(
@@ -1269,15 +1691,34 @@ class IncrementalFeatureMatcherSfM:
         # 只存储当前图像（最后一张）的输出
         current_output = outputs[-1] if num_images >= 2 else outputs[0]
 
-        # Store inference outputs
+        # ★ 将 outputs 移到 CPU 以释放 GPU 显存
+        # 这是显存优化的关键：推理结果在存储前移到 CPU
+        def move_output_to_cpu(output_dict):
+            """将单个输出字典中的 tensor 移到 CPU"""
+            cpu_output = {}
+            for key, value in output_dict.items():
+                if isinstance(value, torch.Tensor):
+                    cpu_output[key] = value.cpu()
+                else:
+                    cpu_output[key] = value
+            return cpu_output
+        
+        # 移动 current_output 和 outputs 到 CPU
+        current_output_cpu = move_output_to_cpu(current_output)
+        outputs_cpu = [move_output_to_cpu(out) for out in outputs]
+
+        # Store inference outputs (现在都在 CPU 上)
         inference_outputs = {
             'image_path': str(image_path),
-            'current_output': current_output,
-            'outputs': outputs,
+            'current_output': current_output_cpu,
+            'outputs': outputs_cpu,
             'scale_ratio': scale_ratio,
             'predicted_scale_ratio': predicted_scale_ratio,
         }
         self.inference_outputs.append(inference_outputs)
+        
+        # 删除原始 GPU 上的 outputs 引用
+        del outputs, current_output
 
         # 清理CUDA缓存
         if torch.cuda.is_available():
@@ -1532,15 +1973,19 @@ class IncrementalFeatureMatcherSfM:
             if self.verbose:
                 print(f"\n  Predicting tracks for batch (indices {start_idx} to {end_idx-1})...")
             
-            # 检查最新的 outputs 是否正好覆盖我们需要的范围
-            latest_inference = self.inference_outputs[-1]
-            latest_outputs = latest_inference['outputs']
-            num_images = len(self.inference_outputs)
-            num_outputs = len(latest_outputs)
-            latest_start_idx = num_images - num_outputs
-            latest_end_idx = num_images
+            # 获取该批次最后一张图像的推理结果（它的 outputs 包含整个窗口）
+            # 支持两种场景：
+            # 1. 逐张推理+处理：inference_outputs[-1] 就是当前批次
+            # 2. 先批量推理再处理：需要根据 end_idx 找到对应的推理结果
+            batch_inference = self.inference_outputs[end_idx - 1]
+            batch_outputs = batch_inference['outputs']
+            num_outputs = len(batch_outputs)
+            
+            # 该推理结果对应的图像范围
+            batch_start_idx = end_idx - num_outputs
+            batch_end_idx = end_idx
 
-            use_latest_outputs = (latest_start_idx == start_idx and latest_end_idx == end_idx)
+            use_batch_outputs = (batch_start_idx == start_idx and batch_end_idx == end_idx)
 
             # 准备这批图像的数据
             batch_image_paths = []
@@ -1548,9 +1993,9 @@ class IncrementalFeatureMatcherSfM:
             batch_confs = []
             batch_points_3d = []
 
-            if use_latest_outputs:
-                # 直接从最新的outputs列表中提取数据
-                for i, output in enumerate(latest_outputs):
+            if use_batch_outputs:
+                # 直接从该批次的outputs列表中提取数据
+                for i, output in enumerate(batch_outputs):
                     idx = start_idx + i      
                     # 收集图像路径
                     batch_image_paths.append(self.inference_outputs[idx]['image_path'])
@@ -1741,25 +2186,30 @@ class IncrementalFeatureMatcherSfM:
             points_3d = latest_batch['points_3d']  # (P, 3) 或 None
             points_rgb = latest_batch['points_rgb']  # (P, 3) 或 None
             
-            # 检查是否可以使用最新的 outputs（与 _predict_tracks_for_batch 保持一致）
-            use_latest_outputs = False
+            # 检查是否可以使用该批次的 outputs（与 _predict_tracks_for_batch 保持一致）
+            # 支持两种场景：
+            # 1. 逐张推理+处理：inference_outputs[-1] 就是当前批次
+            # 2. 先批量推理再处理：需要根据 end_idx 找到对应的推理结果
+            use_batch_outputs = False
+            batch_outputs = None
             if not use_recovered:  # 只在不使用恢复位姿时才优化
-                latest_inference = self.inference_outputs[-1]
-                latest_outputs = latest_inference['outputs']
-                num_images = len(self.inference_outputs)
-                num_outputs = len(latest_outputs)
-                latest_start_idx = num_images - num_outputs
-                latest_end_idx = num_images
-                use_latest_outputs = (latest_start_idx == start_idx and latest_end_idx == end_idx)
+                batch_inference = self.inference_outputs[end_idx - 1]
+                batch_outputs = batch_inference['outputs']
+                num_outputs = len(batch_outputs)
                 
-                if self.verbose and use_latest_outputs:
-                    print(f"  ✓ Using latest inference outputs for camera parameters")
+                # 该推理结果对应的图像范围
+                batch_start_idx = end_idx - num_outputs
+                batch_end_idx = end_idx
+                use_batch_outputs = (batch_start_idx == start_idx and batch_end_idx == end_idx)
+                
+                if self.verbose and use_batch_outputs:
+                    print(f"  ✓ Using batch inference outputs for camera parameters")
             
             # 准备 extrinsics (N, 3, 4)
             extrinsics = []
-            if use_latest_outputs:
-                # 直接从最新的 outputs 列表中获取
-                for i, output in enumerate(latest_outputs):
+            if use_batch_outputs:
+                # 直接从该批次的 outputs 列表中获取
+                for i, output in enumerate(batch_outputs):
                     cam2world = output['camera_poses'][0].cpu().numpy()
                     # 转为 world2cam (3, 4)
                     world2cam = np.linalg.inv(cam2world)[:3, :]  # (3, 4)
@@ -1781,9 +2231,9 @@ class IncrementalFeatureMatcherSfM:
             
             # 准备 intrinsics (N, 3, 3)
             intrinsics = []
-            if use_latest_outputs:
-                # 直接从最新的 outputs 列表中获取
-                for i, output in enumerate(latest_outputs):
+            if use_batch_outputs:
+                # 直接从该批次的 outputs 列表中获取
+                for i, output in enumerate(batch_outputs):
                     K = output['intrinsics'][0].cpu().numpy()  # (3, 3)
                     intrinsics.append(K)
             else:
@@ -2493,7 +2943,8 @@ class IncrementalFeatureMatcherSfM:
             print(f"    结果保存到: {temp_path}")
 
         # 清理不再需要的中间数据以释放内存
-        self._cleanup_intermediate_data(keep_last_n=2)
+        # keep_last_n 控制保留的批次数量，确保有足够的数据供重叠批次使用
+        self._cleanup_intermediate_data(keep_last_n=self.cleanup_keep_last_n)
 
         return True
     
@@ -2501,7 +2952,8 @@ class IncrementalFeatureMatcherSfM:
         self,
         prev_recon: pycolmap.Reconstruction,
         curr_recon: pycolmap.Reconstruction,
-        output_dir: Path
+        output_dir: Path,
+        merge_idx: int = None
     ) -> Optional[pycolmap.Reconstruction]:
         """
         使用基于置信度 + 边缘平滑插值的方式合并两个 reconstruction
@@ -2532,17 +2984,31 @@ class IncrementalFeatureMatcherSfM:
             prev_recon: 之前已合并的 reconstruction
             curr_recon: 当前要合并的 reconstruction
             output_dir: 输出目录
+            merge_idx: 当前要合并的 reconstruction 在 inference_reconstructions 中的索引
             
         Returns:
             合并后的 reconstruction，失败返回 None
         """
+        # 检查输入是否有效
+        if prev_recon is None:
+            if self.verbose:
+                print(f"  Warning: prev_recon is None, returning curr_recon directly")
+            return curr_recon
+        
+        if curr_recon is None:
+            if self.verbose:
+                print(f"  Warning: curr_recon is None, returning prev_recon directly")
+            return prev_recon
+        
+        # 如果未提供 merge_idx，使用最后一个批次（兼容旧调用方式）
+        if merge_idx is None:
+            merge_idx = len(self.inference_reconstructions) - 1
+        
         # 从 pixel_3d_mapping 中提取置信度图
-        # prev_recon_conf: 之前所有批次的 conf（batches 0 to N-2）
-        # curr_recon_conf: 当前批次的 conf（batch N-1）
+        # prev_recon_conf: 之前所有批次的 conf（batches 0 to merge_idx-1）
+        # curr_recon_conf: 当前批次的 conf（batch merge_idx）
         prev_recon_conf: Dict[int, np.ndarray] = {}
         curr_recon_conf: Dict[int, np.ndarray] = {}
-        
-        num_batches = len(self.inference_reconstructions)
         
         # 从 pixel_3d_mapping 提取 conf 的辅助函数
         def extract_conf_from_pixel_3d_mapping(pixel_3d_mapping: Dict) -> Dict[int, np.ndarray]:
@@ -2553,23 +3019,23 @@ class IncrementalFeatureMatcherSfM:
                     conf_maps[global_idx] = data['conf']
             return conf_maps
         
-        # 前 N-1 个批次的 conf 属于 prev_recon
-        for i in range(num_batches - 1):
+        # 前 merge_idx 个批次的 conf 属于 prev_recon (索引 0 到 merge_idx-1)
+        for i in range(merge_idx):
             pixel_3d_mapping = self.inference_reconstructions[i].get('pixel_3d_mapping', {})
             batch_conf_maps = extract_conf_from_pixel_3d_mapping(pixel_3d_mapping)
             prev_recon_conf.update(batch_conf_maps)
         
-        # 最后一个批次的 conf 属于 curr_recon
-        if num_batches > 0:
-            pixel_3d_mapping = self.inference_reconstructions[-1].get('pixel_3d_mapping', {})
+        # 第 merge_idx 个批次的 conf 属于 curr_recon
+        if merge_idx < len(self.inference_reconstructions):
+            pixel_3d_mapping = self.inference_reconstructions[merge_idx].get('pixel_3d_mapping', {})
             curr_recon_conf = extract_conf_from_pixel_3d_mapping(pixel_3d_mapping)
         
         if self.verbose:
             print(f"\n=== 使用 confidence_blend 合并 (置信度选择 + 边缘平滑插值) ===")
+            print(f"    merge_idx: {merge_idx}")
             print(f"    prev_recon: {len(prev_recon.images)} images, {len(prev_recon.points3D)} 3D points")
             print(f"    curr_recon: {len(curr_recon.images)} images, {len(curr_recon.points3D)} 3D points")
             print(f"    overlap: {self.overlap} images")
-            print(f"    num_batches: {num_batches}")
             
             # 显示每个批次的 pixel_3d_mapping 信息
             for i, recon_data in enumerate(self.inference_reconstructions):
@@ -2587,9 +3053,9 @@ class IncrementalFeatureMatcherSfM:
         image_name_to_idx = {ext['image_name']: idx for idx, ext in enumerate(self.ori_extrinsic)}
 
         # 获取当前批次的 start_idx 和 end_idx（用于输出目录命名）
-        if num_batches > 0:
-            start_idx = self.inference_reconstructions[-1].get('start_idx')
-            end_idx = self.inference_reconstructions[-1].get('end_idx')
+        if merge_idx < len(self.inference_reconstructions):
+            start_idx = self.inference_reconstructions[merge_idx].get('start_idx')
+            end_idx = self.inference_reconstructions[merge_idx].get('end_idx')
         else:
             start_idx = None
             end_idx = None
@@ -2639,7 +3105,8 @@ class IncrementalFeatureMatcherSfM:
         self,
         prev_recon: pycolmap.Reconstruction,
         curr_recon: pycolmap.Reconstruction,
-        output_dir: Path
+        output_dir: Path,
+        merge_idx: int = None
     ) -> Optional[pycolmap.Reconstruction]:
         """
         使用简单的置信度选择方式合并两个 reconstruction
@@ -2654,15 +3121,29 @@ class IncrementalFeatureMatcherSfM:
             prev_recon: 之前已合并的 reconstruction
             curr_recon: 当前要合并的 reconstruction
             output_dir: 输出目录
+            merge_idx: 当前要合并的 reconstruction 在 inference_reconstructions 中的索引
             
         Returns:
             合并后的 reconstruction，失败返回 None
         """
+        # 检查输入是否有效
+        if prev_recon is None:
+            if self.verbose:
+                print(f"  Warning: prev_recon is None, returning curr_recon directly")
+            return curr_recon
+        
+        if curr_recon is None:
+            if self.verbose:
+                print(f"  Warning: curr_recon is None, returning prev_recon directly")
+            return prev_recon
+        
         # 从 pixel_3d_mapping 中提取置信度图
         prev_recon_conf: Dict[int, np.ndarray] = {}
         curr_recon_conf: Dict[int, np.ndarray] = {}
         
-        num_batches = len(self.inference_reconstructions)
+        # 如果未提供 merge_idx，使用最后一个批次（兼容旧调用方式）
+        if merge_idx is None:
+            merge_idx = len(self.inference_reconstructions) - 1
         
         def extract_conf_from_pixel_3d_mapping(pixel_3d_mapping: Dict) -> Dict[int, np.ndarray]:
             """从 pixel_3d_mapping 提取 conf 信息"""
@@ -2672,19 +3153,20 @@ class IncrementalFeatureMatcherSfM:
                     conf_maps[global_idx] = data['conf']
             return conf_maps
         
-        # 前 N-1 个批次的 conf 属于 prev_recon
-        for i in range(num_batches - 1):
+        # 前 merge_idx 个批次的 conf 属于 prev_recon (索引 0 到 merge_idx-1)
+        for i in range(merge_idx):
             pixel_3d_mapping = self.inference_reconstructions[i].get('pixel_3d_mapping', {})
             batch_conf_maps = extract_conf_from_pixel_3d_mapping(pixel_3d_mapping)
             prev_recon_conf.update(batch_conf_maps)
         
-        # 最后一个批次的 conf 属于 curr_recon
-        if num_batches > 0:
-            pixel_3d_mapping = self.inference_reconstructions[-1].get('pixel_3d_mapping', {})
+        # 第 merge_idx 个批次的 conf 属于 curr_recon
+        if merge_idx < len(self.inference_reconstructions):
+            pixel_3d_mapping = self.inference_reconstructions[merge_idx].get('pixel_3d_mapping', {})
             curr_recon_conf = extract_conf_from_pixel_3d_mapping(pixel_3d_mapping)
         
         if self.verbose:
             print(f"\n=== 使用 confidence 合并 (简单置信度选择) ===")
+            print(f"    merge_idx: {merge_idx}")
             print(f"    prev_recon: {len(prev_recon.images)} images, {len(prev_recon.points3D)} 3D points")
             print(f"    curr_recon: {len(curr_recon.images)} images, {len(curr_recon.points3D)} 3D points")
             print(f"    overlap: {self.overlap} images")
@@ -2693,9 +3175,9 @@ class IncrementalFeatureMatcherSfM:
         image_name_to_idx = {ext['image_name']: idx for idx, ext in enumerate(self.ori_extrinsic)}
         
         # 获取当前批次的 start_idx 和 end_idx
-        if num_batches > 0:
-            start_idx = self.inference_reconstructions[-1].get('start_idx')
-            end_idx = self.inference_reconstructions[-1].get('end_idx')
+        if merge_idx < len(self.inference_reconstructions):
+            start_idx = self.inference_reconstructions[merge_idx].get('start_idx')
+            end_idx = self.inference_reconstructions[merge_idx].get('end_idx')
         else:
             start_idx = None
             end_idx = None
@@ -2725,6 +3207,101 @@ class IncrementalFeatureMatcherSfM:
         
         return merged_recon
     
+    def _merge_by_points_only_batch(
+        self,
+        output_dir: Path,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Dict]:
+        """
+        批量合并所有 reconstruction 的点云（points_only 模式）
+        
+        核心流程：
+        1. 第一阶段：计算所有相邻 reconstruction 对之间的关系
+        2. 第二阶段：顺序对齐所有 reconstruction 到第一个的坐标系
+        3. 第三阶段：收集所有对齐后的 3D 点，基于空间距离去重
+        4. 输出合并后的点云（不构建 Reconstruction）
+        
+        此方法应在所有 reconstruction 生成完成后调用一次。
+        
+        Args:
+            output_dir: 输出目录
+            
+        Returns:
+            merged_xyz: (N, 3) 合并后的点云坐标
+            merged_colors: (N, 3) 合并后的颜色
+            info: 合并信息字典
+        """
+        from merge.merge_points_only import merge_all_reconstructions_points_only
+        
+        # 收集所有 reconstruction
+        reconstructions = [
+            recon_data['reconstruction'] 
+            for recon_data in self.inference_reconstructions
+        ]
+        
+        if len(reconstructions) == 0:
+            if self.verbose:
+                print(f"  ✗ 没有 reconstruction 可合并")
+            return None, None, {'success': False}
+        
+        # 从 pixel_3d_mapping 中提取每个 reconstruction 的置信度图
+        def extract_conf_from_pixel_3d_mapping(pixel_3d_mapping: Dict) -> Dict[int, np.ndarray]:
+            conf_maps = {}
+            for global_idx, data in pixel_3d_mapping.items():
+                if 'conf' in data:
+                    conf_maps[global_idx] = data['conf']
+            return conf_maps
+        
+        conf_maps_list = []
+        for recon_data in self.inference_reconstructions:
+            pixel_3d_mapping = recon_data.get('pixel_3d_mapping', {})
+            conf_maps_list.append(extract_conf_from_pixel_3d_mapping(pixel_3d_mapping))
+        
+        # 构建 image_name -> global_idx 的映射
+        image_name_to_idx = {ext['image_name']: idx for idx, ext in enumerate(self.ori_extrinsic)}
+        
+        if self.verbose:
+            print(f"\n{'='*60}")
+            print(f"Points Only Batch Merge: {len(reconstructions)} reconstructions")
+            print(f"{'='*60}")
+        
+        # 设置中间结果输出目录
+        intermediate_dir = output_dir / "temp_merged_points_only"
+        intermediate_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 设置最终输出路径（放在中间结果目录中）
+        ply_output_path = intermediate_dir / "final_merged_points_only.ply"
+        
+        # 调用批量点云合并函数
+        merged_xyz, merged_colors, info = merge_all_reconstructions_points_only(
+            reconstructions=reconstructions,
+            conf_maps_list=conf_maps_list,
+            image_name_to_idx=image_name_to_idx,
+            output_path=str(ply_output_path),
+            output_intermediate_dir=str(intermediate_dir),  # 每合并一组输出一个中间结果
+            inlier_threshold=10,
+            min_inliers=5,
+            min_sample_size=5,
+            ransac_iterations=1000,
+            match_radii=[1, 2, 3, 5, 8, 10, 20, 30, 40, 50, 60],
+            k_neighbors=15,
+            dedup_threshold=0.5,  # 去重阈值 0.5 米
+            rotation_mode='full',
+            binary_ply=True,
+            verbose=self.verbose,
+        )
+        
+        if merged_xyz is None or len(merged_xyz) == 0:
+            if self.verbose:
+                print(f"  ✗ points_only 批量合并失败")
+            return None, None, info
+        
+        if self.verbose:
+            print(f"\n  ✓ points_only 批量合并完成:")
+            print(f"    输出点数: {len(merged_xyz)}")
+            print(f"    PLY 保存到: {ply_output_path}")
+        
+        return merged_xyz, merged_colors, info
+    
     def _merge_by_full_pipeline(
         self,
         prev_recon: pycolmap.Reconstruction,
@@ -2742,6 +3319,17 @@ class IncrementalFeatureMatcherSfM:
         Returns:
             合并后的 reconstruction，失败返回 None
         """
+        # 检查输入是否有效
+        if prev_recon is None:
+            if self.verbose:
+                print(f"  Warning: prev_recon is None, returning curr_recon directly")
+            return curr_recon
+        
+        if curr_recon is None:
+            if self.verbose:
+                print(f"  Warning: curr_recon is None, returning prev_recon directly")
+            return prev_recon
+        
         # 临时保存两个reconstruction到磁盘
         temp_base = self.output_dir / "temp_merge_input"
         temp_base.mkdir(parents=True, exist_ok=True)
@@ -3231,15 +3819,16 @@ class IncrementalFeatureMatcherSfM:
             gps_prior=gps_prior
         )
 
-def run_incremental_feature_matching(
+def run_hierarchical_feature_matching(
     image_paths: List[Path],
     output_dir: Path,
     reconstruction_type: str = 'each_pixel_feature_points', # 'dense_feature_points' | 'each_pixel_feature_points'
     model_type: str = 'mapanything',  # 'mapanything' | 'vggt' | 'fastvggt'
     model_path: Optional[str] = None,  # 模型权重路径（VGGT/FastVGGT需要）
     image_interval: int = 2,
-    min_images_for_scale: int = 6,
+    min_images_for_scale: int = 5,
     overlap: int = 2,
+    cleanup_keep_last_n: int = 10,  # 内存清理保留批次数: 保留最近N个批次的推理数据，建议2-4
     pred_vis_scores_thres_value: float = 0.8, 
     max_reproj_error: float = 5.0,
     max_points3D_val: int = 1000000,
@@ -3251,7 +3840,7 @@ def run_incremental_feature_matching(
     merge_statistical_filter: bool = False,  # 是否启用统计过滤
     export_georef: bool = True,  # 是否导出地理坐标系的重建结果
     target_crs: str = "auto_utm",  # 目标坐标系: "auto_utm", "EPSG:3857", "EPSG:4326", 等
-    merge_method: str = 'confidence',  # 'full' | 'confidence' | 'confidence_blend' 合并方式
+    merge_method: str = 'points_only',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only' 合并方式
     enable_visualization: bool = True,
     visualization_mode: str = 'merged',  # 'aligned' | 'merged'
     # FastVGGT 特有参数
@@ -3260,7 +3849,7 @@ def run_incremental_feature_matching(
     fastvggt_depth_conf_thresh: float = 3.0,  # FastVGGT 深度置信度阈值
     verbose: bool = False,
 ) -> bool:
-    """Run incremental image initialization pipeline.
+    """Run hierarchical image initialization pipeline.
     
     Args:
         image_paths: List of image file paths in processing order
@@ -3291,6 +3880,8 @@ def run_incremental_feature_matching(
             'confidence' - use merge_confidence.py with simple confidence-based selection
             'confidence_blend' - use merge_confidence_blend.py with confidence-based selection
                                  and smooth edge blending/interpolation (default)
+            'points_only' - use merge_points_only.py for lightweight point cloud output only
+                            (faster execution, outputs PLY directly, no track building)
         enable_visualization: Whether to start viser server for visualization
         visualization_mode: Point cloud visualization mode, 'aligned' (per batch) or 'merged' (unified)
         fastvggt_merging: FastVGGT token merging parameter (0=disabled, default)
@@ -3363,7 +3954,7 @@ def run_incremental_feature_matching(
                 print("  Warning: Failed to run global SfM")
                 return False
 
-    matcher = IncrementalFeatureMatcherSfM(
+    matcher = HierarchicalFeatureMatcherSfM(
         output_dir=output_dir,
         reconstruction_type=reconstruction_type,
         model_type=model_type,
@@ -3371,6 +3962,7 @@ def run_incremental_feature_matching(
         global_sparse_reconstruction=global_sparse_reconstruction,
         min_images_for_scale=min_images_for_scale,
         overlap=overlap,
+        cleanup_keep_last_n=cleanup_keep_last_n,
         pred_vis_scores_thres_value=pred_vis_scores_thres_value,
         max_reproj_error=max_reproj_error,
         max_points3D_val=max_points3D_val,
@@ -3389,26 +3981,53 @@ def run_incremental_feature_matching(
         verbose=verbose,
     )
 
+    # Inference images one by one
+    for i, image_path in enumerate(selected_image_paths):
+        inference_success = matcher.inference_image(image_path)
+        if not inference_success:
+            print(f"Failed to inference image: {image_path}")
+            return False
+
     # Process images one by one
     for i, image_path in enumerate(selected_image_paths):
         success = matcher.add_image(image_path)
-        
         if not success:
             print(f"Failed to process image: {image_path}")
+            return False
+
+    # Merge reconstructions (统一所有 merge_method 的循环结构)
+    num_reconstructions = len(matcher.inference_reconstructions)
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"Merging {num_reconstructions} reconstructions (method: {merge_method})...")
+        print(f"{'='*60}")
+    
+    for i in range(num_reconstructions):
+        # 使用第一张图片路径作为错误信息中的参考
+        image_path = selected_image_paths[0] if selected_image_paths else Path("unknown")
+        merge_success = matcher.merge_image(image_path)
+        if not merge_success:
+            print(f"Failed to merge reconstruction at index {i}")
             return False
 
     # Release model
     matcher._release_model()
 
     # Export georeferenced coordinates if requested
-    if export_georef and matcher.merged_reconstruction is not None:
-        if verbose:
-            print(f"\n{'='*60}")
-            print(f"Exporting to georeferenced coordinates (target_crs: {target_crs})...")
-            print(f"{'='*60}")
-        georef_success = matcher.export_georeferenced(target_crs=target_crs)
-        if not georef_success:
-            print("  Warning: Georeferenced export failed, but ENU reconstruction is still available")
+    if export_georef:
+        if merge_method == 'points_only':
+            # points_only 模式不支持地理坐标导出（没有 reconstruction 结构）
+            if verbose:
+                print(f"\n  Note: Georeferenced export is not supported in points_only mode.")
+                print(f"        Use 'confidence' or 'confidence_blend' merge_method for georeferencing.")
+        elif matcher.merged_reconstruction is not None:
+            if verbose:
+                print(f"\n{'='*60}")
+                print(f"Exporting to georeferenced coordinates (target_crs: {target_crs})...")
+                print(f"{'='*60}")
+            georef_success = matcher.export_georeferenced(target_crs=target_crs)
+            if not georef_success:
+                print("  Warning: Georeferenced export failed, but ENU reconstruction is still available")
 
     if verbose:
         stats = matcher.get_statistics()
@@ -3474,7 +4093,7 @@ if __name__ == "__main__":
     print(f"Using model: {MODEL_TYPE}")
     
     # Run incremental initialization
-    success = run_incremental_feature_matching(
+    success = run_hierarchical_feature_matching(
         image_paths=image_files,
         output_dir=output_dir,
         model_type=MODEL_TYPE,

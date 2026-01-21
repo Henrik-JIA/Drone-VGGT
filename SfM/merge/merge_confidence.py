@@ -32,7 +32,7 @@ import pycolmap
 from scipy.spatial import cKDTree
 
 # 从 merge_confidence_blend 导入基础工具函数
-from merge_confidence_blend import (
+from merge.merge_confidence_blend import (
     find_common_images,
     build_correspondences_parallel,
     build_2d_3d_correspondences,

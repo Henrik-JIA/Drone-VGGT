@@ -183,6 +183,36 @@ class SfMVisualizer:
         if self.verbose:
             print(f"  ✓ Updated merged point cloud for visualization: {num_points} points")
 
+    def update_merged_point_cloud_from_arrays(
+        self, 
+        points: np.ndarray, 
+        colors: np.ndarray
+    ):
+        """Update merged point cloud directly from numpy arrays (for points_only mode).
+        
+        This method is used by points_only merge mode where we accumulate
+        point clouds without building a full reconstruction structure.
+        
+        Args:
+            points: Point coordinates (N, 3) as float64 or float32
+            colors: Point colors (N, 3) as uint8
+        """
+        if points is None or len(points) == 0:
+            return
+        
+        # Ensure correct dtypes
+        merged_points = points.astype(np.float32) if points.dtype != np.float32 else points
+        merged_colors = colors.astype(np.uint8) if colors.dtype != np.uint8 else colors
+        
+        self.merged_point_cloud = {
+            'points': merged_points,
+            'colors': merged_colors,
+        }
+        self.merged_point_cloud_version += 1
+        
+        if self.verbose:
+            print(f"  ✓ Updated merged point cloud from arrays: {len(points)} points")
+
     def update_aligned_mode(self):
         """Update visualization in 'aligned' mode (incremental batch point clouds)."""
         if self.viser_server is None:
