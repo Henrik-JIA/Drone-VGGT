@@ -49,7 +49,7 @@ from merge.merge_confidence_blend import (
     estimate_sim3_ransac
 )
 from merge.merge_confidence import merge_two_reconstructions as merge_by_confidence
-from merge.merge_points_only import merge_all_reconstructions_points_only
+from merge.merge_points_only import merge_all_reconstructions_points_only, _voxel_dedup, save_ply_binary
 from sfm_extraction import extract_sfm_reconstruction_from_global
 from sfm_visualizer import SfMVisualizer
 from reconstruction_alignment import (
@@ -2868,8 +2868,11 @@ class IncrementalFeatureMatcherSfM:
         output_dir = self.output_dir / "temp_merged_points_only"
         output_dir.mkdir(parents=True, exist_ok=True)
         
+        # 判断是否是第一个 batch
+        is_first_batch = (self.merged_points_xyz is None or self._prev_aligned_recon is None)
+        
         # ==================== 第一个 batch：直接提取点云 ====================
-        if self.merged_points_xyz is None or self._prev_aligned_recon is None:
+        if is_first_batch:
             if self.verbose:
                 print(f"\n=== points_only 模式: 第一个 batch (batch {num_batches-1}) ===")
                 print(f"    [{curr_recon_data['start_idx']}-{curr_recon_data['end_idx']}]: "
@@ -2880,134 +2883,110 @@ class IncrementalFeatureMatcherSfM:
             
             # 保存当前 reconstruction 用于下一次对齐（深拷贝）
             self._prev_aligned_recon = pycolmap.Reconstruction(curr_recon)
-            
-            # 保存点云
-            output_path = output_dir / f"merged_{num_batches}.ply"
-            from merge.merge_points_only import save_ply_binary
-            save_ply_binary(output_path, self.merged_points_xyz, self.merged_points_colors)
-            
-            # 导出 LAS 格式
-            las_path = output_dir / f"merged_{num_batches}.las"
-            self._export_points_to_las(self.merged_points_xyz, self.merged_points_colors, str(las_path))
-            
-            # 更新可视化
-            if self.visualizer is not None:
-                self.visualizer.update_merged_point_cloud_from_arrays(
-                    self.merged_points_xyz, self.merged_points_colors
-                )
-            
-            if self.verbose:
-                print(f"  ✓ 第一个 batch 点云提取完成:")
-                print(f"    总3D点数: {len(self.merged_points_xyz)}")
-                print(f"    PLY 保存到: {output_path}")
-            
-            return True
         
         # ==================== 后续 batch：增量式对齐与合并 ====================
-        if self.verbose:
-            print(f"\n=== points_only 模式: 增量合并 batch {num_batches-1} ===")
-            print(f"    当前 batch [{curr_recon_data['start_idx']}-{curr_recon_data['end_idx']}]: "
-                  f"{len(curr_recon.images)} images, {len(curr_recon.points3D)} 3D points")
-            print(f"    已合并点数: {len(self.merged_points_xyz)}")
-        
-        # 导入必要的函数
-        from merge.merge_confidence_blend import (
-            find_common_images,
-            build_correspondences_parallel,
-            find_corresponding_3d_points,
-            estimate_sim3_ransac,
-        )
-        from merge.merge_points_only import _voxel_dedup, save_ply_binary
-        
-        # 1. 找到公共影像（通过影像名称匹配）
-        common_images = find_common_images(self._prev_aligned_recon, curr_recon)
-        
-        if len(common_images) == 0:
-            print("  ⚠ 警告: 没有找到公共影像，无法对齐")
-            print("    尝试直接合并（可能不准确）...")
-            # 直接合并（不对齐）
-            curr_xyz, curr_colors = self._extract_points_from_reconstruction(curr_recon)
-            self.merged_points_xyz = np.vstack([self.merged_points_xyz, curr_xyz])
-            self.merged_points_colors = np.vstack([self.merged_points_colors, curr_colors])
         else:
             if self.verbose:
-                print(f"    公共影像数: {len(common_images)}")
+                print(f"\n=== points_only 模式: 增量合并 batch {num_batches-1} ===")
+                print(f"    当前 batch [{curr_recon_data['start_idx']}-{curr_recon_data['end_idx']}]: "
+                      f"{len(curr_recon.images)} images, {len(curr_recon.points3D)} 3D points")
+                print(f"    已合并点数: {len(self.merged_points_xyz)}")
             
-            # 2. 构建 2D-3D 对应关系和像素映射
-            correspondences_prev, correspondences_curr, pixel_map_prev, pixel_map_curr = \
-                build_correspondences_parallel(
-                    self._prev_aligned_recon, 
-                    curr_recon, 
-                    common_images,
-                    include_track_pixels=False,
-                    verbose=self.verbose
-                )
+            # 1. 找到公共影像（通过影像名称匹配）- 使用文件顶部已导入的函数
+            common_images = find_common_images(self._prev_aligned_recon, curr_recon)
             
-            # 3. 基于像素位置找到对应的 3D 点对
-            pts_prev, pts_curr, match_info = find_corresponding_3d_points(
-                pixel_map_prev, 
-                pixel_map_curr, 
-                common_images,
-                correspondences_prev,
-                correspondences_curr,
-                verbose=self.verbose
-            )
-            
-            if len(pts_prev) < 5:
-                print(f"  ⚠ 警告: 对应点数不足 ({len(pts_prev)})，尝试直接合并...")
+            if len(common_images) == 0:
+                print("  ⚠ 警告: 没有找到公共影像，无法对齐")
+                print("    尝试直接合并（可能不准确）...")
+                # 直接合并（不对齐）
                 curr_xyz, curr_colors = self._extract_points_from_reconstruction(curr_recon)
                 self.merged_points_xyz = np.vstack([self.merged_points_xyz, curr_xyz])
                 self.merged_points_colors = np.vstack([self.merged_points_colors, curr_colors])
             else:
-                # 4. 使用 RANSAC 估计 Sim3 变换
-                R, t, scale, inlier_mask = estimate_sim3_ransac(
-                    pts_src=pts_curr,  # 源：当前 batch
-                    pts_dst=pts_prev,  # 目标：已对齐的前一个 batch
-                    max_iterations=1000,
-                    inlier_threshold=10.0,
-                    min_inliers=5,
-                    min_sample_size=5,
+                if self.verbose:
+                    print(f"    公共影像数: {len(common_images)}")
+                
+                # 2. 构建 2D-3D 对应关系和像素映射
+                correspondences_prev, correspondences_curr, pixel_map_prev, pixel_map_curr = \
+                    build_correspondences_parallel(
+                        self._prev_aligned_recon, 
+                        curr_recon, 
+                        common_images,
+                        include_track_pixels=False,
+                        verbose=self.verbose
+                    )
+                
+                # 3. 基于像素位置找到对应的 3D 点对
+                pts_prev, pts_curr, match_info = find_corresponding_3d_points(
+                    pixel_map_prev, 
+                    pixel_map_curr, 
+                    common_images,
+                    correspondences_prev,
+                    correspondences_curr,
                     verbose=self.verbose
                 )
                 
-                if R is None:
-                    print("  ⚠ 警告: Sim3 变换估计失败，尝试直接合并...")
+                if len(pts_prev) < 5:
+                    print(f"  ⚠ 警告: 对应点数不足 ({len(pts_prev)})，尝试直接合并...")
                     curr_xyz, curr_colors = self._extract_points_from_reconstruction(curr_recon)
                     self.merged_points_xyz = np.vstack([self.merged_points_xyz, curr_xyz])
                     self.merged_points_colors = np.vstack([self.merged_points_colors, curr_colors])
                 else:
-                    if self.verbose:
-                        inlier_count = inlier_mask.sum() if inlier_mask is not None else 0
-                        print(f"    Sim3 变换: scale={scale:.4f}, 内点数={inlier_count}/{len(pts_prev)}")
+                    # 4. 使用 RANSAC 估计 Sim3 变换（优化：根据点数动态调整迭代次数）
+                    n_points = len(pts_prev)
+                    # 点数少时需要更多迭代，点数多时可以减少
+                    max_iters = min(500, max(200, 1000 - n_points))
                     
-                    # 5. 将变换应用到 curr_recon
-                    sim3_transform = pycolmap.Sim3d(scale, pycolmap.Rotation3d(R), t)
-                    aligned_curr_recon = pycolmap.Reconstruction(curr_recon)
-                    aligned_curr_recon.transform(sim3_transform)
+                    R, t, scale, inlier_mask = estimate_sim3_ransac(
+                        pts_src=pts_curr,  # 源：当前 batch
+                        pts_dst=pts_prev,  # 目标：已对齐的前一个 batch
+                        max_iterations=max_iters,
+                        inlier_threshold=10.0,
+                        min_inliers=5,
+                        min_sample_size=5,
+                        verbose=self.verbose
+                    )
                     
-                    # 6. 提取对齐后的点云
-                    aligned_xyz, aligned_colors = self._extract_points_from_reconstruction(aligned_curr_recon)
-                    
-                    # 7. 合并点云
-                    self.merged_points_xyz = np.vstack([self.merged_points_xyz, aligned_xyz])
-                    self.merged_points_colors = np.vstack([self.merged_points_colors, aligned_colors])
-                    
-                    # 8. 更新 _prev_aligned_recon 为对齐后的版本
-                    self._prev_aligned_recon = aligned_curr_recon
+                    if R is None:
+                        print("  ⚠ 警告: Sim3 变换估计失败，尝试直接合并...")
+                        curr_xyz, curr_colors = self._extract_points_from_reconstruction(curr_recon)
+                        self.merged_points_xyz = np.vstack([self.merged_points_xyz, curr_xyz])
+                        self.merged_points_colors = np.vstack([self.merged_points_colors, curr_colors])
+                    else:
+                        if self.verbose:
+                            inlier_count = inlier_mask.sum() if inlier_mask is not None else 0
+                            print(f"    Sim3 变换: scale={scale:.4f}, 内点数={inlier_count}/{len(pts_prev)}")
+                        
+                        # 5. 优化：直接提取并变换点云，避免创建完整的 reconstruction 副本
+                        curr_xyz, curr_colors = self._extract_points_from_reconstruction(curr_recon)
+                        
+                        # 6. 直接使用 numpy 应用 Sim3 变换（比 pycolmap.transform 更快）
+                        aligned_xyz = scale * (curr_xyz @ R.T) + t
+                        
+                        # 7. 合并点云
+                        self.merged_points_xyz = np.vstack([self.merged_points_xyz, aligned_xyz])
+                        self.merged_points_colors = np.vstack([self.merged_points_colors, curr_colors])
+                        
+                        # 8. 更新 _prev_aligned_recon（仅当需要时才创建副本并变换）
+                        sim3_transform = pycolmap.Sim3d(scale, pycolmap.Rotation3d(R), t)
+                        self._prev_aligned_recon = pycolmap.Reconstruction(curr_recon)
+                        self._prev_aligned_recon.transform(sim3_transform)
+            
+            # ==================== 延迟体素去重（点数超过阈值时才执行）====================
+            # 优化：不是每次都去重，而是当点数超过一定阈值时才去重，减少频繁去重的开销
+            DEDUP_THRESHOLD = 500000  # 50万点后才开始去重
+            if self.merge_voxel_size > 0 and len(self.merged_points_xyz) > DEDUP_THRESHOLD:
+                before_count = len(self.merged_points_xyz)
+                self.merged_points_xyz, self.merged_points_colors = _voxel_dedup(
+                    self.merged_points_xyz, 
+                    self.merged_points_colors,
+                    voxel_size=self.merge_voxel_size,
+                    verbose=self.verbose
+                )
+                if self.verbose:
+                    print(f"    体素去重: {before_count} -> {len(self.merged_points_xyz)} 点")
         
-        # ==================== 体素去重 ====================
-        if self.merge_voxel_size > 0:
-            before_count = len(self.merged_points_xyz)
-            self.merged_points_xyz, self.merged_points_colors = _voxel_dedup(
-                self.merged_points_xyz, 
-                self.merged_points_colors,
-                voxel_size=self.merge_voxel_size,
-                verbose=self.verbose
-            )
-            if self.verbose:
-                print(f"    体素去重: {before_count} -> {len(self.merged_points_xyz)} 点")
-        
-        # ==================== 保存结果 ====================
+        # ==================== 统一保存结果 ====================
         output_path = output_dir / f"merged_{num_batches}.ply"
         save_ply_binary(output_path, self.merged_points_xyz, self.merged_points_colors)
         
@@ -3022,13 +3001,15 @@ class IncrementalFeatureMatcherSfM:
             )
         
         if self.verbose:
-            print(f"  ✓ 增量合并完成:")
+            status_msg = "第一个 batch 点云提取完成" if is_first_batch else "增量合并完成"
+            print(f"  ✓ {status_msg}:")
             print(f"    总3D点数: {len(self.merged_points_xyz)}")
             print(f"    PLY 保存到: {output_path}")
             print(f"    LAS 保存到: {las_path}")
         
-        # 清理中间数据
-        self._cleanup_intermediate_data(keep_last_n=2)
+        # 清理中间数据（仅在非第一个 batch 时执行）
+        if not is_first_batch:
+            self._cleanup_intermediate_data(keep_last_n=2)
         
         return True
     
@@ -3518,7 +3499,7 @@ def run_incremental_feature_matching(
     min_inlier_per_frame: int = 32,
     run_global_sfm_first: bool = True,
     filter_edge_margin: float = 100.0, # 边缘过滤范围（像素），默认50，设为0禁用
-    merge_voxel_size: float = 2.5,  # 点云合并时的体素大小（米）
+    merge_voxel_size: float = 1.5,  # 点云合并时的体素大小（米）
     merge_boundary_filter: bool = True,  # 是否启用边界过滤
     merge_statistical_filter: bool = False,  # 是否启用统计过滤
     export_georef: bool = True,  # 是否导出地理坐标系的重建结果
