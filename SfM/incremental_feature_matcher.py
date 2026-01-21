@@ -49,6 +49,7 @@ from merge.merge_confidence_blend import (
     estimate_sim3_ransac
 )
 from merge.merge_confidence import merge_two_reconstructions as merge_by_confidence
+from merge.merge_points_only import merge_all_reconstructions_points_only
 from sfm_extraction import extract_sfm_reconstruction_from_global
 from sfm_visualizer import SfMVisualizer
 from reconstruction_alignment import (
@@ -135,7 +136,7 @@ class IncrementalFeatureMatcherSfM:
         merge_voxel_size: float = 1.0,  # 点云合并时的体素大小（米）
         merge_boundary_filter: bool = True,  # 是否启用边界过滤
         merge_statistical_filter: bool = False,  # 是否启用统计过滤
-        merge_method: str = 'confidence_blend',  # 'full' | 'confidence' | 'confidence_blend' 合并方式
+        merge_method: str = 'confidence_blend',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only' 合并方式
         enable_visualization: bool = True,
         visualization_mode: str = 'merged',  # 'aligned' | 'merged'，点云可视化模式
         # FastVGGT 特有参数
@@ -170,6 +171,8 @@ class IncrementalFeatureMatcherSfM:
                 'confidence' - use merge_confidence.py with simple confidence-based selection
                 'confidence_blend' - use merge_confidence_blend.py with confidence-based selection 
                                      and smooth edge blending/interpolation (default)
+                'points_only' - use merge_points_only.py for lightweight point cloud only merge
+                                (no pycolmap Reconstruction, faster, outputs xyz/colors only)
             enable_visualization: Whether to start viser server for visualization
             visualization_mode: Point cloud visualization mode, 'aligned' (per batch) or 'merged' (unified)
             verbose: Enable verbose logging
@@ -247,6 +250,13 @@ class IncrementalFeatureMatcherSfM:
         self.sfm_reconstructions: List[Dict] = []  # 存储传统SfM重建结果
         self.merged_reconstruction: Optional[pycolmap.Reconstruction] = None # 每次合并后更新的重建结果
         self.recovered_inference_outputs: List[Dict] = []
+        
+        # points_only 模式专用：存储合并后的点云（不维护 Reconstruction 结构）
+        self.merged_points_xyz: Optional[np.ndarray] = None  # (N, 3) 合并后的点云坐标
+        self.merged_points_colors: Optional[np.ndarray] = None  # (N, 3) 合并后的颜色 (uint8)
+        
+        # points_only 模式：保存前一个已对齐的 reconstruction（用于增量式对齐）
+        self._prev_aligned_recon: Optional[pycolmap.Reconstruction] = None
         
         # 像素级置信度图存储在 inference_reconstructions[i]['pixel_3d_mapping'][global_idx]['conf'] 中
         # 格式: {global_image_idx: {'pts3d': (H,W,3), 'conf': (H,W), 'valid_mask': (H,W)}}
@@ -2416,15 +2426,22 @@ class IncrementalFeatureMatcherSfM:
         将最新的reconstruction与之前已合并的reconstruction合并，
         通过重叠影像进行对齐。合并结果存储在 self.merged_reconstruction 中。
         
-        支持三种合并方式 (由 self.merge_method 控制):
+        支持四种合并方式 (由 self.merge_method 控制):
         - 'full': 使用 merge_full_pipeline.py 完整流程
         - 'confidence': 使用 merge_confidence.py 简单的置信度选择合并
         - 'confidence_blend': 使用 merge_confidence_blend.py 基于置信度选择 + 重叠区边缘平滑插值过渡
+        - 'points_only': 使用 merge_points_only.py 仅合并点云（不维护 Reconstruction 结构）
         
         Returns:
             True if successful, False otherwise
         """
         
+        # ========== points_only 模式：特殊处理 ==========
+        # 每次新增 batch 时，将所有已有的 reconstruction 一起合并
+        if self.merge_method == 'points_only':
+            return self._merge_by_points_only()
+        
+        # ========== 其他模式：两两递增合并 ==========
         # 如果这是第一个reconstruction，直接设置为merged
         if len(self.inference_reconstructions) == 1:
             self.merged_reconstruction = self.inference_reconstructions[0]['reconstruction']
@@ -2796,6 +2813,261 @@ class IncrementalFeatureMatcherSfM:
         )
         
         return merged_recon  
+
+    def _extract_points_from_reconstruction(
+        self, 
+        recon: pycolmap.Reconstruction
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        从 reconstruction 中提取点云坐标和颜色
+        
+        Args:
+            recon: pycolmap.Reconstruction 对象
+            
+        Returns:
+            xyz: (N, 3) 点云坐标
+            colors: (N, 3) RGB 颜色 (uint8)
+        """
+        if len(recon.points3D) == 0:
+            return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
+        
+        xyz = np.array([pt.xyz for pt in recon.points3D.values()], dtype=np.float32)
+        colors = np.array([pt.color for pt in recon.points3D.values()], dtype=np.uint8)
+        return xyz, colors
+
+    def _merge_by_points_only(self) -> bool:
+        """
+        增量式点云合并（points_only 模式）
+        
+        实现增量式合并流程：
+        1. 第一个 batch：直接提取点云作为基础，保存 reconstruction 用于后续对齐
+        2. 后续 batch：
+           a. 与前一个已对齐的 reconstruction 对齐（通过公共影像估计 Sim3 变换）
+           b. 将变换后的点云合并到已有的 merged_points
+           c. 更新 _prev_aligned_recon 用于下一次对齐
+        
+        优势：
+        - 每次只处理新的 batch，而不是重新从头合并所有 reconstruction
+        - 更高效的内存使用和计算
+        - 支持真正的增量式处理
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        if len(self.inference_reconstructions) == 0:
+            if self.verbose:
+                print("  ✗ 没有 reconstruction 可合并")
+            return False
+        
+        # 获取当前 batch 的 reconstruction
+        curr_recon_data = self.inference_reconstructions[-1]
+        curr_recon = curr_recon_data['reconstruction']
+        
+        # 设置输出路径
+        num_batches = len(self.inference_reconstructions)
+        output_dir = self.output_dir / "temp_merged_points_only"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # ==================== 第一个 batch：直接提取点云 ====================
+        if self.merged_points_xyz is None or self._prev_aligned_recon is None:
+            if self.verbose:
+                print(f"\n=== points_only 模式: 第一个 batch (batch {num_batches-1}) ===")
+                print(f"    [{curr_recon_data['start_idx']}-{curr_recon_data['end_idx']}]: "
+                      f"{len(curr_recon.images)} images, {len(curr_recon.points3D)} 3D points")
+            
+            # 直接提取点云
+            self.merged_points_xyz, self.merged_points_colors = self._extract_points_from_reconstruction(curr_recon)
+            
+            # 保存当前 reconstruction 用于下一次对齐（深拷贝）
+            self._prev_aligned_recon = pycolmap.Reconstruction(curr_recon)
+            
+            # 保存点云
+            output_path = output_dir / f"merged_{num_batches}.ply"
+            from merge.merge_points_only import save_ply_binary
+            save_ply_binary(output_path, self.merged_points_xyz, self.merged_points_colors)
+            
+            # 导出 LAS 格式
+            las_path = output_dir / f"merged_{num_batches}.las"
+            self._export_points_to_las(self.merged_points_xyz, self.merged_points_colors, str(las_path))
+            
+            # 更新可视化
+            if self.visualizer is not None:
+                self.visualizer.update_merged_point_cloud_from_arrays(
+                    self.merged_points_xyz, self.merged_points_colors
+                )
+            
+            if self.verbose:
+                print(f"  ✓ 第一个 batch 点云提取完成:")
+                print(f"    总3D点数: {len(self.merged_points_xyz)}")
+                print(f"    PLY 保存到: {output_path}")
+            
+            return True
+        
+        # ==================== 后续 batch：增量式对齐与合并 ====================
+        if self.verbose:
+            print(f"\n=== points_only 模式: 增量合并 batch {num_batches-1} ===")
+            print(f"    当前 batch [{curr_recon_data['start_idx']}-{curr_recon_data['end_idx']}]: "
+                  f"{len(curr_recon.images)} images, {len(curr_recon.points3D)} 3D points")
+            print(f"    已合并点数: {len(self.merged_points_xyz)}")
+        
+        # 导入必要的函数
+        from merge.merge_confidence_blend import (
+            find_common_images,
+            build_correspondences_parallel,
+            find_corresponding_3d_points,
+            estimate_sim3_ransac,
+        )
+        from merge.merge_points_only import _voxel_dedup, save_ply_binary
+        
+        # 1. 找到公共影像（通过影像名称匹配）
+        common_images = find_common_images(self._prev_aligned_recon, curr_recon)
+        
+        if len(common_images) == 0:
+            print("  ⚠ 警告: 没有找到公共影像，无法对齐")
+            print("    尝试直接合并（可能不准确）...")
+            # 直接合并（不对齐）
+            curr_xyz, curr_colors = self._extract_points_from_reconstruction(curr_recon)
+            self.merged_points_xyz = np.vstack([self.merged_points_xyz, curr_xyz])
+            self.merged_points_colors = np.vstack([self.merged_points_colors, curr_colors])
+        else:
+            if self.verbose:
+                print(f"    公共影像数: {len(common_images)}")
+            
+            # 2. 构建 2D-3D 对应关系和像素映射
+            correspondences_prev, correspondences_curr, pixel_map_prev, pixel_map_curr = \
+                build_correspondences_parallel(
+                    self._prev_aligned_recon, 
+                    curr_recon, 
+                    common_images,
+                    include_track_pixels=False,
+                    verbose=self.verbose
+                )
+            
+            # 3. 基于像素位置找到对应的 3D 点对
+            pts_prev, pts_curr, match_info = find_corresponding_3d_points(
+                pixel_map_prev, 
+                pixel_map_curr, 
+                common_images,
+                correspondences_prev,
+                correspondences_curr,
+                verbose=self.verbose
+            )
+            
+            if len(pts_prev) < 5:
+                print(f"  ⚠ 警告: 对应点数不足 ({len(pts_prev)})，尝试直接合并...")
+                curr_xyz, curr_colors = self._extract_points_from_reconstruction(curr_recon)
+                self.merged_points_xyz = np.vstack([self.merged_points_xyz, curr_xyz])
+                self.merged_points_colors = np.vstack([self.merged_points_colors, curr_colors])
+            else:
+                # 4. 使用 RANSAC 估计 Sim3 变换
+                R, t, scale, inlier_mask = estimate_sim3_ransac(
+                    pts_src=pts_curr,  # 源：当前 batch
+                    pts_dst=pts_prev,  # 目标：已对齐的前一个 batch
+                    max_iterations=1000,
+                    inlier_threshold=10.0,
+                    min_inliers=5,
+                    min_sample_size=5,
+                    verbose=self.verbose
+                )
+                
+                if R is None:
+                    print("  ⚠ 警告: Sim3 变换估计失败，尝试直接合并...")
+                    curr_xyz, curr_colors = self._extract_points_from_reconstruction(curr_recon)
+                    self.merged_points_xyz = np.vstack([self.merged_points_xyz, curr_xyz])
+                    self.merged_points_colors = np.vstack([self.merged_points_colors, curr_colors])
+                else:
+                    if self.verbose:
+                        inlier_count = inlier_mask.sum() if inlier_mask is not None else 0
+                        print(f"    Sim3 变换: scale={scale:.4f}, 内点数={inlier_count}/{len(pts_prev)}")
+                    
+                    # 5. 将变换应用到 curr_recon
+                    sim3_transform = pycolmap.Sim3d(scale, pycolmap.Rotation3d(R), t)
+                    aligned_curr_recon = pycolmap.Reconstruction(curr_recon)
+                    aligned_curr_recon.transform(sim3_transform)
+                    
+                    # 6. 提取对齐后的点云
+                    aligned_xyz, aligned_colors = self._extract_points_from_reconstruction(aligned_curr_recon)
+                    
+                    # 7. 合并点云
+                    self.merged_points_xyz = np.vstack([self.merged_points_xyz, aligned_xyz])
+                    self.merged_points_colors = np.vstack([self.merged_points_colors, aligned_colors])
+                    
+                    # 8. 更新 _prev_aligned_recon 为对齐后的版本
+                    self._prev_aligned_recon = aligned_curr_recon
+        
+        # ==================== 体素去重 ====================
+        if self.merge_voxel_size > 0:
+            before_count = len(self.merged_points_xyz)
+            self.merged_points_xyz, self.merged_points_colors = _voxel_dedup(
+                self.merged_points_xyz, 
+                self.merged_points_colors,
+                voxel_size=self.merge_voxel_size,
+                verbose=self.verbose
+            )
+            if self.verbose:
+                print(f"    体素去重: {before_count} -> {len(self.merged_points_xyz)} 点")
+        
+        # ==================== 保存结果 ====================
+        output_path = output_dir / f"merged_{num_batches}.ply"
+        save_ply_binary(output_path, self.merged_points_xyz, self.merged_points_colors)
+        
+        # 导出 LAS 格式
+        las_path = output_dir / f"merged_{num_batches}.las"
+        self._export_points_to_las(self.merged_points_xyz, self.merged_points_colors, str(las_path))
+        
+        # 更新可视化
+        if self.visualizer is not None:
+            self.visualizer.update_merged_point_cloud_from_arrays(
+                self.merged_points_xyz, self.merged_points_colors
+            )
+        
+        if self.verbose:
+            print(f"  ✓ 增量合并完成:")
+            print(f"    总3D点数: {len(self.merged_points_xyz)}")
+            print(f"    PLY 保存到: {output_path}")
+            print(f"    LAS 保存到: {las_path}")
+        
+        # 清理中间数据
+        self._cleanup_intermediate_data(keep_last_n=2)
+        
+        return True
+    
+    def _export_points_to_las(
+        self, 
+        xyz: np.ndarray, 
+        colors: np.ndarray, 
+        output_path: str
+    ) -> None:
+        """
+        将点云坐标和颜色导出为 LAS 格式
+        
+        Args:
+            xyz: (N, 3) 点云坐标
+            colors: (N, 3) RGB 颜色 (uint8)
+            output_path: 输出的 .las 文件路径
+        """
+        if len(xyz) == 0:
+            return
+            
+        # 创建LAS文件
+        header = laspy.LasHeader(point_format=3, version="1.2")
+        header.offsets = np.min(xyz, axis=0)
+        header.scales = np.array([0.001, 0.001, 0.001])  # 1mm精度
+        
+        las = laspy.LasData(header)
+        
+        # 设置坐标
+        las.x = xyz[:, 0]
+        las.y = xyz[:, 1]
+        las.z = xyz[:, 2]
+        
+        # 设置颜色 (LAS使用16位颜色值)
+        las.red = (colors[:, 0].astype(np.uint16) * 256)
+        las.green = (colors[:, 1].astype(np.uint16) * 256)
+        las.blue = (colors[:, 2].astype(np.uint16) * 256)
+        
+        # 写入文件
+        las.write(output_path)
 
     def _align_merged_reconstruction_to_gps_poses(
         self,
@@ -3251,7 +3523,7 @@ def run_incremental_feature_matching(
     merge_statistical_filter: bool = False,  # 是否启用统计过滤
     export_georef: bool = True,  # 是否导出地理坐标系的重建结果
     target_crs: str = "auto_utm",  # 目标坐标系: "auto_utm", "EPSG:3857", "EPSG:4326", 等
-    merge_method: str = 'confidence',  # 'full' | 'confidence' | 'confidence_blend' 合并方式
+    merge_method: str = 'points_only',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only' 合并方式
     enable_visualization: bool = True,
     visualization_mode: str = 'merged',  # 'aligned' | 'merged'
     # FastVGGT 特有参数
@@ -3291,6 +3563,8 @@ def run_incremental_feature_matching(
             'confidence' - use merge_confidence.py with simple confidence-based selection
             'confidence_blend' - use merge_confidence_blend.py with confidence-based selection
                                  and smooth edge blending/interpolation (default)
+            'points_only' - use merge_points_only.py for lightweight point cloud only merge
+                            (no pycolmap Reconstruction, faster, outputs xyz/colors only)
         enable_visualization: Whether to start viser server for visualization
         visualization_mode: Point cloud visualization mode, 'aligned' (per batch) or 'merged' (unified)
         fastvggt_merging: FastVGGT token merging parameter (0=disabled, default)
@@ -3401,14 +3675,21 @@ def run_incremental_feature_matching(
     matcher._release_model()
 
     # Export georeferenced coordinates if requested
-    if export_georef and matcher.merged_reconstruction is not None:
-        if verbose:
-            print(f"\n{'='*60}")
-            print(f"Exporting to georeferenced coordinates (target_crs: {target_crs})...")
-            print(f"{'='*60}")
-        georef_success = matcher.export_georeferenced(target_crs=target_crs)
-        if not georef_success:
-            print("  Warning: Georeferenced export failed, but ENU reconstruction is still available")
+    if export_georef:
+        if matcher.merged_reconstruction is not None:
+            if verbose:
+                print(f"\n{'='*60}")
+                print(f"Exporting to georeferenced coordinates (target_crs: {target_crs})...")
+                print(f"{'='*60}")
+            georef_success = matcher.export_georeferenced(target_crs=target_crs)
+            if not georef_success:
+                print("  Warning: Georeferenced export failed, but ENU reconstruction is still available")
+        elif merge_method == 'points_only' and matcher.merged_points_xyz is not None:
+            if verbose:
+                print(f"\n{'='*60}")
+                print(f"Note: Georeferenced export is not supported in 'points_only' mode.")
+                print(f"Point cloud has been saved to: {output_dir / 'temp_merged_points_only'}")
+                print(f"{'='*60}")
 
     if verbose:
         stats = matcher.get_statistics()
