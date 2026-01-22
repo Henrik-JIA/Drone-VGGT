@@ -2957,20 +2957,38 @@ class IncrementalFeatureMatcherSfM:
                             inlier_count = inlier_mask.sum() if inlier_mask is not None else 0
                             print(f"    Sim3 变换: scale={scale:.4f}, 内点数={inlier_count}/{len(pts_prev)}")
                         
-                        # 5. 优化：直接提取并变换点云，避免创建完整的 reconstruction 副本
-                        curr_xyz, curr_colors = self._extract_points_from_reconstruction(curr_recon)
-                        
-                        # 6. 直接使用 numpy 应用 Sim3 变换（比 pycolmap.transform 更快）
-                        aligned_xyz = scale * (curr_xyz @ R.T) + t
-                        
-                        # 7. 合并点云
-                        self.merged_points_xyz = np.vstack([self.merged_points_xyz, aligned_xyz])
-                        self.merged_points_colors = np.vstack([self.merged_points_colors, curr_colors])
-                        
-                        # 8. 更新 _prev_aligned_recon（仅当需要时才创建副本并变换）
+                        # 5. 对齐当前 batch 的 reconstruction
                         sim3_transform = pycolmap.Sim3d(scale, pycolmap.Rotation3d(R), t)
-                        self._prev_aligned_recon = pycolmap.Reconstruction(curr_recon)
-                        self._prev_aligned_recon.transform(sim3_transform)
+                        curr_recon_aligned = pycolmap.Reconstruction(curr_recon)
+                        curr_recon_aligned.transform(sim3_transform)
+                        
+                        # 6. 识别重叠区的点并只添加非重叠的点
+                        matched_curr_pt3d_ids = self._find_matched_points(
+                            pixel_map_prev, pixel_map_curr, common_images
+                        )
+                        
+                        # 7. 只添加未匹配的点（非重叠区的点）
+                        new_xyz = []
+                        new_colors = []
+                        for pt3d_id, pt3d in curr_recon_aligned.points3D.items():
+                            if pt3d_id not in matched_curr_pt3d_ids:
+                                new_xyz.append(pt3d.xyz)
+                                new_colors.append(pt3d.color)
+                        
+                        if len(new_xyz) > 0:
+                            new_xyz = np.array(new_xyz, dtype=np.float32)
+                            new_colors = np.array(new_colors, dtype=np.uint8)
+                            self.merged_points_xyz = np.vstack([self.merged_points_xyz, new_xyz])
+                            self.merged_points_colors = np.vstack([self.merged_points_colors, new_colors])
+                        
+                        if self.verbose:
+                            total_curr = len(curr_recon_aligned.points3D)
+                            matched_count = len(matched_curr_pt3d_ids)
+                            added_count = len(new_xyz) if len(new_xyz) > 0 else 0
+                            print(f"    点云融合: 当前batch共{total_curr}点, 重叠区{matched_count}点(跳过), 非重叠区{added_count}点(添加)")
+                        
+                        # 8. 更新 _prev_aligned_recon
+                        self._prev_aligned_recon = curr_recon_aligned
             
             # ==================== 延迟体素去重（点数超过阈值时才执行）====================
             # 优化：不是每次都去重，而是当点数超过一定阈值时才去重，减少频繁去重的开销
@@ -3012,6 +3030,59 @@ class IncrementalFeatureMatcherSfM:
             self._cleanup_intermediate_data(keep_last_n=2)
         
         return True
+    
+    def _find_matched_points(
+        self,
+        pixel_map_prev: Dict,
+        pixel_map_curr: Dict,
+        common_images: Dict[int, int],
+        match_radius: float = 60.0,
+    ) -> set:
+        """
+        使用 2D 像素匹配识别 curr 中与 prev 重叠的 3D 点
+        
+        Args:
+            pixel_map_prev: prev_recon 的像素映射
+            pixel_map_curr: curr_recon 的像素映射
+            common_images: 公共影像映射 {prev_img_id: curr_img_id}
+            match_radius: 像素匹配半径（默认 60 像素）
+            
+        Returns:
+            matched_curr_pt3d_ids: curr 中与 prev 匹配的 point3D_id 集合
+        """
+        from scipy.spatial import cKDTree
+        
+        matched_curr_pt3d_ids = set()
+        
+        for prev_img_id, curr_img_id in common_images.items():
+            pmap_prev = pixel_map_prev.get(prev_img_id)
+            pmap_curr = pixel_map_curr.get(curr_img_id)
+            
+            if pmap_prev is None or pmap_curr is None or len(pmap_prev) == 0 or len(pmap_curr) == 0:
+                continue
+            
+            # 构建 KD-Tree 进行像素匹配
+            pixels_prev_list = list(pmap_prev.keys())
+            pixels_curr_list = list(pmap_curr.keys())
+            
+            if len(pixels_curr_list) == 0 or len(pixels_prev_list) == 0:
+                continue
+            
+            # 用 prev 的像素查询 curr 的像素
+            tree_curr = cKDTree(np.asarray(pixels_curr_list, dtype=np.float32))
+            pixels_prev_arr = np.asarray(pixels_prev_list, dtype=np.float32)
+            
+            # 查询最近邻
+            distances, indices = tree_curr.query(pixels_prev_arr, k=1, distance_upper_bound=match_radius)
+            
+            # 收集匹配的 curr 点
+            for i, (dist, idx) in enumerate(zip(distances, indices)):
+                if dist <= match_radius and idx < len(pixels_curr_list):
+                    pixel_key_curr = pixels_curr_list[idx]
+                    pt3d_id_curr = pmap_curr[pixel_key_curr]['point3D_id']
+                    matched_curr_pt3d_ids.add(pt3d_id_curr)
+        
+        return matched_curr_pt3d_ids
     
     def _export_points_to_las(
         self, 
@@ -3504,7 +3575,7 @@ def run_incremental_feature_matching(
     merge_statistical_filter: bool = False,  # 是否启用统计过滤
     export_georef: bool = True,  # 是否导出地理坐标系的重建结果
     target_crs: str = "auto_utm",  # 目标坐标系: "auto_utm", "EPSG:3857", "EPSG:4326", 等
-    merge_method: str = 'points_only',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only' 合并方式
+    merge_method: str = 'confidence',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only' 合并方式
     enable_visualization: bool = True,
     visualization_mode: str = 'merged',  # 'aligned' | 'merged'
     # FastVGGT 特有参数
@@ -3692,8 +3763,8 @@ if __name__ == "__main__":
     # input_dir = Path(r"drone-map-anything\examples\Comprehensive_building_sel\images")
     # output_dir = Path(r"drone-map-anything\output\Comprehensive_building_sel\sparse_incremental_reconstruction")
     
-    # input_dir = Path(r"drone-map-anything\examples\Ganluo_images\images")
-    # output_dir = Path(r"drone-map-anything\output\Ganluo_images\sparse_incremental_reconstruction")
+    input_dir = Path(r"drone-map-anything\examples\Ganluo_images\images")
+    output_dir = Path(r"drone-map-anything\output\Ganluo_images\sparse_incremental_reconstruction")
     
     # input_dir = Path(r"drone-map-anything\examples\Tazishan\images")
     # output_dir = Path(r"drone-map-anything\output\Tazishan\sparse_incremental_reconstruction")
@@ -3707,8 +3778,8 @@ if __name__ == "__main__":
     # input_dir = Path(r"drone-map-anything\examples\HuaPo\images")
     # output_dir = Path(r"drone-map-anything\output\HuaPo\sparse_incremental_reconstruction")
 
-    input_dir = Path(r"drone-map-anything\examples\WenChuan\images")
-    output_dir = Path(r"drone-map-anything\output\WenChuan\sparse_incremental_reconstruction")
+    # input_dir = Path(r"drone-map-anything\examples\WenChuan\images")
+    # output_dir = Path(r"drone-map-anything\output\WenChuan\sparse_incremental_reconstruction")
 
     # 模型选择: 'mapanything', 'vggt', 或 'fastvggt'
     MODEL_TYPE = 'vggt'  # 切换模型类型: 'mapanything' | 'vggt' | 'fastvggt'

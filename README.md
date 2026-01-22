@@ -1,584 +1,530 @@
 <div align="center">
-<h1>MapAnything: Universal Feed-Forward Metric <br>3D Reconstruction</h1>
-<a href="https://map-anything.github.io/assets/MapAnything.pdf"><img src="https://img.shields.io/badge/Paper-blue" alt="Paper"></a>
-<a href="https://arxiv.org/abs/2509.13414"><img src="https://img.shields.io/badge/arXiv-2509.13414-b31b1b" alt="arXiv"></a>
-<a href="https://map-anything.github.io/"><img src="https://img.shields.io/badge/Project_Page-green" alt="Project Page"></a>
-<a href="https://x.com/Nik__V__/status/1968316841618518371"><img src="https://img.shields.io/badge/X_Thread-1DA1F2" alt="X Thread"></a>
-<a href="https://huggingface.co/spaces/facebook/map-anything"><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Demo-blue'></a>
-<br>
-<br>
-<strong>
-<a href="https://nik-v9.github.io/">Nikhil Keetha<sup>1,2</sup></a>
-&nbsp;&nbsp;
-<a href="https://sirwyver.github.io/">Norman Müller<sup>1</sup></a>
-&nbsp;&nbsp;
-<a href="https://demuc.de/">Johannes Schönberger<sup>1</sup></a>
-&nbsp;&nbsp;
-<a href="https://www.linkedin.com/in/lorenzoporzi">Lorenzo Porzi<sup>1</sup></a>
-&nbsp;&nbsp;
-<a href="https://infinity1096.github.io/">Yuchen Zhang<sup>2</sup></a>
-<br>
-<a href="https://tobiasfshr.github.io/">Tobias Fischer<sup>1</sup></a>
-&nbsp;&nbsp;
-<a href="https://www.linkedin.com/in/arno-knapitsch">Arno Knapitsch<sup>1</sup></a>
-&nbsp;&nbsp;
-<a href="https://www.linkedin.com/in/duncan-zauss">Duncan Zauss<sup>1</sup></a>
-&nbsp;&nbsp;
-<a href="https://ethanweber.me/">Ethan Weber<sup>1</sup></a>
-&nbsp;&nbsp;
-<a href="https://www.linkedin.com/in/nelsonantunes7">Nelson Antunes<sup>1</sup></a>
-<br>
-<a href="https://x.com/jonathonluiten?lang=en">Jonathon Luiten<sup>1</sup></a>
-&nbsp;&nbsp;
-<a href="https://m.lopezantequera.com/">Manuel Lopez-Antequera<sup>1</sup></a>
-&nbsp;&nbsp;
-<a href="https://scholar.google.com/citations?user=484sccEAAAAJ">Samuel Rota Bulò<sup>1</sup></a>
-&nbsp;&nbsp;
-<a href="https://richardt.name/">Christian Richardt<sup>1</sup></a>
-<br>
-<a href="https://www.cs.cmu.edu/~deva/">Deva Ramanan<sup>2</sup></a>
-&nbsp;&nbsp;
-<a href="https://theairlab.org/team/sebastian/">Sebastian Scherer<sup>2</sup></a>
-&nbsp;&nbsp;
-<a href="https://www.linkedin.com/in/peter-kontschieder-2a6410134">Peter Kontschieder<sup>1</sup></a>
-<br>
-<br>
-<sup>1</sup> Meta &nbsp;&nbsp;
-<sup>2</sup> Carnegie Mellon University
-</strong>
+
+# Drone-Map-Anything
+
+**基于视觉基础模型推理的无人机影像增量式 3D 重建系统**
+
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)](https://pytorch.org/)
+[![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
 
 </div>
 
-## Overview
+## 概述
 
-MapAnything is a simple, end-to-end trained transformer model that directly regresses the factored metric 3D geometry of a scene given various types of inputs (images, calibration, poses, or depth). A single feed-forward model supports over 12 different 3D reconstruction tasks including multi-image sfm, multi-view stereo, monocular metric depth estimation, registration, depth completion and more.
+Drone-Map-Anything 是一个专为无人机航拍影像设计的增量式 3D 重建系统。系统支持多种深度学习模型（MapAnything、VGGT、FastVGGT），实现了高效的增量式点云重建和合并，并支持实时可视化和地理坐标导出。
 
-![Overview](./assets/teaser.png)
+![记录03推理密集点云Ganluo](./assets/记录03推理密集点云Ganluo.gif)
 
-## Table of Contents
+### 主要特性
 
-- [Quick Start](#quick-start)
-  - [Installation](#installation)
-  - [Image-Only Inference](#image-only-inference)
-  - [Multi-Modal Inference](#multi-modal-inference)
-- [Interactive Demos](#interactive-demos)
-  - [Online Demo](#online-demo)
-  - [Local Gradio Demo](#local-gradio-demo)
-  - [Rerun Demo](#rerun-demo)
-  - [Demo Inference on COLMAP outputs](#demo-inference-on-colmap-outputs)
-- [COLMAP & GSplat Support](#colmap--gsplat-support)
-  - [Exporting to COLMAP Format](#exporting-to-colmap-format)
-  - [Integration with Gaussian Splatting](#integration-with-gaussian-splatting)
-- [Data Processing for Training & Benchmarking](#data-processing-for-training--benchmarking)
-- [Training](#training)
-- [Benchmarking](#benchmarking)
-- [Code License](#code-license)
-- [Models](#models)
-- [Building Blocks for MapAnything](#building-blocks-for-mapanything)
-- [Acknowledgments](#acknowledgments)
-- [Citation](#citation)
+- 🚀 **增量式处理**：逐张添加影像，实时更新重建结果
+- 🧠 **多模型支持**：MapAnything、VGGT、FastVGGT 三种模型可选
+- 🔗 **智能点云合并**：四种合并策略（full、confidence、confidence_blend、points_only）
+- 🌍 **地理坐标导出**：自动检测 UTM 区域，支持多种坐标系导出
+- 👁️ **实时可视化**：基于 Viser 的 3D 点云和相机位姿可视化
+- 📊 **GPS/XMP 元数据**：自动从无人机影像中提取位姿信息
 
-## Quick Start
+## 目录
 
-### Installation
+- [安装](#安装)
+- [快速开始](#快速开始)
+- [核心功能](#核心功能)
+  - [增量式重建流程](#增量式重建流程)
+  - [模型选择](#模型选择)
+  - [点云合并方法](#点云合并方法)
+- [API 参考](#api-参考)
+- [配置参数](#配置参数)
+- [输出格式](#输出格式)
+- [示例数据集](#示例数据集)
+- [致谢](#致谢)
+
+## 安装
+
+### 环境要求
+
+- Python 3.10 - 3.11
+- PyTorch 2.3.1
+- CUDA 11.8
+- [Pixi](https://pixi.sh/) (推荐) 或 Conda
+
+### 方式一：使用 Pixi 安装（推荐）
+
+[Pixi](https://pixi.sh/) 是一个现代化的包管理器，能够自动处理 Conda 和 PyPI 依赖。
 
 ```bash
-git clone https://github.com/facebookresearch/map-anything.git
-cd map-anything
+# 1. 安装 Pixi (如果尚未安装)
+# Windows (PowerShell)
+iwr -useb https://pixi.sh/install.ps1 | iex
 
-# Create and activate conda environment
-conda create -n mapanything python=3.12 -y
-conda activate mapanything
+# Linux/macOS
+curl -fsSL https://pixi.sh/install.sh | bash
 
-# Optional: Install torch, torchvision & torchaudio specific to your system
-# Install MapAnything
+# 2. 克隆仓库
+git clone https://github.com/your-repo/drone-map-anything.git
+cd drone-map-anything
+
+# 3. 一键安装所有依赖并激活环境
+pixi install
+
+# 4. 完整安装（包括本地包和第三方子模块）
+pixi run setup
+
+# 5. 激活环境
+pixi shell
+```
+
+#### Pixi 常用命令
+
+```bash
+# 查看环境信息（PyTorch 版本、CUDA 状态等）
+pixi run info
+
+# 运行增量 SfM 重建
+pixi run run-sfm
+
+# 运行 Delaunay 网格化
+pixi run run-mesh
+
+# 生成 DSM
+pixi run run-dsm
+
+# 代码格式检查
+pixi run lint
+pixi run format
+```
+
+#### Pixi 环境说明
+
+项目提供了三种预配置环境：
+
+| 环境 | 说明 | 激活命令 |
+|------|------|---------|
+| `default` | 完整环境，包含所有功能 | `pixi shell` |
+| `dev` | 开发环境，包含测试工具 | `pixi shell -e dev` |
+| `minimal` | 最小环境，仅核心依赖 | `pixi shell -e minimal` |
+
+### 方式二：使用 Conda/Pip 安装
+
+```bash
+# 克隆仓库
+git clone https://github.com/your-repo/drone-map-anything.git
+cd drone-map-anything
+
+# 创建 conda 环境
+conda create -n drone-map python=3.11 -y
+conda activate drone-map
+
+# 安装 PyTorch (CUDA 11.8)
+pip install torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 --index-url https://download.pytorch.org/whl/cu118
+
+# 安装项目依赖
 pip install -e .
 
-# For all optional dependencies
-# See pyproject.toml for more details
+# 安装可选依赖 (可视化、地理坐标导出等)
 pip install -e ".[all]"
-pre-commit install
+
+# 安装第三方子模块
+pip install -e third/vggt --no-deps
+pip install -e third/fastvggt --no-deps
+pip install git+https://github.com/cvg/LightGlue.git --no-deps
 ```
 
-Note that we don't pin a specific version of PyTorch or CUDA in our requirements. Please feel free to install PyTorch based on your specific system.
+### 模型权重
 
-### Image-Only Inference
+根据选择的模型类型，下载相应的权重：
 
-For metric 3D reconstruction from images without additional geometric inputs:
+| 模型 | 权重路径 | 下载地址 |
+|------|---------|---------|
+| MapAnything | 自动从 HuggingFace 下载 | [facebook/map-anything](https://huggingface.co/facebook/map-anything) |
+| VGGT | `weights/vggt/model.pt` | [VGGT 官方仓库](https://github.com/facebookresearch/vggt) |
+| FastVGGT | `weights/fastvggt/model_tracker_fixed_e20.pt` | 联系作者获取 |
+
+## 快速开始
+
+### 基础用法
 
 ```python
-# Optional config for better memory efficiency
-import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+from pathlib import Path
+from SfM.incremental_feature_matcher import run_incremental_feature_matching
 
-# Required imports
-import torch
-from mapanything.models import MapAnything
-from mapanything.utils.image import load_images
+# 配置输入输出路径
+input_dir = Path("examples/your_drone_images/images")
+output_dir = Path("output/your_project")
 
-# Get inference device
-device = "cuda" if torch.cuda.is_available() else "cpu"
+# 获取所有影像文件
+image_files = sorted(input_dir.glob("*.JPG"))
 
-# Init model - This requires internet access or the huggingface hub cache to be pre-downloaded
-# For Apache 2.0 license model, use "facebook/map-anything-apache"
-model = MapAnything.from_pretrained("facebook/map-anything").to(device)
-
-# Load and preprocess images from a folder or list of paths
-images = "path/to/your/images/"  # or ["path/to/img1.jpg", "path/to/img2.jpg", ...]
-views = load_images(images)
-
-# Run inference
-predictions = model.infer(
-    views,                            # Input views
-    memory_efficient_inference=False, # Trades off speed for more views (up to 2000 views on 140 GB)
-    use_amp=True,                     # Use mixed precision inference (recommended)
-    amp_dtype="bf16",                 # bf16 inference (recommended; falls back to fp16 if bf16 not supported)
-    apply_mask=True,                  # Apply masking to dense geometry outputs
-    mask_edges=True,                  # Remove edge artifacts by using normals and depth
-    apply_confidence_mask=False,      # Filter low-confidence regions
-    confidence_percentile=10,         # Remove bottom 10 percentile confidence pixels
+# 运行增量式重建
+success = run_incremental_feature_matching(
+    image_paths=image_files,
+    output_dir=output_dir,
+    model_type='mapanything',      # 'mapanything' | 'vggt' | 'fastvggt'
+    min_images_for_scale=6,        # 每批次处理的影像数量
+    overlap=2,                     # 批次间的重叠影像数
+    merge_method='confidence',     # 点云合并方法
+    enable_visualization=True,     # 启用实时可视化
+    export_georef=True,            # 导出地理坐标
+    verbose=True,
 )
-
-# Access results for each view - Complete list of metric outputs
-for i, pred in enumerate(predictions):
-    # Geometry outputs
-    pts3d = pred["pts3d"]                     # 3D points in world coordinates (B, H, W, 3)
-    pts3d_cam = pred["pts3d_cam"]             # 3D points in camera coordinates (B, H, W, 3)
-    depth_z = pred["depth_z"]                 # Z-depth in camera frame (B, H, W, 1)
-    depth_along_ray = pred["depth_along_ray"] # Depth along ray in camera frame (B, H, W, 1)
-
-    # Camera outputs
-    ray_directions = pred["ray_directions"]   # Ray directions in camera frame (B, H, W, 3)
-    intrinsics = pred["intrinsics"]           # Recovered pinhole camera intrinsics (B, 3, 3)
-    camera_poses = pred["camera_poses"]       # OpenCV (+X - Right, +Y - Down, +Z - Forward) cam2world poses in world frame (B, 4, 4)
-    cam_trans = pred["cam_trans"]             # OpenCV (+X - Right, +Y - Down, +Z - Forward) cam2world translation in world frame (B, 3)
-    cam_quats = pred["cam_quats"]             # OpenCV (+X - Right, +Y - Down, +Z - Forward) cam2world quaternion in world frame (B, 4)
-
-    # Quality and masking
-    confidence = pred["conf"]                 # Per-pixel confidence scores (B, H, W)
-    mask = pred["mask"]                       # Combined validity mask (B, H, W, 1)
-    non_ambiguous_mask = pred["non_ambiguous_mask"]                # Non-ambiguous regions (B, H, W)
-    non_ambiguous_mask_logits = pred["non_ambiguous_mask_logits"]  # Mask logits (B, H, W)
-
-    # Scaling
-    metric_scaling_factor = pred["metric_scaling_factor"]  # Applied metric scaling (B,)
-
-    # Original input
-    img_no_norm = pred["img_no_norm"]         # Denormalized input images for visualization (B, H, W, 3)
 ```
 
-### Multi-Modal Inference
+### 命令行运行
 
-MapAnything supports flexible combinations of geometric inputs for enhanced metric reconstruction. Steps to try it out:
-
-**Initialize the model:**
-
-```python
-# Optional config for better memory efficiency
-import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
-# Required imports
-import torch
-from mapanything.models import MapAnything
-
-# Get inference device
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
-# Init model - This requires internet access or the huggingface hub cache to be pre-downloaded
-# For Apache 2.0 license model, use "facebook/map-anything-apache"
-model = MapAnything.from_pretrained("facebook/map-anything").to(device)
+```bash
+# 直接运行主脚本
+python SfM/incremental_feature_matcher.py
 ```
 
-**Initialize the inputs:**
+修改脚本底部的配置参数来处理你自己的数据集：
 
 ```python
-# MapAnything is extremely flexible and supports any combination of inputs.
-views_example = [
-    {
-        # View 0: Images + Calibration
-        "img": image, # (H, W, 3) - [0, 255]
-        "intrinsics": intrinsics, # (3, 3)
-    },
-    {
-        # View 1: Images + Calibration + Depth
-        "img": image, # (H, W, 3) - [0, 255]
-        "intrinsics": intrinsics, # (3, 3)
-        "depth_z": depth_z, # (H, W)
-        "is_metric_scale": torch.tensor([True], device=device), # (1,)
-    },
-    {
-        # View 2: Images + Calibration + Depth + Pose
-        "img": image, # (H, W, 3) - [0, 255]
-        "intrinsics": intrinsics, # (3, 3)
-        "depth_z": depth_z, # (H, W)
-        "camera_poses": camera_poses, # (4, 4) or tuple of (quats, trans) in OpenCV cam2world convention
-        "is_metric_scale": torch.tensor([True], device=device), # (1,)
-    },
-    ...
-]
+# 在 if __name__ == "__main__": 部分修改
+input_dir = Path(r"your/image/folder/images")
+output_dir = Path(r"your/output/folder")
+MODEL_TYPE = 'vggt'  # 选择模型
 ```
 
-Note that MapAnything expects the input camera poses to follow the OpenCV (+X - Right, +Y - Down, +Z - Forward) cam2world convention.
+## 核心功能
 
-<!-- TODO: We provide a helper function `mapanything.utils.geometry.convert_cam_convention` to convert from other conventions to OpenCV (see the function in [geometry utils](./mapanything/utils/geometry.py) for more details). -->
+### 增量式重建流程
 
-<details>
-<summary>Expand to show more examples</summary>
+系统采用增量式处理策略，将大量影像分批处理，显著降低内存消耗：
 
-```python
-# Example 1: Images + Camera Intrinsics
-views_example = [
-    {
-        "img": image_tensor,  # (H, W, 3) - [0, 255]
-        "intrinsics": intrinsics_tensor,  # (3, 3)
-    },
-    ...
-]
-
-# Example 2: Images + Intrinsics + Depth
-views_example = [
-    {
-        "img": image_tensor, # (H, W, 3) - [0, 255]
-        "intrinsics": intrinsics_tensor, # (3, 3)
-        "depth_z": depth_tensor,  # (H, W)
-        "is_metric_scale": torch.tensor([True]), # (1,)
-    },
-    ...
-]
-
-# Example 3: Images + Intrinsics + Camera Poses
-views_example = [
-    {
-        "img": image_tensor, # (H, W, 3) - [0, 255]
-        "intrinsics": intrinsics_tensor, # (3, 3)
-        "camera_poses": pose_matrices,  # (4, 4) or tuple of (quats, trans) in OpenCV cam2world convention
-        "is_metric_scale": torch.tensor([True]), # (1,)
-    },
-    ...
-]
-
-# Example 4: Images + Ray Directions + Depth (alternative to intrinsics)
-views_example = [
-    {
-        "img": image_tensor, # (H, W, 3) - [0, 255]
-        "ray_directions": ray_dirs_tensor,  # (H, W, 3)
-        "depth_z": depth_tensor, # (H, W)
-    }
-    ...
-]
-
-# Example 5: Full Multi-Modal (Images + Intrinsics + Depth + Poses)
-views_example = [
-    {
-        "img": image_tensor, # (H, W, 3) - [0, 255]
-        "intrinsics": intrinsics_tensor, # (3, 3)
-        "depth_z": depth_tensor, # (H, W)
-        "camera_poses": pose_matrices, # (4, 4) or tuple of (quats, trans) in OpenCV cam2world convention
-        "is_metric_scale": torch.tensor([True]), # (1,)
-    }
-    ...
-]
-
-# Example 6: Adaptive Mixed Inputs
-views_example = [
-    {
-        # View 0: Images + Pose
-        "img": images, # (H, W, 3) - [0, 255]
-        "camera_poses": camera_poses, # (4, 4) or tuple of (quats, trans) in OpenCV cam2world convention
-    },
-    {
-        # View 1: Images + Calibration
-        "img": images, # (H, W, 3) - [0, 255]
-        "intrinsics": intrinsics, # (3, 3)
-    },
-    {
-        # View 2: Images + Calibration + Depth
-        "img": images, # (H, W, 3) - [0, 255]
-        "intrinsics": intrinsics, # (3, 3)
-        "depth_z": depth_z, # (H, W)
-        "is_metric_scale": torch.tensor([True], device=device), # (1,)
-    },
-    {
-        # View 3: Images + Calibration + Depth + Pose
-        "img": images, # (H, W, 3) - [0, 255]
-        "intrinsics": intrinsics, # (3, 3)
-        "depth_z": depth_z, # (H, W)
-        "camera_poses": camera_poses, # (4, 4) or tuple of (quats, trans) in OpenCV cam2world convention
-        "is_metric_scale": torch.tensor([True], device=device), # (1,)
-    },
-    ...
-]
 ```
-</details>
+┌─────────────────────────────────────────────────────────────┐
+│                    增量式重建流程                            │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Batch 0: [img_0, img_1, img_2, img_3, img_4, img_5]       │
+│           └── 推理 → 重建 → 初始点云                        │
+│                                                             │
+│  Batch 1: [img_4, img_5, img_6, img_7, img_8, img_9]       │
+│           └── 推理 → 重建 → Sim3 对齐 → 合并到主点云        │
+│                  ↑                                          │
+│              重叠影像                                        │
+│                                                             │
+│  Batch 2: [img_8, img_9, img_10, img_11, ...]              │
+│           └── 推理 → 重建 → Sim3 对齐 → 合并到主点云        │
+│                                                             │
+│  ...                                                        │
+│                                                             │
+│  最终输出: 完整的合并点云 + 地理坐标 Reconstruction         │
+└─────────────────────────────────────────────────────────────┘
+```
 
-<br>
+### 模型选择
 
-**Run model inference:**
+| 模型 | 特点 | 适用场景 |
+|------|------|---------|
+| **MapAnything** | 端到端 Transformer，支持多种输入模态 | 通用场景，高精度需求 |
+| **VGGT** | 视觉几何基础模型 | 大规模场景，需要稳定性 |
+| **FastVGGT** | VGGT 加速版本，支持 Token Merging | 实时处理，内存受限场景 |
+
+### 点云合并方法
+
+系统提供四种点云合并策略：
+
+#### 1. `points_only` (推荐用于大规模数据)
 
 ```python
-from mapanything.utils.image import preprocess_inputs
+merge_method='points_only'
+```
 
-# Preprocess inputs to the expected format
-processed_views = preprocess_inputs(views_example)
+- ✅ 最轻量级，仅维护点云数组
+- ✅ 内存效率最高
+- ✅ 支持增量式体素去重
+- ❌ 不维护 pycolmap Reconstruction 结构
 
-# Run inference with any combination of inputs
-predictions = model.infer(
-    processed_views,                  # Any combination of input views
-    memory_efficient_inference=False, # Trades off speed for more views (up to 2000 views on 140 GB)
-    use_amp=True,                     # Use mixed precision inference (recommended)
-    amp_dtype="bf16",                 # bf16 inference (recommended; falls back to fp16 if bf16 not supported)
-    apply_mask=True,                  # Apply masking to dense geometry outputs
-    mask_edges=True,                  # Remove edge artifacts by using normals and depth
-    apply_confidence_mask=False,      # Filter low-confidence regions
-    confidence_percentile=10,         # Remove bottom 10 percentile confidence pixels
-    # Control which inputs to use/ignore
-    # By default, all inputs are used when provided
-    # If is_metric_scale flag is not provided, all inputs are assumed to be in metric scale
-    ignore_calibration_inputs=False,
-    ignore_depth_inputs=False,
-    ignore_pose_inputs=False,
-    ignore_depth_scale_inputs=False,
-    ignore_pose_scale_inputs=False,
+**合并流程**：
+```
+1. 通过公共影像估计 Sim3 变换
+2. 使用 2D 像素匹配识别重叠区
+3. 只添加非重叠区的点（重叠区已存在于累积点云中）
+4. 可选：延迟体素去重（点数超过阈值时执行）
+```
+
+#### 2. `confidence` (推荐用于高质量输出)
+
+```python
+merge_method='confidence'
+```
+
+- ✅ 基于置信度选择最优点
+- ✅ 维护完整的 Reconstruction 结构
+- ✅ 支持精确的像素级匹配
+- ❌ 内存消耗较高
+
+#### 3. `confidence_blend` (最高质量)
+
+```python
+merge_method='confidence_blend'
+```
+
+- ✅ 置信度加权混合
+- ✅ 融合带平滑插值
+- ✅ 密度均衡化
+- ❌ 计算开销最大
+
+#### 4. `full` (完整流程)
+
+```python
+merge_method='full'
+```
+
+- ✅ 使用完整的 merge_full_pipeline
+- ✅ 支持多阶段精化对齐
+- ❌ 最慢
+
+## API 参考
+
+### `IncrementalFeatureMatcherSfM` 类
+
+核心类，管理增量式重建的完整生命周期。
+
+```python
+from SfM.incremental_feature_matcher import IncrementalFeatureMatcherSfM
+
+matcher = IncrementalFeatureMatcherSfM(
+    output_dir=Path("output"),
+    reconstruction_type='each_pixel_feature_points',  # 或 'dense_feature_points'
+    model_type='mapanything',
+    min_images_for_scale=6,
+    overlap=2,
+    merge_method='confidence',
+    enable_visualization=True,
+    verbose=True,
 )
-
-# Access results for each view - Complete list of metric outputs
-# Outputs are the same as above (image-only input case), but with additional inputs used
 ```
 
-**Input requirements for `model.infer`:**
-- `img`: RGB images normalized according to `data_norm_type`
-- `data_norm_type`: Normalization type (must match model's encoder requirements)
+#### 主要方法
 
-**Optional geometric inputs supported by `model.infer`:**
-- `intrinsics` OR `ray_directions`: Camera calibration (cannot provide both since they are redundant)
-- `depth_z`: Z-depth maps (requires calibration info)
-- `camera_poses`: OpenCV (+X - Right, +Y - Down, +Z - Forward) cam2world poses as 4×4 matrices or (quaternions, translations)
-- `is_metric_scale`: Whether inputs are in metric scale
+| 方法 | 描述 |
+|------|------|
+| `add_image(image_path)` | 添加单张影像并处理 |
+| `export_georeferenced(target_crs)` | 导出地理坐标系下的重建结果 |
+| `export_utm()` | 导出 UTM 坐标（自动检测区域） |
+| `get_statistics()` | 获取当前统计信息 |
 
-**Key constraints for `model.infer`:**
-- If `depth_z` is provided, must also provide `intrinsics` or `ray_directions`
-- If any view has `camera_poses`, the first view (reference) must also have them
-- Cannot provide both `intrinsics` and `ray_directions` simultaneously (they are redundant)
+#### 属性
 
-The above constraints are enforced in the inference API. However, if desired, the underlying `model.forward` can support any arbitrary combination of inputs (a total of 64 configurations; without counting per view flexibility).
+| 属性 | 类型 | 描述 |
+|------|------|------|
+| `merged_reconstruction` | `pycolmap.Reconstruction` | 合并后的重建结果 |
+| `merged_points_xyz` | `np.ndarray` | 合并后的点云坐标 (N, 3) |
+| `merged_points_colors` | `np.ndarray` | 合并后的点云颜色 (N, 3) |
+| `inference_reconstructions` | `List[Dict]` | 每个批次的重建结果 |
 
-## Interactive Demos
+### `run_incremental_feature_matching` 函数
 
-We provide multiple interactive demos to try out MapAnything!
+便捷函数，封装完整的增量式重建流程。
 
-### Online Demo
+```python
+from SfM.incremental_feature_matcher import run_incremental_feature_matching
 
-Try our online demo without installation: [🤗 Hugging Face Demo](https://huggingface.co/spaces/facebook/map-anything)
-
-### Local Gradio Demo
-
-We provide a script to launch our Gradio app. The interface and GUI mirrors our [online demo](https://huggingface.co/spaces/facebook/map-anything) where you can upload images/videos, run reconstruction and interactively view them. You can launch this using:
-
-```bash
-# Install requirements for the app
-pip install -e ".[gradio]"
-
-# Launch app locally
-python scripts/gradio_app.py
+success = run_incremental_feature_matching(
+    image_paths=image_files,        # 影像路径列表
+    output_dir=output_dir,          # 输出目录
+    reconstruction_type='each_pixel_feature_points',
+    model_type='mapanything',       # 'mapanything' | 'vggt' | 'fastvggt'
+    model_path=None,                # 模型权重路径
+    image_interval=1,               # 影像间隔
+    min_images_for_scale=6,         # 每批次影像数
+    overlap=2,                      # 批次重叠数
+    pred_vis_scores_thres_value=0.8,
+    max_reproj_error=5.0,
+    run_global_sfm_first=True,      # 先运行全局 SfM
+    merge_method='confidence',
+    merge_voxel_size=1.5,           # 体素大小（米）
+    enable_visualization=True,
+    visualization_mode='merged',    # 'aligned' | 'merged'
+    export_georef=True,
+    target_crs='auto_utm',
+    verbose=True,
+)
 ```
 
-<details>
-<summary>Expand to preview the Gradio demo interface</summary>
+## 配置参数
 
-![Gradio Interface Preview](./assets/gradio_example.png)
-</details>
+### 核心参数
 
-### Rerun Demo
+| 参数 | 默认值 | 描述 |
+|------|--------|------|
+| `min_images_for_scale` | 6 | 每批次处理的影像数量 |
+| `overlap` | 2 | 相邻批次间的重叠影像数 |
+| `merge_method` | 'confidence' | 点云合并方法 |
+| `merge_voxel_size` | 1.5 | 体素去重大小（米） |
 
-We provide a demo script for interactive 3D visualization of metric reconstruction results using [Rerun](https://rerun.io/).
+### 模型参数
 
-```bash
-# Terminal 1: Start the Rerun server
-rerun --serve --port 2004 --web-viewer-port 2006
+| 参数 | 默认值 | 描述 |
+|------|--------|------|
+| `model_type` | 'mapanything' | 模型类型 |
+| `model_path` | None | 模型权重路径（MapAnything 自动下载） |
 
-# Terminal 2: Run MapAnything demo
-# Use --memory_efficient_inference for running inference on a larger number of views
-python scripts/demo_images_only_inference.py \
-    --image_folder /path/to/your/images \
-    --viz \
-    --save_glb \
-    --output_path /path/to/output.glb
+### FastVGGT 专用参数
 
-# Terminal 3 or Local Machine: Open web viewer at http://127.0.0.1:2006 (You might need to port forward if using a remote server)
-```
+| 参数 | 默认值 | 描述 |
+|------|--------|------|
+| `fastvggt_merging` | 0 | Token Merging 参数（0=禁用） |
+| `fastvggt_merge_ratio` | 0.9 | Token Merge 比例 (0.0-1.0) |
+| `fastvggt_depth_conf_thresh` | 3.0 | 深度置信度阈值 |
 
-Use `--apache` flag to use the Apache 2.0 licensed model. Optionally, if rerun is installed locally, local rerun viewer can be spawned using: `rerun --connect rerun+http://127.0.0.1:2004/proxy`.
+### 重建质量参数
 
-### Demo Inference on COLMAP outputs
+| 参数 | 默认值 | 描述 |
+|------|--------|------|
+| `max_reproj_error` | 5.0 | 最大重投影误差（像素） |
+| `max_points3D_val` | 1000000 | 3D 点坐标最大绝对值 |
+| `pred_vis_scores_thres_value` | 0.8 | 特征点可见性阈值 |
+| `filter_edge_margin` | 100.0 | 边缘过滤范围（像素） |
 
-We provide a demo script to run MapAnything inference on COLMAP outputs. The script runs MapAnything in MVS mode by default. Use the `--help` flag for more info.
+### 可视化参数
 
-```bash
-# Terminal 1: Start the Rerun server
-rerun --serve --port 2004 --web-viewer-port 2006
+| 参数 | 默认值 | 描述 |
+|------|--------|------|
+| `enable_visualization` | True | 启用 Viser 可视化 |
+| `visualization_mode` | 'merged' | 可视化模式：'aligned' 或 'merged' |
 
-# Terminal 2: Run MapAnything inference on COLMAP output folder
-# Use --memory_efficient_inference for running inference on a larger number of views
-python scripts/demo_inference_on_colmap_outputs.py \
-    --colmap_path /path/to/your/colmap_output \
-    --viz \
-    --save_glb \
-    --output_path /path/to/output.glb
+### 地理坐标导出参数
 
-# Terminal 3 or Local Machine: Open web viewer at http://127.0.0.1:2006 (You might need to port forward if using a remote server)
-```
+| 参数 | 默认值 | 描述 |
+|------|--------|------|
+| `export_georef` | True | 是否导出地理坐标 |
+| `target_crs` | 'auto_utm' | 目标坐标系 |
 
-Use `--apache` flag to use the Apache 2.0 licensed model. Optionally, if rerun is installed locally, local rerun viewer can be spawned using: `rerun --connect rerun+http://127.0.0.1:2004/proxy`.
+支持的坐标系：
+- `auto_utm`: 自动检测 UTM 区域
+- `EPSG:3857`: Web Mercator
+- `EPSG:4326`: WGS84 经纬度
+- `EPSG:XXXX`: 任意 EPSG 代码
 
-## COLMAP & GSplat Support
+## 输出格式
 
-We build on top of [VGGT's COLMAP demo](https://github.com/facebookresearch/vggt?tab=readme-ov-file#exporting-to-colmap-format) to enable support for COLMAP & GSplat.
-
-### Exporting to COLMAP Format
-
-MapAnything's predictions can directly be converted to COLMAP format by using:
-
-```bash
-# Install requirements for this specific demo
-pip install -e ".[colmap]"
-
-# Feed-forward prediction only
-# Use the memory efficient inference flag to run on a larger number of images at the cost of slower speed
-python scripts/demo_colmap.py --scene_dir=/YOUR/SCENE_DIR/ --memory_efficient_inference
-
-# With bundle adjustment
-python scripts/demo_colmap.py --scene_dir=/YOUR/SCENE_DIR/ --memory_efficient_inference --use_ba
-
-# Run with bundle adjustment using reduced parameters for faster processing
-# Reduces max_query_pts from 4096 (default) to 2048 and query_frame_num from 8 (default) to 5
-# Trade-off: Faster execution but potentially less robust reconstruction in complex scenes (you may consider setting query_frame_num equal to your total number of images)
-# See demo_colmap.py for additional bundle adjustment configuration options
-python scripts/demo_colmap.py --scene_dir=/YOUR/SCENE_DIR/ --memory_efficient_inference --use_ba --max_query_pts=2048 --query_frame_num=5
-```
-
-Please ensure that the images are stored in `/YOUR/SCENE_DIR/images/`. This folder should contain only the images. Check the examples folder for the desired data structure.
-
-The reconstruction result (camera parameters and 3D points) will be automatically saved under `/YOUR/SCENE_DIR/sparse/` in the COLMAP format, such as:
+运行完成后，输出目录结构如下：
 
 ```
-SCENE_DIR/
-├── images/
-└── sparse/
-    ├── cameras.bin
-    ├── images.bin
-    └── points3D.bin
-    └── points.ply
+output/
+├── global_sfm/                    # 全局 SfM 结果
+│   └── enu/
+│       ├── cameras.txt
+│       ├── images.txt
+│       └── points3D.txt
+├── temp_aligned/                  # 每批次对齐后的重建
+│   ├── 0_6/
+│   ├── 4_10/
+│   └── ...
+├── temp_merged/                   # 合并后的重建
+│   ├── merged_1/
+│   ├── merged_2/
+│   └── ...
+│       ├── cameras.txt
+│       ├── images.txt
+│       ├── points3D.txt
+│       ├── points3D.ply
+│       └── points3D.las
+├── temp_merged_points_only/       # points_only 模式输出
+│   ├── merged_1.ply
+│   ├── merged_1.las
+│   └── ...
+└── temp_merged_reconstruction_georeferenced/  # 地理坐标输出
+    ├── cameras.txt
+    ├── images.txt
+    ├── points3D.txt
+    ├── sparse_points.ply
+    └── sparse_points.las
 ```
 
-### Integration with Gaussian Splatting
+### 输出文件格式
 
-The exported COLMAP files can be directly used with [gsplat](https://github.com/nerfstudio-project/gsplat) for Gaussian Splatting training. Install `gsplat` following their official instructions (we recommend `gsplat==1.3.0`):
+| 格式 | 描述 |
+|------|------|
+| `.txt` | COLMAP 文本格式 |
+| `.bin` | COLMAP 二进制格式 |
+| `.ply` | 标准 PLY 点云格式 |
+| `.las` | LAS 点云格式（支持 GIS 软件） |
 
-An example command to train the model is:
+## 示例数据集
+
+项目提供了多个示例数据集用于测试：
+
 ```
-cd <path_to_gsplat>
-python examples/simple_trainer.py  default --data_factor 1 --data_dir /YOUR/SCENE_DIR/ --result_dir /YOUR/RESULT_DIR/
-```
-
-## Data Processing for Training & Benchmarking
-
-We provide details in the [Data Processing README](data_processing/README.md).
-
-## Training
-
-We provide comprehensive training instructions, scripts, and configurations to reproduce MapAnything and train custom models. See [Training README](train.md) for detailed training instructions, including:
-- Data setup and processing for all 13 training datasets used in the paper
-- Quick start examples with memory optimization tips
-- All main model and ablation training scripts from the paper
-- Fine-tuning support for other geometry estimation models like MoGe-2, VGGT, π³ showcasing the modularity of our framework
-
-## Benchmarking
-
-We provide comprehensive benchmarking scripts and instructions for evaluating MapAnything across multiple tasks and datasets. All original bash scripts used for benchmarking are available in the `/bash_scripts/benchmarking/` folder.
-
-### Available Benchmarks
-
-1. **Dense Up-to-N-View Reconstruction Benchmark**
-   See [Dense Up-to-N-View Benchmark README](benchmarking/dense_n_view/README.md) for detailed instructions on evaluating dense multi-view metric reconstruction.
-
-2. **Single-View Image Calibration Benchmark**
-   See [Calibration Benchmark README](benchmarking/calibration/README.md) for detailed instructions on evaluating camera intrinsic prediction from single images.
-
-3. **RobustMVD Benchmark**
-   See [RMVD Benchmark README](benchmarking/rmvd_mvs_benchmark/README.md) for detailed instructions on using the RobustMVD benchmark.
-
-## Code License
-
-This code is licensed under an open-source [Apache 2.0 license](LICENSE).
-
-## Models
-
-We release **two variants** of the pre-trained MapAnything models on Hugging Face Hub, each with different licensing based on the underlying training datasets:
-
-### 🤗 Hugging Face Hub Models
-
-1. **[facebook/map-anything](https://huggingface.co/facebook/map-anything)** (CC-BY-NC 4.0 License)
-2. **[facebook/map-anything-apache](https://huggingface.co/facebook/map-anything-apache)** (Apache 2.0 License)
-
-### Deprecated Models used for V1 Release in September 2025
-
-1. **[facebook/map-anything-v1](https://huggingface.co/facebook/map-anything-v1)** (CC-BY-NC 4.0 License)
-2. **[facebook/map-anything-apache-v1](https://huggingface.co/facebook/map-anything-apache-v1)** (Apache 2.0 License)
-
-### Model Selection Guide
-
-- **For Research & Academic Use**: Use `facebook/map-anything` for the best performance
-- **For Commercial Use**: Use `facebook/map-anything-apache` for commercial-friendly licensing
-
-Both models support the same API and functionality. The only difference is the training data composition and resulting license terms. Please see our paper for detailed information about the specific datasets used in each model variant.
-
-### Optional Checkpoint Conversion
-
-The MapAnything training/benchmarking framework expects trained checkpoints in a specific format with a `model` key. The HuggingFace checkpoints can be easily converted to the expected format using:
-
-```bash
-# Convert default CC-BY-NC model
-python scripts/convert_hf_to_benchmark_checkpoint.py \
-    --output_path checkpoints/facebook_map-anything.pth
-
-# Convert Apache 2.0 model for commercial use
-python scripts/convert_hf_to_benchmark_checkpoint.py \
-    --apache \
-    --output_path checkpoints/facebook_map-anything-apache.pth
+examples/
+├── Ganluo_images/          # 甘洛数据集
+├── Tazishan/               # 塔子山数据集
+├── SWJTU_gongdi/           # 西南交大工地数据集
+├── SWJTU_7th_teaching_building/  # 西南交大七教数据集
+├── HuaPo/                  # 滑坡数据集
+├── WenChuan/               # 汶川数据集
+└── Comprehensive_building_sel/   # 综合建筑数据集
 ```
 
-## Building Blocks for MapAnything
+## 可视化
 
-UniCeption & WorldAI (WAI) Data are two crucial building blocks and have been developed for ease of use by the community:
+系统支持基于 [Viser](https://github.com/nerfstudio-project/viser) 的实时 3D 可视化：
 
-🌍 [UniCeption](https://github.com/castacks/UniCeption/tree/main) is a library which contains modular, config-swappable components for assembling end-to-end networks.
+```python
+# 启用可视化（默认开启）
+matcher = IncrementalFeatureMatcherSfM(
+    ...,
+    enable_visualization=True,
+    visualization_mode='merged',  # 显示合并后的点云
+)
+```
 
-🌍 [WAI](./data_processing/README.md) is a unified data format for all things 3D, 4D & Spatial AI. It enables easy, scalable and reproducible data processing.
+启动后，在浏览器中访问 `http://localhost:8080` 查看：
 
-We strongly encourage the community to build on top of the tools and submit PRs! This also enables us to release stronger models (both apache and research use) as the community adds more datasets to WAI and builds on top of UniCeption/MapAnything.
+- 📍 相机位姿（frustum 显示）
+- 🔵 3D 点云
+- 🖼️ 影像缩略图
 
-### Related Research
+## 致谢
 
-Check out our related work which also use UniCeption & WAI:
+本项目基于以下优秀的开源项目：
 
-🚀 [UFM: A Simple Path towards Unified Dense Correspondence with Flow](https://uniflowmatch.github.io/)
+- [MapAnything](https://github.com/facebookresearch/map-anything) - Meta 的端到端 3D 重建模型
+- [VGGT](https://github.com/facebookresearch/vggt) - 视觉几何基础模型
+- [COLMAP](https://colmap.github.io/) - 经典 SfM/MVS 框架
+- [pycolmap](https://github.com/colmap/pycolmap) - COLMAP Python 绑定
+- [Viser](https://github.com/nerfstudio-project/viser) - 3D 可视化工具
+- [laspy](https://github.com/laspy/laspy) - LAS 文件读写库
 
-🚀 [FlowR: Flowing from Sparse to Dense 3D Reconstructions](https://tobiasfshr.github.io/pub/flowr/)
+## 引用
 
-## Acknowledgments
-
-We thank the following projects for their open-source code: [DUSt3R](https://github.com/naver/dust3r), [MASt3R](https://github.com/naver/mast3r), [RayDiffusion](https://github.com/jasonyzhang/RayDiffusion), [MoGe](https://github.com/microsoft/moge), [VGGSfM](https://github.com/facebookresearch/vggsfm), [VGGT](https://github.com/facebookresearch/vggt), [MaRePo](https://github.com/nianticlabs/marepo), and [DINOv2](https://github.com/facebookresearch/dinov2).
-
-## Citation
-
-If you find our repository useful, please consider giving it a star ⭐ and citing our paper in your work:
+如果您使用了本项目，请引用以下论文：
 
 ```bibtex
-@misc{keetha2025mapanything,
-  title={{MapAnything}: Universal Feed-Forward Metric {3D} Reconstruction},
-  author={Nikhil Keetha and Norman M\"{u}ller and Johannes Sch\"{o}nberger and Lorenzo Porzi and Yuchen Zhang and Tobias Fischer and Arno Knapitsch and Duncan Zauss and Ethan Weber and Nelson Antunes and Jonathon Luiten and Manuel Lopez-Antequera and Samuel Rota Bul\`{o} and Christian Richardt and Deva Ramanan and Sebastian Scherer and Peter Kontschieder},
-  note={arXiv preprint arXiv:2509.13414},
+@inproceedings{wang2025vggt,
+  title={Vggt: Visual geometry grounded transformer},
+  author={Wang, Jianyuan and Chen, Minghao and Karaev, Nikita and Vedaldi, Andrea and Rupprecht, Christian and Novotny, David},
+  booktitle={Proceedings of the Computer Vision and Pattern Recognition Conference},
+  pages={5294--5306},
+  year={2025}
+}
+
+@article{shen2025fastvggt,
+  title={Fastvggt: Training-free acceleration of visual geometry transformer},
+  author={Shen, You and Zhang, Zhipeng and Qu, Yansong and Zheng, Xiawu and Ji, Jiayi and Zhang, Shengchuan and Cao, Liujuan},
+  journal={arXiv preprint arXiv:2509.02560},
+  year={2025}
+}
+
+@article{keetha2025mapanything,
+  title={Mapanything: Universal feed-forward metric 3d reconstruction},
+  author={Keetha, Nikhil and M{\"u}ller, Norman and Sch{\"o}nberger, Johannes and Porzi, Lorenzo and Zhang, Yuchen and Fischer, Tobias and Knapitsch, Arno and Zauss, Duncan and Weber, Ethan and Antunes, Nelson and others},
+  journal={arXiv preprint arXiv:2509.13414},
   year={2025}
 }
 ```
+
+## 许可证
+
+本项目采用 [Apache 2.0 许可证](LICENSE)。
+
+---
+
+<div align="center">
+
+**如有问题或建议，欢迎提交 Issue 或 Pull Request！**
+
+</div>
