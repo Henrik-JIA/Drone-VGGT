@@ -73,6 +73,7 @@ packages = ["dronemapanything"]
 
 # Ruff for linting
 [tool.ruff]
+line-length = 120
 lint.extend-select = ["I"]
 target-version = "py310"
 
@@ -86,9 +87,8 @@ known-first-party = ["dronemapanything", "uniception"]
 # ========================================================================= #
 # Pixi 配置
 # ========================================================================= #
-[tool.pixi.project]
-# 使用清华镜像源（国内访问更稳定）
-channels = ["https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge/"]
+[tool.pixi.workspace]
+channels = ["conda-forge"]
 platforms = ["win-64", "linux-64", "linux-aarch64", "osx-arm64"]
 
 # 系统要求 - 匹配你的 CUDA 11.8 环境
@@ -97,40 +97,23 @@ cuda = "11.8"
 
 # ========== 通用 Conda 依赖 ==========
 [tool.pixi.dependencies]
-# Python 版本
 python = "3.10.*"
-
-# 科学计算
 numpy = ">=1.26,<2"
 scipy = ">=1.11"
 scikit-image = ">=0.21"
 scikit-learn = ">=1.3"
-
-# 点云和 3D 处理
 open3d = ">=0.17"
-
-# 图像处理
 opencv = ">=4.8"
 pillow = ">=10.0"
-
-# 可视化
 matplotlib = ">=3.8"
-
-# 数据处理
 tqdm = ">=4.65"
-
-# 其他工具
 einops = ">=0.7"
 safetensors = ">=0.4"
 huggingface_hub = ">=0.20"
-
-# 地理空间
 gdal = ">=3.8"
 rasterio = ">=1.3"
 pyproj = ">=3.6"
 shapely = ">=2.0"
-
-# 构建工具
 pip = ">=23.0"
 
 # ========== 平台特定 Conda 依赖 ==========
@@ -140,26 +123,20 @@ cuda-version = "==11.8"
 [tool.pixi.target.win-64.dependencies]
 cuda-version = "==11.8"
 
+[tool.pixi.target.linux-aarch64.dependencies]
+# ARM64 通常不需要指定 cuda-version
+
+[tool.pixi.target.osx-arm64.dependencies]
+# macOS ARM64 不需要 CUDA
+
 # ========== 通用 PyPI 依赖 ==========
 [tool.pixi.pypi-dependencies]
-# 本地包（editable 模式，会自动安装 [project].dependencies）
 dronemapanything = { path = ".", editable = true }
-
-# 额外依赖（不在 [project].dependencies 中的）
-# 深度学习工具
 kornia = ">=0.7"
-
-# 可视化
 viser = ">=0.1"
 plotly = ">=5.18"
-
-# GPS 和坐标转换
 pymap3d = ">=3.0"
-
-# LAS 文件支持
 laspy = ">=2.5"
-
-# 网格处理
 pymeshlab = ">=2023.12"
 
 # ========== 平台特定 PyPI 依赖 ==========
@@ -175,10 +152,10 @@ torch = { version = "==2.3.1", index = "https://download.pytorch.org/whl/cu118" 
 torchvision = { version = "==0.18.1", index = "https://download.pytorch.org/whl/cu118" }
 torchaudio = { version = "==2.3.1", index = "https://download.pytorch.org/whl/cu118" }
 
-# Linux ARM64 (Jetson 等)
+# Linux ARM64 (Jetson 等) - 使用预编译的 wheel
 [tool.pixi.target.linux-aarch64.pypi-dependencies]
-torch = ">=2.0"
-torchvision = ">=0.15"
+torch = { url = "https://github.com/ultralytics/assets/releases/download/v0.0.0/torch-2.5.0a0+872d972e41.nv24.08-cp310-cp310-linux_aarch64.whl" }
+torchvision = { url = "https://github.com/ultralytics/assets/releases/download/v0.0.0/torchvision-0.20.0a0+afc54f7-cp310-cp310-linux_aarch64.whl" }
 torchaudio = ">=2.0"
 
 # macOS ARM64 (Apple Silicon)
@@ -192,7 +169,6 @@ torchaudio = ">=2.0"
 pandas = ">=2.0"
 
 # ========== Feature: dev ==========
-# 使用 dronemapanything[dev] 安装，通过本地包的 optional-dependencies
 [tool.pixi.feature.dev.pypi-dependencies]
 dronemapanything = { path = ".", editable = true, extras = ["dev"] }
 
@@ -266,20 +242,9 @@ info = "python -c \"import torch; print(f'PyTorch: {torch.__version__}'); print(
 
 # ========== 环境定义 ==========
 [tool.pixi.environments]
-# 默认环境
 default = { features = ["data"], solve-group = "default" }
-
-# 开发环境
 dev = { features = ["data", "dev"], solve-group = "default" }
-
-# COLMAP 环境
 colmap = { features = ["data", "colmap"], solve-group = "default" }
-
-# Gradio 界面环境
 gradio = { features = ["data", "gradio"], solve-group = "default" }
-
-# 完整环境（包含所有功能）
 full = { features = ["data", "dev", "colmap", "gradio", "radio"], solve-group = "default" }
-
-# 外部模型环境
 benchmarks = { features = ["data", "colmap", "anycalib", "dust3r", "mast3r", "must3r", "pow3r", "depth-anything-3", "rmvd"], solve-group = "default" }
