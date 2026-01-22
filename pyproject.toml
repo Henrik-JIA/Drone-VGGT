@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mapanything"
+name = "dronemapanything"
 version = "1.1.0"
 description = "Universal Feed-Forward Metric 3D Reconstruction with Drone Mapping"
 readme = "readme.md"
@@ -50,26 +50,26 @@ rmvd = ["rmvd @ git+https://github.com/infinity1096/robustmvd.git@master#egg=rmv
 
 # Install all optional dependencies
 all = [
-    "mapanything[anycalib]",
-    "mapanything[colmap]",
-    "mapanything[data]",
-    "mapanything[depth-anything-3]",
-    "mapanything[dev]",
-    "mapanything[dust3r]",
-    "mapanything[gradio]",
-    "mapanything[mast3r]",
-    "mapanything[must3r]",
-    "mapanything[pow3r]",
-    "mapanything[radio]",
-    "mapanything[rmvd]",
+    "dronemapanything[anycalib]",
+    "dronemapanything[colmap]",
+    "dronemapanything[data]",
+    "dronemapanything[depth-anything-3]",
+    "dronemapanything[dev]",
+    "dronemapanything[dust3r]",
+    "dronemapanything[gradio]",
+    "dronemapanything[mast3r]",
+    "dronemapanything[must3r]",
+    "dronemapanything[pow3r]",
+    "dronemapanything[radio]",
+    "dronemapanything[rmvd]",
 ]
 
 # Setuptools configuration
 [tool.setuptools]
-packages = ["mapanything"]
+packages = ["dronemapanything"]
 
 [tool.setuptools.package-data]
-"mapanything" = ["**/*"]
+"dronemapanything" = ["**/*"]
 
 # Ruff for linting
 [tool.ruff]
@@ -81,7 +81,7 @@ case-sensitive = false
 combine-as-imports = true
 detect-same-package = false
 order-by-type = false
-known-first-party = ["mapanything", "uniception"]
+known-first-party = ["dronemapanything", "uniception"]
 
 # ========================================================================= #
 # Pixi 配置
@@ -142,7 +142,7 @@ cuda-version = "==11.8"
 # ========== 通用 PyPI 依赖 ==========
 [tool.pixi.pypi-dependencies]
 # 本地包（editable 模式，会自动安装 [project].dependencies）
-mapanything = { path = ".", editable = true }
+dronemapanything = { path = ".", editable = true }
 
 # 额外依赖（不在 [project].dependencies 中的）
 # 深度学习工具
@@ -191,54 +191,49 @@ torchaudio = ">=2.0"
 pandas = ">=2.0"
 
 # ========== Feature: dev ==========
+# 使用 dronemapanything[dev] 安装，通过本地包的 optional-dependencies
 [tool.pixi.feature.dev.pypi-dependencies]
-pre-commit = ">=3.6"
-pytest = ">=7.4"
-pytest-cov = ">=4.1"
-ruff = ">=0.1"
+dronemapanything = { path = ".", editable = true, extras = ["dev"] }
 
 # ========== Feature: colmap ==========
 [tool.pixi.feature.colmap.pypi-dependencies]
-lightglue = { git = "https://github.com/cvg/LightGlue.git" }
-pycolmap = "==3.10.0"
+dronemapanything = { path = ".", editable = true, extras = ["colmap"] }
 
 # ========== Feature: gradio ==========
 [tool.pixi.feature.gradio.pypi-dependencies]
-gradio = ">=4.0"
-spaces = ">=0.19"
+dronemapanything = { path = ".", editable = true, extras = ["gradio"] }
 
 # ========== Feature: radio ==========
 [tool.pixi.feature.radio.pypi-dependencies]
-timm = ">=0.9"
+dronemapanything = { path = ".", editable = true, extras = ["radio"] }
 
 # ========== Feature: anycalib ==========
 [tool.pixi.feature.anycalib.pypi-dependencies]
-anycalib = { git = "https://github.com/javrtg/AnyCalib.git", branch = "main" }
+dronemapanything = { path = ".", editable = true, extras = ["anycalib"] }
 
 # ========== Feature: dust3r ==========
 [tool.pixi.feature.dust3r.pypi-dependencies]
-croco = { git = "https://github.com/naver/croco.git", branch = "croco_module" }
-dust3r = { git = "https://github.com/naver/dust3r.git", branch = "dust3r_setup" }
+dronemapanything = { path = ".", editable = true, extras = ["dust3r"] }
 
 # ========== Feature: mast3r ==========
 [tool.pixi.feature.mast3r.pypi-dependencies]
-mast3r = { git = "https://github.com/Nik-V9/mast3r.git", branch = "main" }
+dronemapanything = { path = ".", editable = true, extras = ["mast3r"] }
 
 # ========== Feature: must3r ==========
 [tool.pixi.feature.must3r.pypi-dependencies]
-must3r = { git = "https://github.com/naver/must3r.git", branch = "main" }
+dronemapanything = { path = ".", editable = true, extras = ["must3r"] }
 
 # ========== Feature: pow3r ==========
 [tool.pixi.feature.pow3r.pypi-dependencies]
-pow3r = { git = "https://github.com/Nik-V9/pow3r.git", branch = "main" }
+dronemapanything = { path = ".", editable = true, extras = ["pow3r"] }
 
 # ========== Feature: depth-anything-3 ==========
 [tool.pixi.feature.depth-anything-3.pypi-dependencies]
-depth-anything-3 = { git = "https://github.com/Nik-V9/depth-anything-3.git", branch = "main" }
+dronemapanything = { path = ".", editable = true, extras = ["depth-anything-3"] }
 
 # ========== Feature: rmvd ==========
 [tool.pixi.feature.rmvd.pypi-dependencies]
-rmvd = { git = "https://github.com/infinity1096/robustmvd.git", branch = "master" }
+dronemapanything = { path = ".", editable = true, extras = ["rmvd"] }
 
 # ========== 任务定义 ==========
 [tool.pixi.tasks]
