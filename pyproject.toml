@@ -87,7 +87,8 @@ known-first-party = ["dronemapanything", "uniception"]
 # Pixi 配置
 # ========================================================================= #
 [tool.pixi.project]
-channels = ["conda-forge"]
+# 使用清华镜像源（国内访问更稳定）
+channels = ["https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge/"]
 platforms = ["win-64", "linux-64", "linux-aarch64", "osx-arm64"]
 
 # 系统要求 - 匹配你的 CUDA 11.8 环境
