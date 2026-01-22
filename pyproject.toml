@@ -1,90 +1,217 @@
-[build-system]
-requires = ["setuptools>=61.0", "wheel"]
-build-backend = "setuptools.build_meta"
-
 [project]
-name = "mapanything"
-version = "1.1"
-description = "Universal Feed-Forward Metric 3D Reconstruction"
-readme = "readme.md"
-authors = [{ name = "Nikhil Keetha", email = "keethanikhil@gmail.com" }]
-requires-python = ">=3.10.0"
-dependencies = [
-    "huggingface_hub",
-    "hydra-core",
-    "natsort",
-    "opencv-python-headless==4.10.0.84",
-    "orjson",
-    "pillow-heif",
-    "plyfile",
-    "python-box",
-    "requests",
-    "rerun-sdk~=0.24.1",
-    "safetensors",
-    "tensorboard",
-    "tqdm",
-    "trimesh",
-    "uniception==0.1.6",
-]
+name = "drone-map-anything"
+version = "1.1.0"
+description = "Universal Feed-Forward Metric 3D Reconstruction with Drone Mapping"
+authors = ["Your Name <your.email@example.com>"]
+channels = ["conda-forge"]
+platforms = ["win-64", "linux-64", "linux-aarch64", "osx-arm64"]
 
-[project.optional-dependencies]
-data = ["pandas"]
-dev = ["pre-commit", "pytest", "pytest-cov", "ruff"]
-colmap = [
-    "lightglue @ git+https://github.com/cvg/LightGlue.git",
-    "pycolmap==3.10.0"
-]
-gradio = ["gradio", "spaces"]
-radio = ["timm"]
-# External models for benchmarking
-anycalib = ["anycalib @ git+https://github.com/javrtg/AnyCalib.git@main#egg=anycalib"]
-dust3r = [
-    "croco @ git+https://github.com/naver/croco.git@croco_module#egg=croco",
-    "dust3r @ git+https://github.com/naver/dust3r.git@dust3r_setup#egg=dust3r",
-]
-mast3r = ["mast3r @ git+https://github.com/Nik-V9/mast3r.git@main#egg=mast3r"]
-must3r = ["must3r @ git+https://github.com/naver/must3r.git@main#egg=must3r"]
-pow3r = ["pow3r @ git+https://github.com/Nik-V9/pow3r.git@main#egg=pow3r"]
-depth-anything-3 = ["depth-anything-3 @ git+https://github.com/Nik-V9/depth-anything-3.git@main#egg=depth-anything-3"]
-rmvd = ["rmvd @ git+https://github.com/infinity1096/robustmvd.git@master#egg=rmvd"]
+# 系统要求 - 匹配你的 CUDA 11.8 环境
+[system-requirements]
+cuda = "11.8"
 
-# Install all optional dependencies
-all = [
-    "mapanything[anycalib]",
-    "mapanything[colmap]",
-    "mapanything[data]",
-    "mapanything[depth-anything-3]",
-    "mapanything[dev]",
-    "mapanything[dust3r]",
-    "mapanything[gradio]",
-    "mapanything[mast3r]",
-    "mapanything[must3r]",
-    "mapanything[pow3r]",
-    "mapanything[radio]",
-    "mapanything[rmvd]",
-]
+# ========== 通用 Conda 依赖 ==========
+[dependencies]
+# Python 版本
+python = "3.10.*"
 
-# Setuptools configuration
-[tool.setuptools]
-# Disable automatic package discovery to avoid conflicts
-packages = ["mapanything"]
+# 科学计算
+numpy = ">=1.26,<2"
+scipy = ">=1.11"
+scikit-image = ">=0.21"
+scikit-learn = ">=1.3"
 
-# Include package data
-[tool.setuptools.package-data]
-"mapanything" = ["**/*"]
+# 点云和 3D 处理
+open3d = ">=0.17"
 
-# Ruff for linting
-[tool.ruff]
-# Enable the isort rules.
-lint.extend-select = ["I"]
+# 图像处理
+opencv = ">=4.8"
+pillow = ">=10.0"
 
-# Following https://www.internalfb.com/wiki/Python/code_formatting/pyfmt/
-target-version = "py310"
+# 可视化
+matplotlib = ">=3.8"
 
-# Following https://www.internalfb.com/wiki/Python/code_formatting/pyfmt/
-[tool.ruff.lint.isort]
-case-sensitive = false
-combine-as-imports = true
-detect-same-package = false
-order-by-type = false
-known-first-party = ["mapanything", "uniception"]
+# 数据处理
+tqdm = ">=4.65"
+
+# 其他工具
+einops = ">=0.7"
+safetensors = ">=0.4"
+huggingface_hub = ">=0.20"
+
+# 地理空间
+gdal = ">=3.8"
+rasterio = ">=1.3"
+pyproj = ">=3.6"
+shapely = ">=2.0"
+
+# 构建工具
+pip = ">=23.0"
+
+# ========== 平台特定 Conda 依赖 ==========
+[target.linux-64.dependencies]
+cuda-version = "==11.8"
+
+[target.win-64.dependencies]
+cuda-version = "==11.8"
+
+# ========== 通用 PyPI 依赖 ==========
+[pypi-dependencies]
+# 本地包（editable 模式）
+mapanything = { path = ".", editable = true }
+
+# MapAnything 核心依赖（来自 pyproject.toml）
+hydra-core = ">=1.3"
+natsort = ">=8.4"
+orjson = ">=3.9"
+pillow-heif = ">=0.13"
+plyfile = ">=1.0"
+python-box = ">=7.1"
+requests = ">=2.31"
+rerun-sdk = "~=0.24.1"
+tensorboard = ">=2.15"
+trimesh = ">=4.0"
+uniception = "==0.1.6"
+
+# 深度学习工具
+kornia = ">=0.7"
+
+# 可视化
+viser = ">=0.1"
+plotly = ">=5.18"
+
+# GPS 和坐标转换
+pymap3d = ">=3.0"
+
+# LAS 文件支持
+laspy = ">=2.5"
+
+# 网格处理
+pymeshlab = ">=2023.12"
+
+# ========== 平台特定 PyPI 依赖 ==========
+# Linux x86_64
+[target.linux-64.pypi-dependencies]
+torch = { version = "==2.3.1", index = "https://download.pytorch.org/whl/cu118" }
+torchvision = { version = "==0.18.1", index = "https://download.pytorch.org/whl/cu118" }
+torchaudio = { version = "==2.3.1", index = "https://download.pytorch.org/whl/cu118" }
+
+# Windows x86_64
+[target.win-64.pypi-dependencies]
+torch = { version = "==2.3.1", index = "https://download.pytorch.org/whl/cu118" }
+torchvision = { version = "==0.18.1", index = "https://download.pytorch.org/whl/cu118" }
+torchaudio = { version = "==2.3.1", index = "https://download.pytorch.org/whl/cu118" }
+
+# Linux ARM64 (Jetson 等)
+[target.linux-aarch64.pypi-dependencies]
+torch = ">=2.0"
+torchvision = ">=0.15"
+torchaudio = ">=2.0"
+
+# macOS ARM64 (Apple Silicon)
+[target.osx-arm64.pypi-dependencies]
+torch = ">=2.0"
+torchvision = ">=0.15"
+torchaudio = ">=2.0"
+
+# ========== Feature: data ==========
+[feature.data.dependencies]
+pandas = ">=2.0"
+
+# ========== Feature: dev ==========
+[feature.dev.pypi-dependencies]
+pre-commit = ">=3.6"
+pytest = ">=7.4"
+pytest-cov = ">=4.1"
+ruff = ">=0.1"
+
+# ========== Feature: colmap ==========
+[feature.colmap.pypi-dependencies]
+lightglue = { git = "https://github.com/cvg/LightGlue.git" }
+pycolmap = "==3.10.0"
+
+# ========== Feature: gradio ==========
+[feature.gradio.pypi-dependencies]
+gradio = ">=4.0"
+spaces = ">=0.19"
+
+# ========== Feature: radio ==========
+[feature.radio.pypi-dependencies]
+timm = ">=0.9"
+
+# ========== Feature: anycalib ==========
+[feature.anycalib.pypi-dependencies]
+anycalib = { git = "https://github.com/javrtg/AnyCalib.git", branch = "main" }
+
+# ========== Feature: dust3r ==========
+[feature.dust3r.pypi-dependencies]
+croco = { git = "https://github.com/naver/croco.git", branch = "croco_module" }
+dust3r = { git = "https://github.com/naver/dust3r.git", branch = "dust3r_setup" }
+
+# ========== Feature: mast3r ==========
+[feature.mast3r.pypi-dependencies]
+mast3r = { git = "https://github.com/Nik-V9/mast3r.git", branch = "main" }
+
+# ========== Feature: must3r ==========
+[feature.must3r.pypi-dependencies]
+must3r = { git = "https://github.com/naver/must3r.git", branch = "main" }
+
+# ========== Feature: pow3r ==========
+[feature.pow3r.pypi-dependencies]
+pow3r = { git = "https://github.com/Nik-V9/pow3r.git", branch = "main" }
+
+# ========== Feature: depth-anything-3 ==========
+[feature.depth-anything-3.pypi-dependencies]
+depth-anything-3 = { git = "https://github.com/Nik-V9/depth-anything-3.git", branch = "main" }
+
+# ========== Feature: rmvd ==========
+[feature.rmvd.pypi-dependencies]
+rmvd = { git = "https://github.com/infinity1096/robustmvd.git", branch = "master" }
+
+# ========== 任务定义 ==========
+[tasks]
+# 安装 LightGlue（手动安装，避免依赖冲突）
+install-lightglue = "pip install git+https://github.com/cvg/LightGlue.git --no-deps"
+
+# 安装第三方子模块
+install-vggt = "pip install -e third/vggt --no-deps"
+install-fastvggt = "pip install -e third/fastvggt --no-deps"
+
+# 完整安装
+setup = { depends-on = ["install-lightglue", "install-vggt", "install-fastvggt"] }
+
+# 运行增量 SfM
+run-sfm = "python SfM/incremental_feature_matcher.py"
+
+# 运行 Delaunay 网格化
+run-mesh = "python SfM/delaunay/delaunay_mesh.py"
+
+# 生成 DSM
+run-dsm = "python SfM/delaunay/ply_to_dsm.py"
+
+# 代码格式检查
+lint = "ruff check ."
+format = "ruff format ."
+
+# 显示环境信息
+info = "python -c \"import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA: {torch.cuda.is_available()}'); print(f'Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"CPU\"}')\""
+
+# ========== 环境定义 ==========
+[environments]
+# 默认环境
+default = { features = ["data"], solve-group = "default" }
+
+# 开发环境
+dev = { features = ["data", "dev"], solve-group = "default" }
+
+# COLMAP 环境
+colmap = { features = ["data", "colmap"], solve-group = "default" }
+
+# Gradio 界面环境
+gradio = { features = ["data", "gradio"], solve-group = "default" }
+
+# 完整环境（包含所有功能）
+full = { features = ["data", "dev", "colmap", "gradio", "radio"], solve-group = "default" }
+
+# 外部模型环境
+benchmarks = { features = ["data", "colmap", "anycalib", "dust3r", "mast3r", "must3r", "pow3r", "depth-anything-3", "rmvd"], solve-group = "default" }
