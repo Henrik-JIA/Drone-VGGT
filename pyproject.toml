@@ -2,7 +2,7 @@
 name = "drone-map-anything"
 version = "1.1.0"
 description = "Universal Feed-Forward Metric 3D Reconstruction with Drone Mapping"
-authors = ["Your Name <your.email@example.com>"]
+authors = [{ name = "Zhihao Jia", email = "jiazhihaojzh@126.com" }]
 channels = ["conda-forge"]
 platforms = ["win-64", "linux-64", "linux-aarch64", "osx-arm64"]
 
