@@ -1,17 +1,101 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "drone-map-anything"
+name = "mapanything"
 version = "1.1.0"
 description = "Universal Feed-Forward Metric 3D Reconstruction with Drone Mapping"
+readme = "readme.md"
 authors = [{ name = "Zhihao Jia", email = "jiazhihaojzh@126.com" }]
+requires-python = ">=3.10.0"
+dependencies = [
+    "huggingface_hub",
+    "hydra-core",
+    "natsort",
+    "opencv-python-headless==4.10.0.84",
+    "orjson",
+    "pillow-heif",
+    "plyfile",
+    "python-box",
+    "requests",
+    "rerun-sdk~=0.24.1",
+    "safetensors",
+    "tensorboard",
+    "tqdm",
+    "trimesh",
+    "uniception==0.1.6",
+]
+
+[project.optional-dependencies]
+data = ["pandas"]
+dev = ["pre-commit", "pytest", "pytest-cov", "ruff"]
+colmap = [
+    "lightglue @ git+https://github.com/cvg/LightGlue.git",
+    "pycolmap==3.10.0"
+]
+gradio = ["gradio", "spaces"]
+radio = ["timm"]
+# External models for benchmarking
+anycalib = ["anycalib @ git+https://github.com/javrtg/AnyCalib.git@main#egg=anycalib"]
+dust3r = [
+    "croco @ git+https://github.com/naver/croco.git@croco_module#egg=croco",
+    "dust3r @ git+https://github.com/naver/dust3r.git@dust3r_setup#egg=dust3r",
+]
+mast3r = ["mast3r @ git+https://github.com/Nik-V9/mast3r.git@main#egg=mast3r"]
+must3r = ["must3r @ git+https://github.com/naver/must3r.git@main#egg=must3r"]
+pow3r = ["pow3r @ git+https://github.com/Nik-V9/pow3r.git@main#egg=pow3r"]
+depth-anything-3 = ["depth-anything-3 @ git+https://github.com/Nik-V9/depth-anything-3.git@main#egg=depth-anything-3"]
+rmvd = ["rmvd @ git+https://github.com/infinity1096/robustmvd.git@master#egg=rmvd"]
+
+# Install all optional dependencies
+all = [
+    "mapanything[anycalib]",
+    "mapanything[colmap]",
+    "mapanything[data]",
+    "mapanything[depth-anything-3]",
+    "mapanything[dev]",
+    "mapanything[dust3r]",
+    "mapanything[gradio]",
+    "mapanything[mast3r]",
+    "mapanything[must3r]",
+    "mapanything[pow3r]",
+    "mapanything[radio]",
+    "mapanything[rmvd]",
+]
+
+# Setuptools configuration
+[tool.setuptools]
+packages = ["mapanything"]
+
+[tool.setuptools.package-data]
+"mapanything" = ["**/*"]
+
+# Ruff for linting
+[tool.ruff]
+lint.extend-select = ["I"]
+target-version = "py310"
+
+[tool.ruff.lint.isort]
+case-sensitive = false
+combine-as-imports = true
+detect-same-package = false
+order-by-type = false
+known-first-party = ["mapanything", "uniception"]
+
+# ========================================================================= #
+# Pixi 配置
+# ========================================================================= #
+[tool.pixi.project]
 channels = ["conda-forge"]
 platforms = ["win-64", "linux-64", "linux-aarch64", "osx-arm64"]
 
 # 系统要求 - 匹配你的 CUDA 11.8 环境
-[system-requirements]
+[tool.pixi.system-requirements]
 cuda = "11.8"
 
 # ========== 通用 Conda 依赖 ==========
-[dependencies]
+[tool.pixi.dependencies]
 # Python 版本
 python = "3.10.*"
 
@@ -49,18 +133,18 @@ shapely = ">=2.0"
 pip = ">=23.0"
 
 # ========== 平台特定 Conda 依赖 ==========
-[target.linux-64.dependencies]
+[tool.pixi.target.linux-64.dependencies]
 cuda-version = "==11.8"
 
-[target.win-64.dependencies]
+[tool.pixi.target.win-64.dependencies]
 cuda-version = "==11.8"
 
 # ========== 通用 PyPI 依赖 ==========
-[pypi-dependencies]
+[tool.pixi.pypi-dependencies]
 # 本地包（editable 模式）
 mapanything = { path = ".", editable = true }
 
-# MapAnything 核心依赖（来自 pyproject.toml）
+# MapAnything 核心依赖
 hydra-core = ">=1.3"
 natsort = ">=8.4"
 orjson = ">=3.9"
@@ -91,85 +175,85 @@ pymeshlab = ">=2023.12"
 
 # ========== 平台特定 PyPI 依赖 ==========
 # Linux x86_64
-[target.linux-64.pypi-dependencies]
+[tool.pixi.target.linux-64.pypi-dependencies]
 torch = { version = "==2.3.1", index = "https://download.pytorch.org/whl/cu118" }
 torchvision = { version = "==0.18.1", index = "https://download.pytorch.org/whl/cu118" }
 torchaudio = { version = "==2.3.1", index = "https://download.pytorch.org/whl/cu118" }
 
 # Windows x86_64
-[target.win-64.pypi-dependencies]
+[tool.pixi.target.win-64.pypi-dependencies]
 torch = { version = "==2.3.1", index = "https://download.pytorch.org/whl/cu118" }
 torchvision = { version = "==0.18.1", index = "https://download.pytorch.org/whl/cu118" }
 torchaudio = { version = "==2.3.1", index = "https://download.pytorch.org/whl/cu118" }
 
 # Linux ARM64 (Jetson 等)
-[target.linux-aarch64.pypi-dependencies]
+[tool.pixi.target.linux-aarch64.pypi-dependencies]
 torch = ">=2.0"
 torchvision = ">=0.15"
 torchaudio = ">=2.0"
 
 # macOS ARM64 (Apple Silicon)
-[target.osx-arm64.pypi-dependencies]
+[tool.pixi.target.osx-arm64.pypi-dependencies]
 torch = ">=2.0"
 torchvision = ">=0.15"
 torchaudio = ">=2.0"
 
 # ========== Feature: data ==========
-[feature.data.dependencies]
+[tool.pixi.feature.data.dependencies]
 pandas = ">=2.0"
 
 # ========== Feature: dev ==========
-[feature.dev.pypi-dependencies]
+[tool.pixi.feature.dev.pypi-dependencies]
 pre-commit = ">=3.6"
 pytest = ">=7.4"
 pytest-cov = ">=4.1"
 ruff = ">=0.1"
 
 # ========== Feature: colmap ==========
-[feature.colmap.pypi-dependencies]
+[tool.pixi.feature.colmap.pypi-dependencies]
 lightglue = { git = "https://github.com/cvg/LightGlue.git" }
 pycolmap = "==3.10.0"
 
 # ========== Feature: gradio ==========
-[feature.gradio.pypi-dependencies]
+[tool.pixi.feature.gradio.pypi-dependencies]
 gradio = ">=4.0"
 spaces = ">=0.19"
 
 # ========== Feature: radio ==========
-[feature.radio.pypi-dependencies]
+[tool.pixi.feature.radio.pypi-dependencies]
 timm = ">=0.9"
 
 # ========== Feature: anycalib ==========
-[feature.anycalib.pypi-dependencies]
+[tool.pixi.feature.anycalib.pypi-dependencies]
 anycalib = { git = "https://github.com/javrtg/AnyCalib.git", branch = "main" }
 
 # ========== Feature: dust3r ==========
-[feature.dust3r.pypi-dependencies]
+[tool.pixi.feature.dust3r.pypi-dependencies]
 croco = { git = "https://github.com/naver/croco.git", branch = "croco_module" }
 dust3r = { git = "https://github.com/naver/dust3r.git", branch = "dust3r_setup" }
 
 # ========== Feature: mast3r ==========
-[feature.mast3r.pypi-dependencies]
+[tool.pixi.feature.mast3r.pypi-dependencies]
 mast3r = { git = "https://github.com/Nik-V9/mast3r.git", branch = "main" }
 
 # ========== Feature: must3r ==========
-[feature.must3r.pypi-dependencies]
+[tool.pixi.feature.must3r.pypi-dependencies]
 must3r = { git = "https://github.com/naver/must3r.git", branch = "main" }
 
 # ========== Feature: pow3r ==========
-[feature.pow3r.pypi-dependencies]
+[tool.pixi.feature.pow3r.pypi-dependencies]
 pow3r = { git = "https://github.com/Nik-V9/pow3r.git", branch = "main" }
 
 # ========== Feature: depth-anything-3 ==========
-[feature.depth-anything-3.pypi-dependencies]
+[tool.pixi.feature.depth-anything-3.pypi-dependencies]
 depth-anything-3 = { git = "https://github.com/Nik-V9/depth-anything-3.git", branch = "main" }
 
 # ========== Feature: rmvd ==========
-[feature.rmvd.pypi-dependencies]
+[tool.pixi.feature.rmvd.pypi-dependencies]
 rmvd = { git = "https://github.com/infinity1096/robustmvd.git", branch = "master" }
 
 # ========== 任务定义 ==========
-[tasks]
+[tool.pixi.tasks]
 # 安装 LightGlue（手动安装，避免依赖冲突）
 install-lightglue = "pip install git+https://github.com/cvg/LightGlue.git --no-deps"
 
@@ -197,7 +281,7 @@ format = "ruff format ."
 info = "python -c \"import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA: {torch.cuda.is_available()}'); print(f'Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"CPU\"}')\""
 
 # ========== 环境定义 ==========
-[environments]
+[tool.pixi.environments]
 # 默认环境
 default = { features = ["data"], solve-group = "default" }
 
