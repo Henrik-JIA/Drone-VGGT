@@ -1,220 +1,153 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
-build-backend = "setuptools.build_meta"
+build-backend = "hatchling.build"
+requires = ["hatchling"]
 
 [project]
 name = "dronemapanything"
 version = "1.1.0"
 description = "Universal Feed-Forward Metric 3D Reconstruction with Drone Mapping"
-readme = "readme.md"
 authors = [{ name = "Zhihao Jia", email = "jiazhihaojzh@126.com" }]
-requires-python = ">=3.10.0"
+license = { text = "MIT" }
+readme = "readme.md"
+requires-python = ">=3.10"
+keywords = [
+    "3d-reconstruction",
+    "drone-mapping",
+    "photogrammetry",
+    "sfm",
+    "deep-learning",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
 dependencies = [
-    "huggingface_hub",
-    "hydra-core",
-    "natsort",
-    "opencv-python-headless==4.10.0.84",
-    "orjson",
-    "pillow-heif",
-    "plyfile",
-    "python-box",
-    "requests",
-    "rerun-sdk~=0.24.1",
-    "safetensors",
-    "tensorboard",
-    "tqdm",
-    "trimesh",
+    # MapAnything 核心依赖
+    "huggingface_hub>=0.20,<1",
+    "hydra-core>=1.3,<2",
+    "natsort>=8.4,<9",
+    "orjson>=3.9,<4",
+    "pillow-heif>=0.13,<1",
+    "plyfile>=1.0,<2",
+    "python-box>=7.1,<8",
+    "requests>=2.31,<3",
+    "rerun-sdk>=0.15,<1",
+    "safetensors>=0.4,<1",
+    "tensorboard>=2.15,<3",
+    "trimesh>=4.0,<5",
     "uniception==0.1.6",
+
+    # 深度学习工具
+    "kornia>=0.7,<1",
+    "timm>=0.9,<1",
+
+    # 可视化
+    "viser>=0.1,<1",
+    "plotly>=5.18,<6",
+    "matplotlib>=3.8,<4",
+
+    # GPS 和坐标转换
+    "pymap3d>=3.0,<4",
+
+    # LAS 文件支持
+    "laspy>=2.5,<3",
+
+    # 网格处理
+    "pymeshlab>=2023.12",
+
+    # 科学计算
+    "scipy>=1.11,<2",
+    "scikit-image>=0.21,<1",
+    "scikit-learn>=1.3,<2",
+
+    # 数据处理
+    "pandas>=2.0,<3",
+    "tqdm>=4.65,<5",
+
+    # 工具
+    "pip",
+    "ruff",
 ]
 
-[project.optional-dependencies]
-data = ["pandas"]
-dev = ["pre-commit", "pytest", "pytest-cov", "ruff"]
-colmap = [
-    "lightglue @ git+https://github.com/cvg/LightGlue.git",
-    "pycolmap==3.10.0"
-]
-gradio = ["gradio", "spaces"]
-radio = ["timm"]
-# External models for benchmarking
-anycalib = ["anycalib @ git+https://github.com/javrtg/AnyCalib.git@main#egg=anycalib"]
-dust3r = [
-    "croco @ git+https://github.com/naver/croco.git@croco_module#egg=croco",
-    "dust3r @ git+https://github.com/naver/dust3r.git@dust3r_setup#egg=dust3r",
-]
-mast3r = ["mast3r @ git+https://github.com/Nik-V9/mast3r.git@main#egg=mast3r"]
-must3r = ["must3r @ git+https://github.com/naver/must3r.git@main#egg=must3r"]
-pow3r = ["pow3r @ git+https://github.com/Nik-V9/pow3r.git@main#egg=pow3r"]
-depth-anything-3 = ["depth-anything-3 @ git+https://github.com/Nik-V9/depth-anything-3.git@main#egg=depth-anything-3"]
-rmvd = ["rmvd @ git+https://github.com/infinity1096/robustmvd.git@master#egg=rmvd"]
-
-# Install all optional dependencies
-all = [
-    "dronemapanything[anycalib]",
-    "dronemapanything[colmap]",
-    "dronemapanything[data]",
-    "dronemapanything[depth-anything-3]",
-    "dronemapanything[dev]",
-    "dronemapanything[dust3r]",
-    "dronemapanything[gradio]",
-    "dronemapanything[mast3r]",
-    "dronemapanything[must3r]",
-    "dronemapanything[pow3r]",
-    "dronemapanything[radio]",
-    "dronemapanything[rmvd]",
-]
-
-# Setuptools configuration
-[tool.setuptools]
-packages = ["dronemapanything"]
-
-[tool.setuptools.package-data]
-"dronemapanything" = ["**/*"]
-
-# Ruff for linting
-[tool.ruff]
-line-length = 120
-lint.extend-select = ["I"]
-target-version = "py310"
-
-[tool.ruff.lint.isort]
-case-sensitive = false
-combine-as-imports = true
-detect-same-package = false
-order-by-type = false
-known-first-party = ["dronemapanything", "uniception"]
-
-# ========================================================================= #
-# Pixi 配置
-# ========================================================================= #
 [tool.pixi.workspace]
 channels = ["conda-forge"]
-platforms = ["win-64", "linux-64", "linux-aarch64", "osx-arm64"]
+platforms = ["win-64", "linux-aarch64", "linux-64", "osx-arm64"]
 
-# 系统要求 - 匹配你的 CUDA 11.8 环境
-[tool.pixi.system-requirements]
-cuda = "11.8"
-
-# ========== 通用 Conda 依赖 ==========
+#=========================================================================#
+# conda dependencies
+#=========================================================================#
 [tool.pixi.dependencies]
 python = "3.10.*"
-numpy = ">=1.26,<2"
-scipy = ">=1.11"
-scikit-image = ">=0.21"
-scikit-learn = ">=1.3"
+numpy = ">=1.26.0,<2"
+
+# 点云和 3D 处理
 open3d = ">=0.17"
+
+# 图像处理
 opencv = ">=4.8"
 pillow = ">=10.0"
-matplotlib = ">=3.8"
-tqdm = ">=4.65"
+
+# 其他工具
 einops = ">=0.7"
-safetensors = ">=0.4"
-huggingface_hub = ">=0.20"
+
+# 地理空间
 gdal = ">=3.8"
 rasterio = ">=1.3"
 pyproj = ">=3.6"
 shapely = ">=2.0"
-pip = ">=23.0"
 
-# ========== 平台特定 Conda 依赖 ==========
+[tool.pixi.target.linux-aarch64.dependencies]
+# ARM64 不指定 cuda-version
+
 [tool.pixi.target.linux-64.dependencies]
 cuda-version = "==11.8"
 
 [tool.pixi.target.win-64.dependencies]
 cuda-version = "==11.8"
 
-[tool.pixi.target.linux-aarch64.dependencies]
-# ARM64 通常不需要指定 cuda-version
-
 [tool.pixi.target.osx-arm64.dependencies]
 # macOS ARM64 不需要 CUDA
 
-# ========== 通用 PyPI 依赖 ==========
+#=========================================================================#
+# pypi dependencies
+#=========================================================================#
 [tool.pixi.pypi-dependencies]
 dronemapanything = { path = ".", editable = true }
-kornia = ">=0.7"
-viser = ">=0.1"
-plotly = ">=5.18"
-pymap3d = ">=3.0"
-laspy = ">=2.5"
-pymeshlab = ">=2023.12"
 
-# ========== 平台特定 PyPI 依赖 ==========
-# Linux x86_64
+[tool.pixi.target.linux-aarch64.pypi-dependencies]
+torch = { url = "https://github.com/ultralytics/assets/releases/download/v0.0.0/torch-2.5.0a0+872d972e41.nv24.08-cp310-cp310-linux_aarch64.whl" }
+torchvision = { url = "https://github.com/ultralytics/assets/releases/download/v0.0.0/torchvision-0.20.0a0+afc54f7-cp310-cp310-linux_aarch64.whl" }
+torchaudio = ">=2.0,<3"
+
 [tool.pixi.target.linux-64.pypi-dependencies]
 torch = { version = "==2.3.1", index = "https://download.pytorch.org/whl/cu118" }
 torchvision = { version = "==0.18.1", index = "https://download.pytorch.org/whl/cu118" }
 torchaudio = { version = "==2.3.1", index = "https://download.pytorch.org/whl/cu118" }
 
-# Windows x86_64
 [tool.pixi.target.win-64.pypi-dependencies]
 torch = { version = "==2.3.1", index = "https://download.pytorch.org/whl/cu118" }
 torchvision = { version = "==0.18.1", index = "https://download.pytorch.org/whl/cu118" }
 torchaudio = { version = "==2.3.1", index = "https://download.pytorch.org/whl/cu118" }
 
-# Linux ARM64 (Jetson 等) - 使用预编译的 wheel
-[tool.pixi.target.linux-aarch64.pypi-dependencies]
-torch = { url = "https://github.com/ultralytics/assets/releases/download/v0.0.0/torch-2.5.0a0+872d972e41.nv24.08-cp310-cp310-linux_aarch64.whl" }
-torchvision = { url = "https://github.com/ultralytics/assets/releases/download/v0.0.0/torchvision-0.20.0a0+afc54f7-cp310-cp310-linux_aarch64.whl" }
-torchaudio = ">=2.0"
-
-# macOS ARM64 (Apple Silicon)
 [tool.pixi.target.osx-arm64.pypi-dependencies]
-torch = ">=2.0"
-torchvision = ">=0.15"
-torchaudio = ">=2.0"
+torch = ">=2.0,<3"
+torchvision = ">=0.15,<1"
+torchaudio = ">=2.0,<3"
 
-# ========== Feature: data ==========
-[tool.pixi.feature.data.dependencies]
-pandas = ">=2.0"
+[tool.pixi.system-requirements]
+cuda = "11.8"
 
-# ========== Feature: dev ==========
-[tool.pixi.feature.dev.pypi-dependencies]
-dronemapanything = { path = ".", editable = true, extras = ["dev"] }
+[tool.pixi.environments]
+default = { features = [], solve-group = "default" }
 
-# ========== Feature: colmap ==========
-[tool.pixi.feature.colmap.pypi-dependencies]
-dronemapanything = { path = ".", editable = true, extras = ["colmap"] }
-
-# ========== Feature: gradio ==========
-[tool.pixi.feature.gradio.pypi-dependencies]
-dronemapanything = { path = ".", editable = true, extras = ["gradio"] }
-
-# ========== Feature: radio ==========
-[tool.pixi.feature.radio.pypi-dependencies]
-dronemapanything = { path = ".", editable = true, extras = ["radio"] }
-
-# ========== Feature: anycalib ==========
-[tool.pixi.feature.anycalib.pypi-dependencies]
-dronemapanything = { path = ".", editable = true, extras = ["anycalib"] }
-
-# ========== Feature: dust3r ==========
-[tool.pixi.feature.dust3r.pypi-dependencies]
-dronemapanything = { path = ".", editable = true, extras = ["dust3r"] }
-
-# ========== Feature: mast3r ==========
-[tool.pixi.feature.mast3r.pypi-dependencies]
-dronemapanything = { path = ".", editable = true, extras = ["mast3r"] }
-
-# ========== Feature: must3r ==========
-[tool.pixi.feature.must3r.pypi-dependencies]
-dronemapanything = { path = ".", editable = true, extras = ["must3r"] }
-
-# ========== Feature: pow3r ==========
-[tool.pixi.feature.pow3r.pypi-dependencies]
-dronemapanything = { path = ".", editable = true, extras = ["pow3r"] }
-
-# ========== Feature: depth-anything-3 ==========
-[tool.pixi.feature.depth-anything-3.pypi-dependencies]
-dronemapanything = { path = ".", editable = true, extras = ["depth-anything-3"] }
-
-# ========== Feature: rmvd ==========
-[tool.pixi.feature.rmvd.pypi-dependencies]
-dronemapanything = { path = ".", editable = true, extras = ["rmvd"] }
-
-# ========== 任务定义 ==========
 [tool.pixi.tasks]
-# 安装 LightGlue（手动安装，避免依赖冲突）
+# 安装 LightGlue
 install-lightglue = "pip install git+https://github.com/cvg/LightGlue.git --no-deps"
 
 # 安装第三方子模块
@@ -240,11 +173,8 @@ format = "ruff format ."
 # 显示环境信息
 info = "python -c \"import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA: {torch.cuda.is_available()}'); print(f'Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"CPU\"}')\""
 
-# ========== 环境定义 ==========
-[tool.pixi.environments]
-default = { features = ["data"], solve-group = "default" }
-dev = { features = ["data", "dev"], solve-group = "default" }
-colmap = { features = ["data", "colmap"], solve-group = "default" }
-gradio = { features = ["data", "gradio"], solve-group = "default" }
-full = { features = ["data", "dev", "colmap", "gradio", "radio"], solve-group = "default" }
-benchmarks = { features = ["data", "colmap", "anycalib", "dust3r", "mast3r", "must3r", "pow3r", "depth-anything-3", "rmvd"], solve-group = "default" }
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+extend-select = ["I"]
