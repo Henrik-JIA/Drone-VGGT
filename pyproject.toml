@@ -8,7 +8,7 @@ version = "1.1.0"
 description = "Universal Feed-Forward Metric 3D Reconstruction with Drone Mapping"
 authors = [{ name = "Zhihao Jia", email = "jiazhihaojzh@126.com" }]
 license = { text = "MIT" }
-readme = "readme.md"
+readme = "README.md"
 requires-python = ">=3.10"
 keywords = [
     "3d-reconstruction",
@@ -37,11 +37,11 @@ dependencies = [
     "plyfile>=1.0,<2",
     "python-box>=7.1,<8",
     "requests>=2.31,<3",
-    "rerun-sdk>=0.15,<1",
+    # rerun-sdk 和 uniception 依赖冲突（numpy 版本），需要时手动安装
     "safetensors>=0.4,<1",
     "tensorboard>=2.15,<3",
     "trimesh>=4.0,<5",
-    "uniception==0.1.6",
+    # "uniception==0.1.6",  # 依赖 rerun-sdk，与 numpy<2 冲突
 
     # 深度学习工具
     "kornia>=0.7,<1",
@@ -58,13 +58,8 @@ dependencies = [
     # LAS 文件支持
     "laspy>=2.5,<3",
 
-    # 网格处理
-    "pymeshlab>=2023.12",
-
-    # 科学计算
-    "scipy>=1.11,<2",
-    "scikit-image>=0.21,<1",
-    "scikit-learn>=1.3,<2",
+    # 网格处理 - pymeshlab 在 linux-aarch64 上不兼容，需要时手动安装
+    # "pymeshlab>=2023.12",
 
     # 数据处理
     "pandas>=2.0,<3",
@@ -86,6 +81,11 @@ platforms = ["win-64", "linux-aarch64", "linux-64", "osx-arm64"]
 python = "3.10.*"
 numpy = ">=1.26.0,<2"
 
+# 科学计算
+scipy = ">=1.11"
+scikit-image = ">=0.21"
+scikit-learn = ">=1.3"
+
 # 点云和 3D 处理
 open3d = ">=0.17"
 
@@ -102,17 +102,20 @@ rasterio = ">=1.3"
 pyproj = ">=3.6"
 shapely = ">=2.0"
 
+# pycolmap 通过 conda 安装（支持所有平台）
 [tool.pixi.target.linux-aarch64.dependencies]
-# ARM64 不指定 cuda-version
+pycolmap = ">=0.6"
 
 [tool.pixi.target.linux-64.dependencies]
+pycolmap = ">=0.6"
 cuda-version = "==11.8"
 
 [tool.pixi.target.win-64.dependencies]
+pycolmap = ">=0.6"
 cuda-version = "==11.8"
 
 [tool.pixi.target.osx-arm64.dependencies]
-# macOS ARM64 不需要 CUDA
+pycolmap = ">=0.6"
 
 #=========================================================================#
 # pypi dependencies
@@ -123,7 +126,7 @@ dronemapanything = { path = ".", editable = true }
 [tool.pixi.target.linux-aarch64.pypi-dependencies]
 torch = { url = "https://github.com/ultralytics/assets/releases/download/v0.0.0/torch-2.5.0a0+872d972e41.nv24.08-cp310-cp310-linux_aarch64.whl" }
 torchvision = { url = "https://github.com/ultralytics/assets/releases/download/v0.0.0/torchvision-0.20.0a0+afc54f7-cp310-cp310-linux_aarch64.whl" }
-torchaudio = ">=2.0,<3"
+# torchaudio 在 linux-aarch64 上与 torch wheel 版本不匹配，暂不安装
 
 [tool.pixi.target.linux-64.pypi-dependencies]
 torch = { version = "==2.3.1", index = "https://download.pytorch.org/whl/cu118" }
@@ -147,6 +150,15 @@ cuda = "11.8"
 default = { features = [], solve-group = "default" }
 
 [tool.pixi.tasks]
+# 安装 rerun-sdk（linux-aarch64 不支持，其他平台可用）
+install-rerun = "pip install rerun-sdk>=0.15"
+
+# 安装 pymeshlab（linux-aarch64 不支持，其他平台可用）
+install-pymeshlab = "pip install pymeshlab>=2023.12"
+
+# 安装 uniception（需要 numpy>=2，与当前环境冲突）
+install-uniception = "pip install uniception==0.1.6"
+
 # 安装 LightGlue
 install-lightglue = "pip install git+https://github.com/cvg/LightGlue.git --no-deps"
 
@@ -172,6 +184,9 @@ format = "ruff format ."
 
 # 显示环境信息
 info = "python -c \"import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA: {torch.cuda.is_available()}'); print(f'Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"CPU\"}')\""
+
+[tool.hatch.build.targets.wheel]
+packages = ["mapanything"]
 
 [tool.ruff]
 line-length = 120
