@@ -3575,7 +3575,7 @@ def run_incremental_feature_matching(
     merge_statistical_filter: bool = False,  # 是否启用统计过滤
     export_georef: bool = True,  # 是否导出地理坐标系的重建结果
     target_crs: str = "auto_utm",  # 目标坐标系: "auto_utm", "EPSG:3857", "EPSG:4326", 等
-    merge_method: str = 'confidence',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only' 合并方式
+    merge_method: str = 'points_only',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only' 合并方式
     enable_visualization: bool = True,
     visualization_mode: str = 'merged',  # 'aligned' | 'merged'
     # FastVGGT 特有参数

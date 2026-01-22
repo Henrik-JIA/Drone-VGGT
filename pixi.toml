@@ -3,7 +3,12 @@ name = "drone-map-anything"
 version = "1.0.0"
 description = "Universal Feed-Forward Metric 3D Reconstruction with Drone Mapping"
 authors = ["Your Name <your.email@example.com>"]
-channels = ["pytorch", "nvidia/label/cuda-11.8.0", "conda-forge"]
+# 使用清华镜像源（国内访问更稳定）
+channels = [
+    "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/pytorch/",
+    "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/nvidia/",
+    "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge/"
+]
 platforms = ["win-64", "linux-64"]
 
 # 系统要求 - 匹配你的 CUDA 11.8 环境
@@ -16,10 +21,10 @@ cuda = "11.8"
 python = ">=3.10,<3.12"
 
 # PyTorch 生态 - 匹配 torch 2.3.1+cu118
-pytorch = "2.3.1"
-torchvision = "0.18.1"
-torchaudio = "2.3.1"
-pytorch-cuda = "11.8"
+pytorch = "==2.3.1"
+torchvision = "==0.18.1"
+torchaudio = "==2.3.1"
+pytorch-cuda = "==11.8"
 
 # 科学计算
 numpy = "1.26.*"
@@ -138,9 +143,9 @@ pytest-cov = ">=4.1"
 [feature.minimal.dependencies]
 # 最小环境，不含 gradio 等大型依赖
 python = ">=3.10,<3.12"
-pytorch = "2.3.1"
-torchvision = "0.18.1"
-pytorch-cuda = "11.8"
+pytorch = "==2.3.1"
+torchvision = "==0.18.1"
+pytorch-cuda = "==11.8"
 numpy = "1.26.*"
 
 # ========== 环境定义 ==========
