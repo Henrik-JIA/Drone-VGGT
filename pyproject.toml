@@ -58,6 +58,9 @@ dependencies = [
     # LAS 文件支持
     "laspy>=2.5,<3",
 
+    # EXIF 处理
+    "piexif>=1.1,<2",
+
     # 网格处理 - pymeshlab 在 linux-aarch64 上不兼容，需要时手动安装
     # "pymeshlab>=2023.12",
 
