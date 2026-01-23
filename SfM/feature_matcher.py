@@ -313,7 +313,12 @@ class FeatureMatcherSfM:
         try:
             # Configure feature extraction options
             sift_options = pycolmap.SiftExtractionOptions()
-            sift_options.max_image_size = self.imgsz
+            # Handle pycolmap version compatibility
+            # Newer versions use 'max_image_dim', older versions use 'max_image_size'
+            if hasattr(sift_options, 'max_image_dim'):
+                sift_options.max_image_dim = self.imgsz
+            elif hasattr(sift_options, 'max_image_size'):
+                sift_options.max_image_size = self.imgsz
             sift_options.max_num_features = self.num_features
 
             # Extract features

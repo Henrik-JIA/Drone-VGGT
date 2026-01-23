@@ -3763,9 +3763,14 @@ if __name__ == "__main__":
     # input_dir = Path(r"drone-map-anything\examples\Comprehensive_building_sel\images")
     # output_dir = Path(r"drone-map-anything\output\Comprehensive_building_sel\sparse_incremental_reconstruction")
     
+    # windows path
     input_dir = Path(r"drone-map-anything\examples\Ganluo_images\images")
     output_dir = Path(r"drone-map-anything\output\Ganluo_images\sparse_incremental_reconstruction")
-    
+
+    # linux path
+    # input_dir = Path("examples/Ganluo_images/images")
+    # output_dir = Path("output/Ganluo_images/sparse_incremental_reconstruction")
+
     # input_dir = Path(r"drone-map-anything\examples\Tazishan\images")
     # output_dir = Path(r"drone-map-anything\output\Tazishan\sparse_incremental_reconstruction")
 
