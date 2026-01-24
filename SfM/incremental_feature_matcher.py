@@ -3220,6 +3220,322 @@ class IncrementalFeatureMatcherSfM:
         
         return reconstruction    
 
+    def _align_merged_to_global_sfm(
+        self,
+        reconstruction: pycolmap.Reconstruction,
+        alignment_mode: str = 'auto',
+        center_at_first_camera: bool = True
+    ) -> pycolmap.Reconstruction:
+        """
+        将merged_reconstruction对齐到原始的global_sparse_reconstruction。
+        
+        在地理参考导出之前调用此方法，可以：
+        1. 利用原始全局SfM的高精度位姿信息
+        2. 纠正合并过程中可能产生的累积误差/漂移
+        3. 确保最终输出的重建与原始SfM的几何一致性
+        
+        Args:
+            reconstruction: 要对齐的重建（通常是merged_reconstruction）
+            alignment_mode: 对齐模式
+                - 'auto': 自动选择最佳方式（优先3D点云对齐，失败后回退到相机位置对齐）
+                - 'pcl': 使用3D点云对齐
+                - 'camera': 使用相机位置对齐
+            center_at_first_camera: 是否将第一个相机位置设为世界坐标系原点（默认True）
+            
+        Returns:
+            对齐后的reconstruction
+        """
+        if self.global_sparse_reconstruction is None:
+            if self.verbose:
+                print("  Skipping alignment to global SfM (no global reconstruction available)")
+            return reconstruction
+        
+        if self.verbose:
+            print(f"  Aligning merged reconstruction to global sparse SfM...")
+        
+        try:
+            global_recon = self.global_sparse_reconstruction
+            
+            # 建立图像名称映射
+            merged_name_to_image = {img.name: img for img in reconstruction.images.values()}
+            global_name_to_image = {img.name: img for img in global_recon.images.values()}
+            
+            # 找到共同图像
+            common_names = set(merged_name_to_image.keys()) & set(global_name_to_image.keys())
+            
+            if len(common_names) < 3:
+                print(f"  Warning: Not enough common images ({len(common_names)}) for alignment, need at least 3")
+                return reconstruction
+            
+            if self.verbose:
+                print(f"    Found {len(common_names)} common images between merged and global SfM")
+            
+            alignment_success = False
+            
+            # 方法1：3D点云对齐（更精确，需要足够的共同3D点）
+            if alignment_mode in ('auto', 'pcl'):
+                if self.verbose:
+                    print(f"    Attempting 3D point cloud alignment...")
+                
+                try:
+                    from reconstruction_alignment import find_single_images_pair_matches_kdtree, _extract_valid_points2d, estimate_sim3_transform, HAS_KDTREE
+                except ImportError:
+                    from .reconstruction_alignment import find_single_images_pair_matches_kdtree, _extract_valid_points2d, estimate_sim3_transform, HAS_KDTREE
+                
+                point_correspondences = []
+                pixel_threshold = 3.0
+                
+                # 选择部分图像进行匹配（避免过多计算）
+                common_names_list = sorted(list(common_names))
+                n_common = len(common_names_list)
+                if n_common <= 5:
+                    selected_names = common_names_list
+                else:
+                    # 均匀采样
+                    step = max(1, n_common // 5)
+                    selected_names = [common_names_list[i] for i in range(0, n_common, step)][:5]
+                
+                for name in selected_names:
+                    merged_img = merged_name_to_image[name]
+                    global_img = global_name_to_image[name]
+                    
+                    # 提取merged图像的有效2D点
+                    merged_coords, merged_pt3d_ids = _extract_valid_points2d(merged_img)
+                    
+                    if not merged_coords:
+                        continue
+                    
+                    if HAS_KDTREE:
+                        merged_coords_arr = np.asarray(merged_coords, dtype=np.float64)
+                        correspondences = find_single_images_pair_matches_kdtree(
+                            global_img, 
+                            merged_img, 
+                            merged_coords_arr,
+                            merged_pt3d_ids,
+                            pixel_threshold, 
+                        )
+                    else:
+                        # 回退到网格搜索
+                        from .reconstruction_alignment import find_single_images_pair_matches
+                        merged_spatial_index = {}
+                        for i, (x, y) in enumerate(merged_coords):
+                            grid_key = (int(round(x)), int(round(y)))
+                            if grid_key in merged_spatial_index:
+                                merged_spatial_index[grid_key].append((merged_pt3d_ids[i], (x, y)))
+                            else:
+                                merged_spatial_index[grid_key] = [(merged_pt3d_ids[i], (x, y))]
+                        correspondences = find_single_images_pair_matches(
+                            global_img, 
+                            merged_img, 
+                            merged_spatial_index, 
+                            pixel_threshold, 
+                        )
+                    point_correspondences.extend(correspondences)
+                
+                if len(point_correspondences) >= 10:
+                    # 批量提取3D点坐标
+                    global_points3D = global_recon.points3D
+                    merged_points3D = reconstruction.points3D
+                    
+                    valid_pairs = [
+                        (global_pt3d_id, merged_pt3d_id)
+                        for global_pt3d_id, merged_pt3d_id, _ in point_correspondences
+                        if global_pt3d_id in global_points3D and merged_pt3d_id in merged_points3D
+                    ]
+                    
+                    if len(valid_pairs) >= 10:
+                        n_pairs = len(valid_pairs)
+                        global_pts3d = np.empty((n_pairs, 3), dtype=np.float64)
+                        merged_pts3d = np.empty((n_pairs, 3), dtype=np.float64)
+                        
+                        for i, (global_pid, merged_pid) in enumerate(valid_pairs):
+                            global_pts3d[i] = global_points3D[global_pid].xyz
+                            merged_pts3d[i] = merged_points3D[merged_pid].xyz
+                        
+                        # 估计 Sim3（merged → global）
+                        sim3_transform = estimate_sim3_transform(merged_pts3d, global_pts3d)
+                        if sim3_transform is not None:
+                            reconstruction.transform(sim3_transform)
+                            alignment_success = True
+                            if self.verbose:
+                                print(f"    ✓ Aligned via 3D point cloud matching")
+                                print(f"      Scale: {sim3_transform.scale:.6f}")
+                                print(f"      Used {len(valid_pairs)} 3D point pairs")
+            
+            # 方法2：相机位置对齐（更鲁棒，但精度可能略低）
+            if not alignment_success and alignment_mode in ('auto', 'camera'):
+                if self.verbose:
+                    print(f"    Attempting camera position alignment...")
+                
+                # 收集共同图像的相机位置
+                tgt_image_names = []
+                tgt_locations = []
+                
+                for name in common_names:
+                    global_img = global_name_to_image[name]
+                    # 计算相机中心位置: C = -R^T * t
+                    R = global_img.cam_from_world.rotation.matrix()
+                    t = global_img.cam_from_world.translation
+                    camera_center = -R.T @ t
+                    
+                    tgt_image_names.append(name)
+                    tgt_locations.append(camera_center)
+                
+                tgt_locations = np.array(tgt_locations, dtype=np.float64)
+                
+                # 使用RANSAC对齐
+                ransac_options = pycolmap.RANSACOptions()
+                ransac_options.max_error = 5.0  # 5米误差阈值
+                ransac_options.min_inlier_ratio = 0.3
+                
+                sim3d = pycolmap.align_reconstruction_to_locations(
+                    src=reconstruction,
+                    tgt_image_names=tgt_image_names,
+                    tgt_locations=tgt_locations,
+                    min_common_points=max(3, len(tgt_image_names) // 4),
+                    ransac_options=ransac_options
+                )
+                
+                if sim3d is not None:
+                    reconstruction.transform(sim3d)
+                    alignment_success = True
+                    if self.verbose:
+                        print(f"    ✓ Aligned via camera position matching")
+                        print(f"      Scale: {sim3d.scale:.6f}")
+                        print(f"      Used {len(tgt_image_names)} cameras")
+            
+            if not alignment_success:
+                print("  Warning: Failed to align merged reconstruction to global SfM")
+            else:
+                if self.verbose:
+                    print(f"  ✓ Merged reconstruction aligned to global sparse SfM")
+                
+                # 可选：将第一个相机位置设为世界坐标系原点
+                if center_at_first_camera:
+                    reconstruction = self._center_reconstruction_at_first_camera(reconstruction)
+                
+        except Exception as e:
+            print(f"  Error aligning merged reconstruction to global SfM: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        return reconstruction
+
+    def _center_reconstruction_at_first_camera(
+        self,
+        reconstruction: pycolmap.Reconstruction
+    ) -> pycolmap.Reconstruction:
+        """
+        将重建平移使第一个相机位置为世界坐标系原点。
+        
+        这与 feature_matcher.py 中 _align_to_enu 的行为一致：
+        对齐后确保第一个相机在原点 (0, 0, 0)。
+        
+        Args:
+            reconstruction: 要调整的重建
+            
+        Returns:
+            调整后的reconstruction（第一个相机在原点）
+        """
+        if len(self.image_paths) == 0:
+            if self.verbose:
+                print("    Warning: No image paths available, cannot center at first camera")
+            return reconstruction
+        
+        try:
+            # 获取第一个图像的名称
+            first_img_name = self.image_paths[0].name
+            first_camera_center = None
+            
+            # 在重建中找到第一个图像
+            for img in reconstruction.images.values():
+                if img.name == first_img_name:
+                    cam_from_world = img.cam_from_world
+                    R = cam_from_world.rotation.matrix()
+                    t = cam_from_world.translation
+                    # 计算相机中心: C = -R^T @ t
+                    first_camera_center = -R.T @ t
+                    break
+            
+            if first_camera_center is None:
+                if self.verbose:
+                    print(f"    Warning: First image '{first_img_name}' not found in reconstruction")
+                return reconstruction
+            
+            # 计算将第一个相机移动到原点所需的偏移
+            offset = -first_camera_center
+            
+            if self.verbose:
+                print(f"    First camera position: [{first_camera_center[0]:.4f}, {first_camera_center[1]:.4f}, {first_camera_center[2]:.4f}]")
+                print(f"    Applying translation to center at origin: [{offset[0]:.4f}, {offset[1]:.4f}, {offset[2]:.4f}]")
+            
+            # 应用纯平移变换（scale=1, R=identity）
+            self._apply_translation_to_reconstruction(reconstruction, offset)
+            
+            if self.verbose:
+                # 验证第一个相机现在是否在原点
+                for img in reconstruction.images.values():
+                    if img.name == first_img_name:
+                        cam_from_world = img.cam_from_world
+                        R = cam_from_world.rotation.matrix()
+                        t = cam_from_world.translation
+                        new_center = -R.T @ t
+                        print(f"    First camera final position: [{new_center[0]:.6f}, {new_center[1]:.6f}, {new_center[2]:.6f}]")
+                        break
+            
+            return reconstruction
+            
+        except Exception as e:
+            print(f"    Error centering reconstruction at first camera: {e}")
+            import traceback
+            traceback.print_exc()
+            return reconstruction
+
+    def _apply_translation_to_reconstruction(
+        self,
+        reconstruction: pycolmap.Reconstruction,
+        translation: np.ndarray
+    ):
+        """
+        对重建应用纯平移变换。
+        
+        将所有3D点和相机位置平移指定的偏移量。
+        
+        Args:
+            reconstruction: 要变换的重建
+            translation: 3D平移向量
+        """
+        # 平移所有3D点
+        for point3D_id in list(reconstruction.points3D.keys()):
+            point3D = reconstruction.points3D[point3D_id]
+            point3D.xyz = point3D.xyz + translation
+        
+        # 平移所有相机位置
+        for image_id in reconstruction.images:
+            image = reconstruction.images[image_id]
+            cam_from_world = image.cam_from_world
+            
+            # 获取旧的旋转和平移
+            R_old = cam_from_world.rotation.matrix()
+            t_old = cam_from_world.translation
+            
+            # 计算旧的相机中心: C_old = -R_old^T @ t_old
+            C_old = -R_old.T @ t_old
+            
+            # 新的相机中心: C_new = C_old + translation
+            C_new = C_old + translation
+            
+            # 旋转不变: R_new = R_old
+            # 新的平移: t_new = -R_old @ C_new
+            t_new = -R_old @ C_new
+            
+            # 更新相机位姿
+            new_cam_from_world = pycolmap.Rigid3d(
+                rotation=cam_from_world.rotation,  # 保持原旋转
+                translation=t_new
+            )
+            image.cam_from_world = new_cam_from_world
+
     def create_pixel_coordinate_grid(self, num_frames, height, width):
         """
         Creates a grid of pixel coordinates and frame indices for all frames.
@@ -3329,10 +3645,13 @@ class IncrementalFeatureMatcherSfM:
     def export_georeferenced(self, reconstruction: Optional[pycolmap.Reconstruction] = None, 
                               output_dir: Optional[Path] = None,
                               target_crs: str = "auto_utm",
-                              gps_prior: float = 5.0) -> bool:
+                              gps_prior: float = 5.0,
+                              align_to_global_sfm: bool = True,
+                              center_at_first_camera: bool = True) -> bool:
         """Export the reconstruction and poses in a target coordinate system.
 
         This method:
+        0. (Optional) Aligns merged reconstruction to global sparse SfM to correct drift
         1. Extracts camera positions from reconstruction and matches with original GPS data
         2. Converts original GPS lat/lon/alt to target CRS coordinates using pyproj
         3. Aligns the reconstruction to target coordinates using pycolmap model_aligner
@@ -3347,6 +3666,12 @@ class IncrementalFeatureMatcherSfM:
                 - "EPSG:4326": WGS84 经纬度坐标
                 - "EPSG:XXXX": 任意EPSG代码，如 "EPSG:32648" (UTM Zone 48N)
             gps_prior: GPS先验误差（米），用于alignment_max_error
+            align_to_global_sfm: 是否先对齐到全局稀疏SfM（默认True）
+                - True: 在地理参考对齐之前，先将merged_reconstruction对齐到global_sparse_reconstruction
+                  这可以纠正合并过程中产生的累积误差/漂移
+                - False: 跳过此步骤，直接使用GPS坐标进行地理参考对齐
+            center_at_first_camera: 是否将第一个相机位置设为世界坐标系原点（默认True）
+                - 仅在 align_to_global_sfm=True 时生效
 
         Returns:
             True if successful, False otherwise
@@ -3370,6 +3695,30 @@ class IncrementalFeatureMatcherSfM:
             return False
 
         try:
+            # 0. 首先将merged_reconstruction对齐到原始全局SfM（纠正累积误差）
+            # 同时保存重建到临时目录，供后续 model_aligner 使用
+            model_aligner_input_dir = None
+            
+            if align_to_global_sfm and self.global_sparse_reconstruction is not None:
+                if self.verbose:
+                    print(f"\n  Step 0: Aligning merged reconstruction to global sparse SfM...")
+                reconstruction = self._align_merged_to_global_sfm(
+                    reconstruction, 
+                    alignment_mode='auto',
+                    center_at_first_camera=center_at_first_camera
+                )
+                
+                # 保存对齐后的中间结果（同时作为 model_aligner 输入）
+                model_aligner_input_dir = output_dir.parent / "temp_merged_final_to_global_sfm"
+                model_aligner_input_dir.mkdir(parents=True, exist_ok=True)
+                reconstruction.write_text(str(model_aligner_input_dir))
+                reconstruction.export_PLY(str(model_aligner_input_dir / "points3D.ply"))
+                if self.verbose:
+                    print(f"    Saved aligned reconstruction to: {model_aligner_input_dir}")
+            elif align_to_global_sfm and self.global_sparse_reconstruction is None:
+                if self.verbose:
+                    print(f"\n  Step 0: Skipping alignment to global SfM (no global reconstruction available)")
+            
             # 1. 建立 image_name -> GPS 的映射（从原始数据）
             image_name_to_gps = {}
             for ext in self.ori_extrinsic:
@@ -3458,13 +3807,17 @@ class IncrementalFeatureMatcherSfM:
             tgt_image_names = image_names
             min_common_images = min(len(tgt_image_names), 3)
 
-            # 保存ENU重建到临时目录（用于colmap model_aligner输入）
-            enu_temp_dir = output_dir.parent / "enu_temp"
-            enu_temp_dir.mkdir(parents=True, exist_ok=True)
-            reconstruction.write_text(str(enu_temp_dir))
+            # 确保输出目录存在
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 如果还没有保存重建（未对齐到全局SfM的情况），则保存到临时目录
+            if model_aligner_input_dir is None:
+                model_aligner_input_dir = output_dir.parent / "temp_enu"
+                model_aligner_input_dir.mkdir(parents=True, exist_ok=True)
+                reconstruction.write_text(str(model_aligner_input_dir))
 
             # Write reference images file for colmap model_aligner
-            ref_images_path = output_dir.parent / "georef_locations.txt"
+            ref_images_path = output_dir / "georef_locations.txt"
             with open(ref_images_path, "w") as f:
                 for img_name, (x, y, z) in zip(tgt_image_names, target_coords_offset):
                     f.write(f"{img_name} {x} {y} {z}\n")
@@ -3474,13 +3827,12 @@ class IncrementalFeatureMatcherSfM:
                 print(f"  Geo center (offset): [{geo_center[0]:.3f}, {geo_center[1]:.3f}, {geo_center[2]:.3f}]")
 
             # 6. Use colmap model_aligner to align reconstruction to target CRS
-            output_dir.mkdir(parents=True, exist_ok=True)
 
             cmd = [
                 "colmap",
                 "model_aligner",
                 "--log_to_stderr", "1" if self.verbose else "0",
-                "--input_path", str(enu_temp_dir),
+                "--input_path", str(model_aligner_input_dir),
                 "--output_path", str(output_dir),
                 "--ref_images_path", str(ref_images_path),
                 "--alignment_type", "custom",
@@ -3508,8 +3860,8 @@ class IncrementalFeatureMatcherSfM:
                 return False
 
             # 8. Export as PLY and LAS
-            rec_georef.export_PLY(str(output_dir / "sparse_points.ply"))
-            self.export_reconstruction_to_las(rec_georef, str(output_dir / "sparse_points.las"))
+            rec_georef.export_PLY(str(output_dir / "points3D.ply"))
+            self.export_reconstruction_to_las(rec_georef, str(output_dir / "points3D.las"))
 
             # Store georeferenced data for later use
             self.geo_center = geo_center
@@ -3532,28 +3884,180 @@ class IncrementalFeatureMatcherSfM:
             traceback.print_exc()
             return False
 
-    def export_utm(self, reconstruction: Optional[pycolmap.Reconstruction] = None, 
-                   output_dir: Optional[Path] = None,
-                   gps_prior: float = 5.0) -> bool:
-        """Export the reconstruction in auto-detected UTM coordinates.
+    def export_dsm(
+        self,
+        output_path: Optional[Path] = None,
+        resolution: float = 0.1,
+        interpolation_method: str = "nearest",
+        aggregation: str = "max",
+        boundary_mask: bool = True,
+        boundary_alpha: float = 0.005,
+        boundary_buffer: int = 2,
+    ) -> bool:
+        """Export a Digital Surface Model (DSM) from the merged point cloud.
         
-        This is a convenience wrapper for export_georeferenced with target_crs="auto_utm".
-        For more options (EPSG:3857, EPSG:4326, etc.), use export_georeferenced directly.
-
+        从合并后的密集点云生成 DSM.tif 文件。
+        
         Args:
-            reconstruction: pycolmap重建对象，默认使用 self.merged_reconstruction
-            output_dir: 输出目录
-            gps_prior: GPS先验误差（米）
-
+            output_path: 输出 DSM 文件路径，默认为 output_dir / "temp_dsm" / "dsm.tif"
+            resolution: DSM 分辨率（米），默认 0.1m (10cm)
+            interpolation_method: 空洞填充方法，可选:
+                - "nearest": 最近邻插值（快速，推荐）
+                - "linear": 线性插值
+                - "cubic": 三次插值（更平滑）
+                - "idw": 反距离加权插值
+                - "none": 不进行空洞填充
+            aggregation: 单元格聚合方式:
+                - "max": 取最大值（标准 DSM）
+                - "min": 取最小值
+                - "mean": 取平均值
+            boundary_mask: 是否使用点云边界轮廓裁剪（非矩形），默认 True
+            boundary_alpha: 边界轮廓参数:
+                - 0: 使用凸包（convex hull）
+                - >0: 使用凹包（concave hull），值越大边界越紧密
+            boundary_buffer: 边界向外扩展的像素数，默认 10
+                
         Returns:
             True if successful, False otherwise
         """
-        return self.export_georeferenced(
-            reconstruction=reconstruction,
-            output_dir=output_dir,
-            target_crs="auto_utm",
-            gps_prior=gps_prior
+        # 导入 DSM 导出模块
+        try:
+            from SfM.dsm import export_dsm_from_point_cloud
+        except ImportError:
+            try:
+                from dsm import export_dsm_from_point_cloud
+            except ImportError:
+                print("Error: DSM 模块不可用。请确保 SfM/dsm/ 存在。")
+                return False
+        
+        # 确定输入点云路径
+        point_cloud_path = self._find_merged_point_cloud()
+        
+        if point_cloud_path is None:
+            print("Error: 未找到有效的点云文件。请先运行重建流程。")
+            return False
+        
+        # 设置输出路径
+        if output_path is None:
+            output_path = self.output_dir / "temp_dsm" / "dsm.tif"
+        
+        # 使用通用导出函数
+        return export_dsm_from_point_cloud(
+            point_cloud_path=point_cloud_path,
+            output_path=output_path,
+            resolution=resolution,
+            epsg_code=self.output_epsg_code,
+            interpolation_method=interpolation_method,
+            aggregation=aggregation,
+            boundary_mask=boundary_mask,
+            boundary_alpha=boundary_alpha,
+            boundary_buffer=boundary_buffer,
+            verbose=self.verbose,
         )
+
+    def export_dsm_georeferenced(
+        self,
+        output_path: Optional[Path] = None,
+        resolution: float = 0.1,
+        interpolation_method: str = "nearest",
+        aggregation: str = "max",
+        boundary_mask: bool = True,
+        boundary_alpha: float = 0.005,
+        boundary_buffer: int = 2,
+    ) -> bool:
+        """Export a Digital Surface Model (DSM) from the georeferenced point cloud.
+        
+        从地理参考后的点云生成 DSM.tif 文件。
+        需要先调用 export_georeferenced() 生成地理参考点云。
+        
+        Args:
+            output_path: 输出 DSM 文件路径，默认为 output_dir / "temp_dsm_georeferenced" / "dsm.tif"
+            resolution: DSM 分辨率（米），默认 0.1m (10cm)
+            interpolation_method: 空洞填充方法
+            aggregation: 单元格聚合方式
+            boundary_mask: 是否使用点云边界轮廓裁剪
+            boundary_alpha: 边界轮廓参数
+            boundary_buffer: 边界向外扩展的像素数
+                
+        Returns:
+            True if successful, False otherwise
+        """
+        # 导入 DSM 导出模块
+        try:
+            from SfM.dsm import export_dsm_from_point_cloud, find_point_cloud_in_directory
+        except ImportError:
+            try:
+                from dsm import export_dsm_from_point_cloud, find_point_cloud_in_directory
+            except ImportError:
+                print("Error: DSM 模块不可用。请确保 SfM/dsm/ 存在。")
+                return False
+        
+        # 检查是否已有地理参考导出
+        if not hasattr(self, 'rec_georef_dir') or self.rec_georef_dir is None:
+            print("Error: 未找到地理参考导出结果。请先调用 export_georeferenced()。")
+            return False
+        
+        if self.verbose:
+            print(f"\n  [Georeferenced DSM] 地理参考目录: {self.rec_georef_dir}")
+            print(f"  [Georeferenced DSM] 目录存在: {self.rec_georef_dir.exists() if hasattr(self.rec_georef_dir, 'exists') else 'N/A'}")
+        
+        # 查找地理参考点云
+        point_cloud_path = find_point_cloud_in_directory(
+            self.rec_georef_dir, 
+            preferred_names=["sparse_points", "points3D"]
+        )
+        
+        if point_cloud_path is None:
+            print(f"Error: 未找到地理参考点云文件")
+            print(f"  搜索目录: {self.rec_georef_dir}")
+            # 列出目录内容以便调试
+            if hasattr(self.rec_georef_dir, 'exists') and self.rec_georef_dir.exists():
+                print(f"  目录内容: {list(self.rec_georef_dir.iterdir())}")
+            else:
+                print(f"  目录不存在!")
+            return False
+        
+        # 设置输出路径
+        if output_path is None:
+            output_path = self.output_dir / "temp_dsm" / "dsm_georeferenced.tif"
+        
+        if self.verbose:
+            print(f"  [Georeferenced DSM] 使用点云: {point_cloud_path}")
+            print(f"  [Georeferenced DSM] 点云存在: {point_cloud_path.exists()}")
+            print(f"  [Georeferenced DSM] EPSG: {self.output_epsg_code}")
+        
+        # 使用通用导出函数
+        return export_dsm_from_point_cloud(
+            point_cloud_path=point_cloud_path,
+            output_path=output_path,
+            resolution=resolution,
+            epsg_code=self.output_epsg_code,
+            interpolation_method=interpolation_method,
+            aggregation=aggregation,
+            boundary_mask=boundary_mask,
+            boundary_alpha=boundary_alpha,
+            boundary_buffer=boundary_buffer,
+            verbose=self.verbose,
+        )
+
+    def _find_merged_point_cloud(self) -> Optional[Path]:
+        """查找合并后的点云文件路径。"""
+        # 优先使用 points_only 模式的输出
+        if self.merge_method == 'points_only' and self.merged_points_xyz is not None:
+            num_batches = len(self.inference_reconstructions)
+            ply_path = self.output_dir / "temp_merged_points_only" / f"merged_{num_batches}.ply"
+            if ply_path.exists():
+                return ply_path
+        
+        # 如果没有找到，尝试使用 merged_reconstruction
+        if self.merged_reconstruction is not None:
+            num_batches = len(self.inference_reconstructions)
+            ply_path = self.output_dir / "temp_merged" / f"merged_{num_batches}" / "points3D.ply"
+            if ply_path.exists():
+                return ply_path
+        
+        return None
+
 
 def run_incremental_feature_matching(
     image_paths: List[Path],
@@ -3575,7 +4079,9 @@ def run_incremental_feature_matching(
     merge_statistical_filter: bool = False,  # 是否启用统计过滤
     export_georef: bool = True,  # 是否导出地理坐标系的重建结果
     target_crs: str = "auto_utm",  # 目标坐标系: "auto_utm", "EPSG:3857", "EPSG:4326", 等
-    merge_method: str = 'points_only',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only' 合并方式
+    export_dsm: bool = True,  # 是否导出 DSM (数字表面模型)
+    dsm_resolution: float = 0.1,  # DSM 分辨率（米），默认 10cm
+    merge_method: str = 'confidence',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only' 合并方式
     enable_visualization: bool = True,
     visualization_mode: str = 'merged',  # 'aligned' | 'merged'
     # FastVGGT 特有参数
@@ -3610,6 +4116,8 @@ def run_incremental_feature_matching(
             - "EPSG:3857": Web Mercator（适合网页地图可视化）
             - "EPSG:4326": WGS84 经纬度坐标
             - "EPSG:XXXX": 任意EPSG代码
+        export_dsm: Whether to export Digital Surface Model (DSM) as GeoTIFF
+        dsm_resolution: DSM resolution in meters (default 0.1m = 10cm)
         merge_method: Merge method selection: 
             'full' - use merge_full_pipeline.py with full pipeline
             'confidence' - use merge_confidence.py with simple confidence-based selection
@@ -3727,14 +4235,21 @@ def run_incremental_feature_matching(
     matcher._release_model()
 
     # Export georeferenced coordinates if requested
+    georef_export_success = False
     if export_georef:
         if matcher.merged_reconstruction is not None:
             if verbose:
                 print(f"\n{'='*60}")
                 print(f"Exporting to georeferenced coordinates (target_crs: {target_crs})...")
                 print(f"{'='*60}")
-            georef_success = matcher.export_georeferenced(target_crs=target_crs)
-            if not georef_success:
+            # align_to_global_sfm: Whether to align merged reconstruction to global sparse SfM first
+            # center_at_first_camera: Whether to center reconstruction at first camera position
+            georef_export_success = matcher.export_georeferenced(
+                target_crs=target_crs,
+                align_to_global_sfm=True, # 是否先对齐到全局稀疏SfM
+                center_at_first_camera=False # 是否将第一个相机位置设为世界坐标系原点
+            )
+            if not georef_export_success:
                 print("  Warning: Georeferenced export failed, but ENU reconstruction is still available")
         elif merge_method == 'points_only' and matcher.merged_points_xyz is not None:
             if verbose:
@@ -3742,6 +4257,43 @@ def run_incremental_feature_matching(
                 print(f"Note: Georeferenced export is not supported in 'points_only' mode.")
                 print(f"Point cloud has been saved to: {output_dir / 'temp_merged_points_only'}")
                 print(f"{'='*60}")
+        else:
+            if verbose:
+                print(f"\n  [Skip] Georeferenced export: merged_reconstruction is None")
+
+    # Export DSM if requested
+    if export_dsm:
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"Exporting Digital Surface Model (DSM)...")
+            print(f"{'='*60}")
+        dsm_success = matcher.export_dsm(
+            resolution=dsm_resolution,
+            interpolation_method="nearest",
+            aggregation="max",
+        )
+        if not dsm_success:
+            print("  Warning: DSM export failed")
+        else:
+            if verbose:
+                print(f"  ✓ DSM exported to: {output_dir / 'temp_dsm' / 'dsm.tif'}")
+        
+        # 如果已进行地理参考导出，也基于地理参考点云导出 DSM
+        if export_georef and georef_export_success and matcher.rec_georef_dir is not None:
+            if verbose:
+                print(f"\n{'='*60}")
+                print(f"Exporting DSM from georeferenced point cloud...")
+                print(f"{'='*60}")
+            georef_dsm_success = matcher.export_dsm_georeferenced(
+                resolution=dsm_resolution,
+                interpolation_method="nearest",
+                aggregation="max",
+            )
+            if not georef_dsm_success:
+                print("  Warning: Georeferenced DSM export failed")
+            else:
+                if verbose:
+                    print(f"  ✓ Georeferenced DSM exported to: {output_dir / 'temp_dsm' / 'dsm_georeferenced.tif'}")
 
     if verbose:
         stats = matcher.get_statistics()
