@@ -2935,7 +2935,7 @@ class IncrementalFeatureMatcherSfM:
                     # 4. 使用 RANSAC 估计 Sim3 变换（优化：根据点数动态调整迭代次数）
                     n_points = len(pts_prev)
                     # 点数少时需要更多迭代，点数多时可以减少
-                    max_iters = min(500, max(200, 1000 - n_points))
+                    max_iters = min(1000, max(500, 1000 - n_points))
                     
                     R, t, scale, inlier_mask = estimate_sim3_ransac(
                         pts_src=pts_curr,  # 源：当前 batch
@@ -4081,7 +4081,7 @@ def run_incremental_feature_matching(
     target_crs: str = "auto_utm",  # 目标坐标系: "auto_utm", "EPSG:3857", "EPSG:4326", 等
     export_dsm: bool = True,  # 是否导出 DSM (数字表面模型)
     dsm_resolution: float = 0.1,  # DSM 分辨率（米），默认 10cm
-    merge_method: str = 'confidence',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only' 合并方式
+    merge_method: str = 'points_only',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only' 合并方式
     enable_visualization: bool = True,
     visualization_mode: str = 'merged',  # 'aligned' | 'merged'
     # FastVGGT 特有参数

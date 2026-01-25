@@ -518,7 +518,7 @@ def rescale_reconstruction_to_original_size(
         for i, idx in enumerate(range(start_idx, end_idx)):
             extrinsic_info = ori_extrinsics[idx]
             R_cameras[i] = extrinsic_info['R_camera']
-            t = extrinsic_info['tvec']
+            t = np.asarray(extrinsic_info['tvec'])
             # 直接处理 tvec 形状
             tvecs[i] = t.reshape(3, 1) if t.ndim == 1 else t
         

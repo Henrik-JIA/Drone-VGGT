@@ -30,6 +30,7 @@ from typing import Optional, Tuple, List, Dict
 import numpy as np
 import open3d as o3d
 import pycolmap
+from PIL import Image
 
 
 # ============================================================================
@@ -95,6 +96,8 @@ class SfMVisualizerO3D:
         show_frustums: bool = True,
         show_points: bool = True,
         viewpoint_file: Optional[str] = None,
+        projection_mode: str = "perspective",
+        ortho_zoom: float = 0.5,
         verbose: bool = True,
     ):
         """
@@ -111,6 +114,8 @@ class SfMVisualizerO3D:
             show_frustums: 是否显示视锥体
             show_points: 是否显示点云
             viewpoint_file: 视角保存文件路径 (可选，默认保存到重建结果文件夹)
+            projection_mode: 投影模式 ('perspective' 透视 | 'orthographic' 正射)
+            ortho_zoom: 正射投影的缩放因子 (数值越小场景显示越大)
             verbose: 是否输出详细信息
         """
         self.reconstruction_path = Path(reconstruction_path)
@@ -121,6 +126,8 @@ class SfMVisualizerO3D:
         self.frustum_line_thickness = frustum_line_thickness
         self.show_frustums = show_frustums
         self.show_points = show_points
+        self.projection_mode = projection_mode  # 'perspective' or 'orthographic'
+        self.ortho_zoom = ortho_zoom
         self.verbose = verbose
 
         # 设置颜色主题
@@ -174,20 +181,29 @@ class SfMVisualizerO3D:
             print(f"  ✗ 保存视角失败: {e}")
             return False
 
-    def save_current_viewpoint(self, vis, name: str = "custom") -> bool:
+    def save_current_viewpoint(self, vis, name: str = "custom", is_ortho: bool = False) -> bool:
         """
         保存当前视角。
         
         Args:
             vis: Open3D Visualizer 对象
             name: 视角名称
+            is_ortho: 当前是否为正射投影模式
             
         Returns:
             是否保存成功
         """
         try:
-            # 获取当前视角参数
             ctr = vis.get_view_control()
+            
+            # 如果是正射投影模式，先临时切换到透视模式再保存
+            if is_ortho:
+                for _ in range(50):
+                    ctr.change_field_of_view(step=5.0)
+                vis.poll_events()
+                vis.update_renderer()
+            
+            # 获取当前视角参数
             cam_params = ctr.convert_to_pinhole_camera_parameters()
             
             # 提取关键参数
@@ -196,7 +212,15 @@ class SfMVisualizerO3D:
                 "intrinsic_width": cam_params.intrinsic.width,
                 "intrinsic_height": cam_params.intrinsic.height,
                 "intrinsic_matrix": cam_params.intrinsic.intrinsic_matrix.tolist(),
+                "was_ortho": is_ortho,  # 记录保存时的投影模式
             }
+            
+            # 如果之前是正射投影，恢复
+            if is_ortho:
+                for _ in range(50):
+                    ctr.change_field_of_view(step=-5.0)
+                vis.poll_events()
+                vis.update_renderer()
             
             self.saved_viewpoints[name] = viewpoint
             self._save_viewpoints_to_file()
@@ -208,13 +232,14 @@ class SfMVisualizerO3D:
             print(f"\n  ✗ 保存视角失败: {e}")
             return False
     
-    def load_viewpoint(self, vis, name: str = "custom") -> bool:
+    def load_viewpoint(self, vis, name: str = "custom", is_ortho: bool = False) -> bool:
         """
         加载已保存的视角。
         
         Args:
             vis: Open3D Visualizer 对象
             name: 视角名称
+            is_ortho: 当前是否处于正射投影模式
             
         Returns:
             是否加载成功
@@ -226,8 +251,17 @@ class SfMVisualizerO3D:
         try:
             viewpoint = self.saved_viewpoints[name]
             
-            # 恢复相机参数
             ctr = vis.get_view_control()
+            
+            # 如果当前是正射投影模式，先切换到透视模式
+            if is_ortho:
+                # 增大 FOV 切换到透视模式
+                for _ in range(50):
+                    ctr.change_field_of_view(step=5.0)
+                vis.poll_events()
+                vis.update_renderer()
+            
+            # 获取当前相机参数作为基础
             cam_params = ctr.convert_to_pinhole_camera_parameters()
             
             # 设置外参矩阵
@@ -235,6 +269,16 @@ class SfMVisualizerO3D:
             
             # 应用参数
             ctr.convert_from_pinhole_camera_parameters(cam_params, allow_arbitrary=True)
+            vis.poll_events()
+            vis.update_renderer()
+            
+            # 如果之前是正射投影，恢复
+            if is_ortho:
+                # 减小 FOV 切换回正射模式
+                for _ in range(50):
+                    ctr.change_field_of_view(step=-5.0)
+                vis.poll_events()
+                vis.update_renderer()
             
             print(f"\n  ✓ 视角 '{name}' 已加载")
             return True
@@ -527,6 +571,7 @@ class SfMVisualizerO3D:
         load_viewpoint: Optional[str] = None, 
         screenshot_dir: Optional[str] = None,
         window_size: Tuple[int, int] = (1280, 720),
+        screenshot_dpi: int = 300,
     ):
         """
         启动交互式可视化窗口。
@@ -543,6 +588,7 @@ class SfMVisualizerO3D:
             load_viewpoint: 启动时加载的视角名称 (可选)
             screenshot_dir: 截图保存目录 (可选，默认使用输出目录)
             window_size: 窗口尺寸 (width, height)
+            screenshot_dpi: 截图 DPI (默认 300，用于论文打印)
         """
         if not self.all_geometries:
             self.prepare_scene()
@@ -558,6 +604,8 @@ class SfMVisualizerO3D:
             print("  鼠标右键: 平移")
             print("  滚轮: 缩放")
             print("  ─────────────────────────────────")
+            print("  🔭 O: 切换投影模式 (透视/正射)")
+            print("  ─────────────────────────────────")
             print("  💾 保存视角 (组合键):")
             print("     S → 1-9: 保存到 'custom_1' ~ 'custom_9'")
             print("     (先按 S，然后按数字键)")
@@ -568,6 +616,7 @@ class SfMVisualizerO3D:
             print("  📷 P: 截图保存当前渲染")
             print("  ❌ Q/ESC: 退出")
             print(f"{'=' * 60}")
+            print(f"  🔭 当前投影模式: {self.projection_mode}")
             
             # 显示已保存的视角
             if self.saved_viewpoints:
@@ -627,22 +676,33 @@ class SfMVisualizerO3D:
             return False
         
         def take_screenshot(vis):
-            """P键: 截图保存"""
+            """P键: 截图保存 (带 DPI 设置)"""
             screenshot_counter["count"] += 1
             filename = screenshot_path / f"screenshot_{screenshot_counter['count']:03d}.png"
             vis.capture_screen_image(str(filename), do_render=True)
-            print(f"\n  📷 截图已保存: {filename}")
+            
+            # 使用 PIL 设置 DPI
+            try:
+                img = Image.open(str(filename))
+                img.save(str(filename), dpi=(screenshot_dpi, screenshot_dpi))
+                print(f"\n  📷 截图已保存: {filename} ({screenshot_dpi} DPI)")
+            except Exception as e:
+                print(f"\n  📷 截图已保存: {filename} (DPI 设置失败: {e})")
+            
             return False
+        
+        # 投影状态追踪 (用于保存/加载视角时正确处理正射投影)
+        projection_state = {"is_ortho": self.projection_mode == "orthographic"}
         
         def make_number_callback(num):
             """创建数字键回调"""
             def callback(vis):
                 mode = key_state["mode"]
                 if mode == "save":
-                    visualizer_self.save_current_viewpoint(vis, f"custom_{num}")
+                    visualizer_self.save_current_viewpoint(vis, f"custom_{num}", is_ortho=projection_state["is_ortho"])
                     key_state["mode"] = None
                 elif mode == "load":
-                    visualizer_self.load_viewpoint(vis, f"custom_{num}")
+                    visualizer_self.load_viewpoint(vis, f"custom_{num}", is_ortho=projection_state["is_ortho"])
                     key_state["mode"] = None
                 else:
                     # 非组合键模式下，数字键不做任何操作
@@ -674,6 +734,30 @@ class SfMVisualizerO3D:
                 return False
             return False
         vis.register_key_callback(27, escape_callback)
+        
+        # O/o 键 (ASCII 79, 111) - 切换投影模式
+        def toggle_projection(vis):
+            """O键: 切换透视/正射投影"""
+            ctr = vis.get_view_control()
+            projection_state["is_ortho"] = not projection_state["is_ortho"]
+            
+            if projection_state["is_ortho"]:
+                # 切换到正射投影（通过将 FOV 减小到最小值来模拟）
+                # Open3D 的正射投影通过将 FOV 设置为很小的值来实现
+                for _ in range(50):  # 多次减小 FOV
+                    ctr.change_field_of_view(step=-5.0)
+                print("\n  🔭 已切换到: 正射投影 (Orthographic)")
+            else:
+                # 切换到透视投影（恢复默认 FOV）
+                for _ in range(50):  # 多次增大 FOV
+                    ctr.change_field_of_view(step=5.0)
+                print("\n  🔭 已切换到: 透视投影 (Perspective)")
+            
+            vis.update_renderer()
+            return False
+        
+        vis.register_key_callback(79, toggle_projection)   # O
+        vis.register_key_callback(111, toggle_projection)  # o
 
         # 设置初始视角
         ctr = vis.get_view_control()
@@ -686,6 +770,14 @@ class SfMVisualizerO3D:
             self.load_viewpoint(vis, load_viewpoint)
         else:
             ctr.set_zoom(0.8)
+        
+        # 设置初始投影模式
+        if self.projection_mode == "orthographic":
+            # 切换到正射投影
+            for _ in range(50):
+                ctr.change_field_of_view(step=-5.0)
+            if self.verbose:
+                print("  🔭 初始投影: 正射投影 (Orthographic)")
 
         # 运行
         vis.run()
@@ -697,6 +789,7 @@ class SfMVisualizerO3D:
         views: Optional[List[str]] = None,
         resolution: Tuple[int, int] = (1920, 1080),
         format: str = "png",
+        dpi: int = 300,
     ):
         """
         捕获多个视角的高分辨率截图。
@@ -709,6 +802,7 @@ class SfMVisualizerO3D:
                    - 如果为 None，使用默认预设视角
             resolution: 输出分辨率 (width, height)
             format: 输出格式 ('png', 'jpg')
+            dpi: 输出 DPI (默认 300，用于论文打印)
         """
         if not self.all_geometries:
             self.prepare_scene()
@@ -776,9 +870,16 @@ class SfMVisualizerO3D:
             # 保存
             output_file = output_path / f"reconstruction_{view_name}.{format}"
             vis.capture_screen_image(str(output_file), do_render=True)
+            
+            # 设置 DPI
+            try:
+                img = Image.open(str(output_file))
+                img.save(str(output_file), dpi=(dpi, dpi))
+            except Exception:
+                pass  # 静默忽略 DPI 设置失败
 
             if self.verbose:
-                print(f"  ✓ 保存: {output_file}")
+                print(f"  ✓ 保存: {output_file} ({dpi} DPI)")
 
             vis.destroy_window()
     
@@ -973,6 +1074,13 @@ WINDOW_SIZE = (1280, 720)   # 小窗口，方便调试
 SHOW_FRUSTUMS = True       # 是否显示相机视锥体
 SHOW_POINTS = True         # 是否显示点云
 
+# 🔭 投影模式: "perspective" (透视投影) | "orthographic" (正射投影)
+# PROJECTION_MODE = "perspective"
+PROJECTION_MODE = "orthographic"
+
+# 📐 正射投影时的缩放因子 (数值越小，场景显示越大)
+ORTHO_ZOOM = 0.5
+
 # 🎯 启动时加载的视角 (设为 None 使用默认视角，设为 "custom_1" 加载保存的视角)
 LOAD_VIEWPOINT_ON_START = None
 # LOAD_VIEWPOINT_ON_START = "custom"  # 加载保存的 'custom' 视角
@@ -983,6 +1091,9 @@ VIEWPOINT_FILE = r"D:\Github_code\drone-map-anything\output\Ganluo_images\sparse
 
 # 📷 交互式截图保存目录 (按 P 键时保存的位置，设为 None 则使用 OUTPUT_DIR)
 SCREENSHOT_DIR = None  # 默认使用 OUTPUT_DIR
+
+# 🖨️ 截图 DPI (用于论文打印，推荐 300 DPI)
+SCREENSHOT_DPI = 300
 
 
 def main():
@@ -1006,6 +1117,8 @@ def main():
             show_frustums=SHOW_FRUSTUMS,
             show_points=SHOW_POINTS,
             viewpoint_file=VIEWPOINT_FILE,
+            projection_mode=PROJECTION_MODE,
+            ortho_zoom=ORTHO_ZOOM,
             verbose=True,
         )
 
@@ -1023,6 +1136,7 @@ def main():
             load_viewpoint=LOAD_VIEWPOINT_ON_START,
             screenshot_dir=screenshot_save_dir,
             window_size=WINDOW_SIZE,
+            screenshot_dpi=SCREENSHOT_DPI,
         )
             
     else:
@@ -1142,6 +1256,28 @@ def main():
             metavar=("WIDTH", "HEIGHT"),
             help="窗口/截图尺寸 (默认: 1280 720)",
         )
+        
+        parser.add_argument(
+            "--projection",
+            type=str,
+            default="perspective",
+            choices=["perspective", "orthographic"],
+            help="投影模式: perspective (透视) | orthographic (正射)",
+        )
+        
+        parser.add_argument(
+            "--ortho-zoom",
+            type=float,
+            default=0.5,
+            help="正射投影的缩放因子 (默认: 0.5)",
+        )
+        
+        parser.add_argument(
+            "--dpi",
+            type=int,
+            default=300,
+            help="截图 DPI (默认: 300，用于论文打印)",
+        )
 
         args = parser.parse_args()
 
@@ -1157,6 +1293,8 @@ def main():
             show_frustums=not args.no_frustums,
             show_points=not args.no_points,
             viewpoint_file=args.viewpoint_file,
+            projection_mode=args.projection,
+            ortho_zoom=args.ortho_zoom,
             verbose=True,
         )
 
@@ -1174,6 +1312,7 @@ def main():
             load_viewpoint=args.load_viewpoint,
             screenshot_dir=screenshot_dir,
             window_size=tuple(args.window_size),
+            screenshot_dpi=args.dpi,
         )
 
 
