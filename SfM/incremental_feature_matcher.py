@@ -3865,7 +3865,7 @@ def run_incremental_feature_matching(
     image_paths: List[Path],
     output_dir: Path,
     reconstruction_type: str = 'each_pixel_feature_points', # 'dense_feature_points' | 'each_pixel_feature_points'
-    model_type: str = 'mapanything',  # 'mapanything' | 'vggt' | 'fastvggt'
+    model_type: str = 'vggt',  # 'mapanything' | 'vggt' | 'fastvggt'
     model_path: Optional[str] = None,  # 模型权重路径（VGGT/FastVGGT需要）
     image_interval: int = 2,
     min_images_for_scale: int = 6,
@@ -3878,12 +3878,12 @@ def run_incremental_feature_matching(
     filter_edge_margin: float = 100.0, # 边缘过滤范围（像素），默认50，设为0禁用
     merge_voxel_size: float = 1.5,  # 点云合并时的体素大小（米）
     merge_boundary_filter: bool = True,  # 是否启用边界过滤
-    merge_statistical_filter: bool = False,  # 是否启用统计过滤
+    merge_statistical_filter: bool = True,  # 是否启用统计过滤
     export_georef: bool = True,  # 是否导出地理坐标系的重建结果
     target_crs: str = "auto_utm",  # 目标坐标系: "auto_utm", "EPSG:3857", "EPSG:4326", 等
     export_dsm: bool = True,  # 是否导出 DSM (数字表面模型)
     dsm_resolution: float = 0.1,  # DSM 分辨率（米），默认 10cm
-    merge_method: str = 'points_only',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only' 合并方式
+    merge_method: str = 'full',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only' 合并方式
     enable_visualization: bool = True,
     visualization_mode: str = 'merged',  # 'aligned' | 'merged'
     # FastVGGT 特有参数

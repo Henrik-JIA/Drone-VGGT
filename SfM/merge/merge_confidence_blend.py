@@ -14,14 +14,6 @@ from scipy.spatial import cKDTree
 # 从体素降采样模块导入
 # 兼容包导入和直接运行两种方式
 from utils.voxel_downsample import voxel_downsample
-# try:
-#     from utils.voxel_downsample import voxel_downsample
-# except ImportError:
-#     try:
-#         from ..utils.voxel_downsample import voxel_downsample
-#     except ImportError:
-#         from point_cloud_utils import voxel_downsample
-
 
 def _signed_distance_to_hull(points: np.ndarray, hull_points: np.ndarray) -> np.ndarray:
     """

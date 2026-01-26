@@ -12,10 +12,10 @@ from typing import Tuple, Optional, Dict, List, Set
 from scipy.spatial import cKDTree
 
 # 从体素降采样模块导入
-from utils.voxel_downsample import (
-    voxel_downsample,
-    voxel_downsample_array,
-)
+from utils.voxel_downsample import voxel_downsample
+
+# 从统计滤波模块导入
+from utils.statistical_filter import statistical_outlier_removal
 
 # 从边界处理模块导入
 from utils.boundary_filter import (
@@ -26,13 +26,10 @@ from utils.boundary_filter import (
 
 # 从点云处理工具模块导入通用函数
 from point_cloud_utils import (
-    statistical_outlier_removal,
-    statistical_outlier_removal_array,
     filter_by_track_length,
     find_duplicate_points,
     process_point_cloud,
 )
-
 
 def estimate_translation_only(src_points: np.ndarray, tgt_points: np.ndarray) -> np.ndarray:
     """
