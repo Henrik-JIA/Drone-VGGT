@@ -60,6 +60,14 @@ from reconstruction_alignment import (
 from reconstruction_rename import rename_colmap_recons_and_rescale_camera
 from utils.gps import extract_gps_from_image, lat_lon_to_enu
 from utils.xmp import parse_xmp_tags
+from utils.las_export import (
+    export_reconstruction_to_las,
+    export_points_to_las,
+)
+from utils.georef import (
+    export_reconstruction_georeferenced,
+    GeoreferencedExporter,
+)
 from mapanything.utils.image import preprocess_inputs
 from mapanything.third_party.projection import project_3D_points_np, project_3D_points
 from mapanything.models import MapAnything
@@ -2454,7 +2462,7 @@ class IncrementalFeatureMatcherSfM:
             temp_path.mkdir(parents=True, exist_ok=True)
             merged_recon.write_text(str(temp_path))
             merged_recon.export_PLY(str(temp_path / "points3D.ply"))
-            self.export_reconstruction_to_las(merged_recon, str(temp_path / "points3D.las"))
+            export_reconstruction_to_las(merged_recon, str(temp_path / "points3D.las"), verbose=self.verbose)
             return True
 
         # 获取当前reconstruction信息
@@ -2501,7 +2509,7 @@ class IncrementalFeatureMatcherSfM:
         temp_path.mkdir(parents=True, exist_ok=True)
         merged_recon.write_text(str(temp_path))
         merged_recon.export_PLY(str(temp_path / "points3D.ply"))
-        self.export_reconstruction_to_las(merged_recon, str(temp_path / "points3D.las"))
+        export_reconstruction_to_las(merged_recon, str(temp_path / "points3D.las"), verbose=self.verbose)
         
         if self.verbose:
             print(f"  ✓ 合并完成:")
@@ -3010,7 +3018,7 @@ class IncrementalFeatureMatcherSfM:
         
         # 导出 LAS 格式
         las_path = output_dir / f"merged_{num_batches}.las"
-        self._export_points_to_las(self.merged_points_xyz, self.merged_points_colors, str(las_path))
+        export_points_to_las(self.merged_points_xyz, self.merged_points_colors, str(las_path), verbose=self.verbose)
         
         # 更新可视化
         if self.visualizer is not None:
@@ -3084,43 +3092,6 @@ class IncrementalFeatureMatcherSfM:
         
         return matched_curr_pt3d_ids
     
-    def _export_points_to_las(
-        self, 
-        xyz: np.ndarray, 
-        colors: np.ndarray, 
-        output_path: str
-    ) -> None:
-        """
-        将点云坐标和颜色导出为 LAS 格式
-        
-        Args:
-            xyz: (N, 3) 点云坐标
-            colors: (N, 3) RGB 颜色 (uint8)
-            output_path: 输出的 .las 文件路径
-        """
-        if len(xyz) == 0:
-            return
-            
-        # 创建LAS文件
-        header = laspy.LasHeader(point_format=3, version="1.2")
-        header.offsets = np.min(xyz, axis=0)
-        header.scales = np.array([0.001, 0.001, 0.001])  # 1mm精度
-        
-        las = laspy.LasData(header)
-        
-        # 设置坐标
-        las.x = xyz[:, 0]
-        las.y = xyz[:, 1]
-        las.z = xyz[:, 2]
-        
-        # 设置颜色 (LAS使用16位颜色值)
-        las.red = (colors[:, 0].astype(np.uint16) * 256)
-        las.green = (colors[:, 1].astype(np.uint16) * 256)
-        las.blue = (colors[:, 2].astype(np.uint16) * 256)
-        
-        # 写入文件
-        las.write(output_path)
-
     def _align_merged_reconstruction_to_gps_poses(
         self,
         reconstruction: pycolmap.Reconstruction
@@ -3603,45 +3574,6 @@ class IncrementalFeatureMatcherSfM:
         
         return stats
     
-    def export_reconstruction_to_las(self, reconstruction: pycolmap.Reconstruction, output_path: str):
-        """
-        将pycolmap Reconstruction导出为LAS格式
-        
-        Args:
-            reconstruction: pycolmap重建对象
-            output_path: 输出的.las文件路径
-        """
-        # 提取所有3D点的坐标和颜色
-        points = []
-        colors = []
-        
-        for point3D_id, point3D in reconstruction.points3D.items():
-            points.append(point3D.xyz)
-            colors.append(point3D.color)
-        
-        points = np.array(points)
-        colors = np.array(colors)
-        
-        # 创建LAS文件
-        header = laspy.LasHeader(point_format=3, version="1.2")
-        header.offsets = np.min(points, axis=0)
-        header.scales = np.array([0.001, 0.001, 0.001])  # 1mm精度
-        
-        las = laspy.LasData(header)
-        
-        # 设置坐标
-        las.x = points[:, 0]
-        las.y = points[:, 1]
-        las.z = points[:, 2]
-        
-        # 设置颜色 (LAS使用16位颜色值)
-        las.red = (colors[:, 0] * 256).astype(np.uint16)
-        las.green = (colors[:, 1] * 256).astype(np.uint16)
-        las.blue = (colors[:, 2] * 256).astype(np.uint16)
-        
-        # 写入文件
-        las.write(output_path)
-
     def export_georeferenced(self, reconstruction: Optional[pycolmap.Reconstruction] = None, 
                               output_dir: Optional[Path] = None,
                               target_crs: str = "auto_utm",
@@ -3696,8 +3628,7 @@ class IncrementalFeatureMatcherSfM:
 
         try:
             # 0. 首先将merged_reconstruction对齐到原始全局SfM（纠正累积误差）
-            # 同时保存重建到临时目录，供后续 model_aligner 使用
-            model_aligner_input_dir = None
+            temp_input_dir = None
             
             if align_to_global_sfm and self.global_sparse_reconstruction is not None:
                 if self.verbose:
@@ -3709,12 +3640,12 @@ class IncrementalFeatureMatcherSfM:
                 )
                 
                 # 保存对齐后的中间结果（同时作为 model_aligner 输入）
-                model_aligner_input_dir = output_dir.parent / "temp_merged_final_to_global_sfm"
-                model_aligner_input_dir.mkdir(parents=True, exist_ok=True)
-                reconstruction.write_text(str(model_aligner_input_dir))
-                reconstruction.export_PLY(str(model_aligner_input_dir / "points3D.ply"))
+                temp_input_dir = output_dir.parent / "temp_merged_final_to_global_sfm"
+                temp_input_dir.mkdir(parents=True, exist_ok=True)
+                reconstruction.write_text(str(temp_input_dir))
+                reconstruction.export_PLY(str(temp_input_dir / "points3D.ply"))
                 if self.verbose:
-                    print(f"    Saved aligned reconstruction to: {model_aligner_input_dir}")
+                    print(f"    Saved aligned reconstruction to: {temp_input_dir}")
             elif align_to_global_sfm and self.global_sparse_reconstruction is None:
                 if self.verbose:
                     print(f"\n  Step 0: Skipping alignment to global SfM (no global reconstruction available)")
@@ -3726,157 +3657,26 @@ class IncrementalFeatureMatcherSfM:
                 gps = ext['gps']  # [lat, lon, alt]
                 image_name_to_gps[img_name] = gps
             
-            # 2. 从 reconstruction 中提取图像名称，并匹配 GPS
-            image_names = []
-            lats = []
-            lons = []
-            alts = []
+            # 2. 使用 utils.georef 进行地理参考导出
+            success, result = export_reconstruction_georeferenced(
+                reconstruction=reconstruction,
+                image_name_to_gps=image_name_to_gps,
+                output_dir=output_dir,
+                target_crs=target_crs,
+                gps_prior=gps_prior,
+                temp_input_dir=temp_input_dir,
+                verbose=self.verbose
+            )
             
-            for img_id, img in reconstruction.images.items():
-                img_name = img.name
-                if img_name in image_name_to_gps:
-                    gps = image_name_to_gps[img_name]
-                    image_names.append(img_name)
-                    lats.append(gps[0])
-                    lons.append(gps[1])
-                    alts.append(gps[2])
-                else:
-                    if self.verbose:
-                        print(f"  Warning: No GPS data for image {img_name}, skipping")
-            
-            if len(image_names) < 3:
-                print(f"Error: Not enough images with GPS data ({len(image_names)}). Need at least 3.")
+            if success and result:
+                # 存储地理参考数据以供后续使用
+                self.geo_center = result['geo_center']
+                self.output_epsg_code = result['epsg_code']
+                self.rec_georef = result['reconstruction']
+                self.rec_georef_dir = result['output_dir']
+                return True
+            else:
                 return False
-            
-            lats = np.array(lats)
-            lons = np.array(lons)
-            alts = np.array(alts)
-            
-            if self.verbose:
-                print(f"  Matched {len(image_names)} images with GPS data")
-
-            # 3. Determine target CRS
-            try:
-                if target_crs.lower() == "auto_utm":
-                    # 自动检测UTM区域
-                    utm_crs_info = pyproj.database.query_utm_crs_info(
-                        datum_name="WGS 84",
-                        area_of_interest=pyproj.aoi.AreaOfInterest(
-                            west_lon_degree=float(lons[0]) - 0.01,
-                            south_lat_degree=float(lats[0]) - 0.01,
-                            east_lon_degree=float(lons[0]) + 0.01,
-                            north_lat_degree=float(lats[0]) + 0.01,
-                        ),
-                    )
-                    if not utm_crs_info:
-                        print("Error: Could not determine UTM zone for the given coordinates")
-                        return False
-                    target_crs_obj = pyproj.CRS.from_epsg(utm_crs_info[0].code)
-                    self.output_epsg_code = utm_crs_info[0].code
-                elif target_crs.upper().startswith("EPSG:"):
-                    # 使用指定的EPSG代码
-                    epsg_code = int(target_crs.split(":")[1])
-                    target_crs_obj = pyproj.CRS.from_epsg(epsg_code)
-                    self.output_epsg_code = epsg_code
-                else:
-                    # 尝试直接解析为CRS
-                    target_crs_obj = pyproj.CRS.from_user_input(target_crs)
-                    self.output_epsg_code = target_crs_obj.to_epsg() if target_crs_obj.to_epsg() else None
-                
-                if self.verbose:
-                    crs_name = target_crs_obj.name if hasattr(target_crs_obj, 'name') else str(target_crs_obj)
-                    print(f"  Using CRS: {crs_name} (EPSG:{self.output_epsg_code})")
-                    
-            except Exception as e:
-                print(f"Error determining target CRS: {e}")
-                return False
-
-            # Create transformer from WGS84 to target CRS
-            crs_transformer = pyproj.Transformer.from_crs("EPSG:4326", target_crs_obj, always_xy=True)
-
-            # Convert to target CRS coordinates
-            target_x, target_y = crs_transformer.transform(lons, lats)
-            target_coords = np.column_stack([target_x, target_y, alts])
-
-            # 4. Use the mean as center to offset the whole scene (避免坐标值过大)
-            geo_center = np.mean(target_coords, axis=0)
-            geo_center[2] = 0.0  # Set altitude to 0 for center
-            target_coords_offset = target_coords - geo_center
-
-            # 5. Get image names for alignment
-            tgt_image_names = image_names
-            min_common_images = min(len(tgt_image_names), 3)
-
-            # 确保输出目录存在
-            output_dir.mkdir(parents=True, exist_ok=True)
-            
-            # 如果还没有保存重建（未对齐到全局SfM的情况），则保存到临时目录
-            if model_aligner_input_dir is None:
-                model_aligner_input_dir = output_dir.parent / "temp_enu"
-                model_aligner_input_dir.mkdir(parents=True, exist_ok=True)
-                reconstruction.write_text(str(model_aligner_input_dir))
-
-            # Write reference images file for colmap model_aligner
-            ref_images_path = output_dir / "georef_locations.txt"
-            with open(ref_images_path, "w") as f:
-                for img_name, (x, y, z) in zip(tgt_image_names, target_coords_offset):
-                    f.write(f"{img_name} {x} {y} {z}\n")
-
-            if self.verbose:
-                print(f"  Reference images written to: {ref_images_path}")
-                print(f"  Geo center (offset): [{geo_center[0]:.3f}, {geo_center[1]:.3f}, {geo_center[2]:.3f}]")
-
-            # 6. Use colmap model_aligner to align reconstruction to target CRS
-
-            cmd = [
-                "colmap",
-                "model_aligner",
-                "--log_to_stderr", "1" if self.verbose else "0",
-                "--input_path", str(model_aligner_input_dir),
-                "--output_path", str(output_dir),
-                "--ref_images_path", str(ref_images_path),
-                "--alignment_type", "custom",
-                "--min_common_images", str(min_common_images),
-                "--alignment_max_error", str(gps_prior * 3.0),
-                "--ref_is_gps", "0",
-            ]
-
-            try:
-                if self.verbose:
-                    print(f"  Running COLMAP model_aligner...")
-                subprocess.run(cmd, check=True, capture_output=not self.verbose)
-            except subprocess.CalledProcessError as e:
-                print(f"COLMAP model_aligner failed: {e}")
-                return False
-            except FileNotFoundError:
-                print("Error: COLMAP not found. Please install COLMAP and add it to PATH.")
-                return False
-
-            # 7. Load the aligned model
-            try:
-                rec_georef = pycolmap.Reconstruction(str(output_dir))
-            except Exception as e:
-                print(f"Failed to load aligned georeferenced reconstruction: {e}")
-                return False
-
-            # 8. Export as PLY and LAS
-            rec_georef.export_PLY(str(output_dir / "points3D.ply"))
-            self.export_reconstruction_to_las(rec_georef, str(output_dir / "points3D.las"))
-
-            # Store georeferenced data for later use
-            self.geo_center = geo_center
-            self.rec_georef = rec_georef
-            self.rec_georef_dir = output_dir
-
-            if self.verbose:
-                print(f"  ✓ Georeferenced export completed:")
-                print(f"    EPSG code: {self.output_epsg_code}")
-                print(f"    Geo center (offset): [{geo_center[0]:.3f}, {geo_center[1]:.3f}, {geo_center[2]:.3f}]")
-                print(f"    Output dir: {output_dir}")
-                print(f"    Total images: {len(rec_georef.images)}")
-                print(f"    Total 3D points: {len(rec_georef.points3D)}")
-
-            return True
 
         except Exception as e:
             print(f"Error during georeferenced export: {e}")
@@ -4081,7 +3881,7 @@ def run_incremental_feature_matching(
     target_crs: str = "auto_utm",  # 目标坐标系: "auto_utm", "EPSG:3857", "EPSG:4326", 等
     export_dsm: bool = True,  # 是否导出 DSM (数字表面模型)
     dsm_resolution: float = 0.1,  # DSM 分辨率（米），默认 10cm
-    merge_method: str = 'points_only',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only' 合并方式
+    merge_method: str = 'confidence',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only' 合并方式
     enable_visualization: bool = True,
     visualization_mode: str = 'merged',  # 'aligned' | 'merged'
     # FastVGGT 特有参数
