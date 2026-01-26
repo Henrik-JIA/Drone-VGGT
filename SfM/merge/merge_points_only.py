@@ -28,10 +28,7 @@ import pycolmap
 from scipy.spatial import cKDTree
 
 # 从体素降采样模块导入
-try:
-    from utils.voxel_downsample import _voxel_dedup, voxel_dedup
-except ImportError:
-    from ..utils.voxel_downsample import _voxel_dedup, voxel_dedup
+from utils.voxel_downsample import _voxel_dedup
 
 # 从 merge_confidence_blend 导入基础工具函数
 from merge.merge_confidence_blend import (

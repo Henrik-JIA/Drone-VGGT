@@ -12,13 +12,7 @@ from typing import Dict, Tuple, List, Optional, Set
 from scipy.spatial import cKDTree
 
 # 从独立的体素降采样模块导入（为了向后兼容，在此重新导出）
-from utils.voxel_downsample import (
-    voxel_downsample,
-    voxel_downsample_array,
-    voxel_dedup,
-    _voxel_dedup,
-)
-
+from utils.voxel_downsample import voxel_downsample
 
 def statistical_outlier_removal(
     points_xyz: Dict[int, np.ndarray],
