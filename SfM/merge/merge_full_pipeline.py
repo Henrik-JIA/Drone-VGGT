@@ -17,15 +17,19 @@ from utils.voxel_downsample import (
     voxel_downsample_array,
 )
 
+# 从边界处理模块导入
+from utils.boundary_filter import (
+    boundary_aware_filter,
+    boundary_aware_filter_array,
+    smooth_boundary_points,
+)
+
 # 从点云处理工具模块导入通用函数
 from point_cloud_utils import (
     statistical_outlier_removal,
     statistical_outlier_removal_array,
-    boundary_aware_filter,
-    boundary_aware_filter_array,
     filter_by_track_length,
     find_duplicate_points,
-    smooth_boundary_points,
     process_point_cloud,
 )
 
