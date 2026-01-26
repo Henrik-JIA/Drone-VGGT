@@ -27,6 +27,12 @@ import numpy as np
 import pycolmap
 from scipy.spatial import cKDTree
 
+# 从体素降采样模块导入
+try:
+    from utils.voxel_downsample import _voxel_dedup, voxel_dedup
+except ImportError:
+    from ..utils.voxel_downsample import _voxel_dedup, voxel_dedup
+
 # 从 merge_confidence_blend 导入基础工具函数
 from merge.merge_confidence_blend import (
     find_common_images,
@@ -1430,64 +1436,6 @@ def _union_find_dedup(
     
     del parent, unique_roots, first_indices, keep_indices
     gc.collect()
-    
-    return merged_xyz, merged_colors
-
-
-def _voxel_dedup(
-    all_xyz: np.ndarray,
-    all_colors: np.ndarray,
-    voxel_size: float,
-    verbose: bool = False
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    使用体素下采样进行近似去重（适合大数据集，内存友好）
-    
-    内存优化：
-    - 使用 numpy 向量化操作
-    - 分批处理大数据集
-    """
-    import gc
-    
-    n = len(all_xyz)
-    
-    # 计算体素索引（使用 int64 避免溢出）
-    voxel_indices = np.floor(all_xyz / voxel_size).astype(np.int64)
-    
-    # 将 3D 体素索引转换为唯一的 1D 键（使用质数避免碰撞）
-    # 使用较大的质数以减少碰撞
-    p1, p2 = 73856093, 19349663
-    
-    # 偏移到正数范围
-    offset = voxel_indices.min(axis=0)
-    voxel_indices -= offset
-    
-    # 计算唯一键
-    voxel_keys = (voxel_indices[:, 0] * p1 + 
-                  voxel_indices[:, 1] * p2 + 
-                  voxel_indices[:, 2])
-    
-    del voxel_indices
-    gc.collect()
-    
-    # 使用 numpy.unique 找到第一次出现的索引
-    _, first_indices = np.unique(voxel_keys, return_index=True)
-    
-    del voxel_keys
-    gc.collect()
-    
-    # 排序索引以保持原始顺序
-    first_indices = np.sort(first_indices)
-    
-    # 复制结果（允许原数组被释放）
-    merged_xyz = all_xyz[first_indices].copy()
-    merged_colors = all_colors[first_indices].copy()
-    
-    del first_indices
-    gc.collect()
-    
-    if verbose:
-        print(f"    Voxel dedup: {n} -> {len(merged_xyz)} points")
     
     return merged_xyz, merged_colors
 

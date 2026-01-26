@@ -11,10 +11,14 @@ from pathlib import Path
 from typing import Tuple, Optional, Dict, List, Set
 from scipy.spatial import cKDTree
 
-# 从点云处理工具模块导入通用函数
-from point_cloud_utils import (
+# 从体素降采样模块导入
+from utils.voxel_downsample import (
     voxel_downsample,
     voxel_downsample_array,
+)
+
+# 从点云处理工具模块导入通用函数
+from point_cloud_utils import (
     statistical_outlier_removal,
     statistical_outlier_removal_array,
     boundary_aware_filter,
@@ -2143,4 +2147,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -49,7 +49,8 @@ from merge.merge_confidence_blend import (
     estimate_sim3_ransac
 )
 from merge.merge_confidence import merge_two_reconstructions as merge_by_confidence
-from merge.merge_points_only import merge_all_reconstructions_points_only, _voxel_dedup, save_ply_binary
+from merge.merge_points_only import merge_all_reconstructions_points_only, save_ply_binary
+from utils.voxel_downsample import _voxel_dedup, voxel_dedup
 from sfm_extraction import extract_sfm_reconstruction_from_global
 from sfm_visualizer import SfMVisualizer
 from reconstruction_alignment import (
@@ -2635,14 +2636,14 @@ class IncrementalFeatureMatcherSfM:
             output_dir=output_dir,
             start_idx=start_idx,
             end_idx=end_idx,
-            color_by_source=True,
+            color_by_source=False, 
             match_radii=[1, 2, 3, 5, 8, 10, 20, 30, 40, 50],  # 多级2D匹配半径（从小到大依次匹配）
             match_3d_threshold=10.0,  # 3D空间匹配阈值（单位与点云坐标一致）
             aggressive_3d_threshold=3.0,  # 最终阶段激进3D匹配阈值，用于减少重叠区独有点
             inner_blend_margin=150.0,  # 融合带向内延伸（像素），同时控制空间插值范围
             outer_blend_margin=200.0,  # 融合带向外延伸（像素），同时控制空间插值范围
             blend_mode='weighted',   # 加权平均模式，基于置信度计算加权位置
-            keep_unmatched_overlap=True,  # 保留重叠区未匹配点
+            keep_unmatched_overlap=False,  # 保留重叠区未匹配点
             spatial_blend_interpolation=True,  # 启用融合带3D坐标空间插值
             spatial_blend_k_neighbors=32,  # 空间插值使用的近邻数
             spatial_blend_smooth_transition=True,  # 使用 smoothstep 实现更平滑过渡
@@ -3000,7 +3001,8 @@ class IncrementalFeatureMatcherSfM:
             
             # ==================== 延迟体素去重（点数超过阈值时才执行）====================
             # 优化：不是每次都去重，而是当点数超过一定阈值时才去重，减少频繁去重的开销
-            DEDUP_THRESHOLD = 500000  # 50万点后才开始去重
+            # DEDUP_THRESHOLD = 500000  # 50万点后才开始去重
+            DEDUP_THRESHOLD = 100  # 100点后才开始去重
             if self.merge_voxel_size > 0 and len(self.merged_points_xyz) > DEDUP_THRESHOLD:
                 before_count = len(self.merged_points_xyz)
                 self.merged_points_xyz, self.merged_points_colors = _voxel_dedup(
@@ -3881,7 +3883,7 @@ def run_incremental_feature_matching(
     target_crs: str = "auto_utm",  # 目标坐标系: "auto_utm", "EPSG:3857", "EPSG:4326", 等
     export_dsm: bool = True,  # 是否导出 DSM (数字表面模型)
     dsm_resolution: float = 0.1,  # DSM 分辨率（米），默认 10cm
-    merge_method: str = 'confidence',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only' 合并方式
+    merge_method: str = 'points_only',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only' 合并方式
     enable_visualization: bool = True,
     visualization_mode: str = 'merged',  # 'aligned' | 'merged'
     # FastVGGT 特有参数

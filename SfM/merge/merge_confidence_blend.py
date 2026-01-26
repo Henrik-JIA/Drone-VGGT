@@ -11,12 +11,15 @@ from typing import Dict, Optional, List, Tuple, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from scipy.spatial import cKDTree
 
-# 从点云处理工具模块导入体素降采样函数
+# 从体素降采样模块导入
 # 兼容包导入和直接运行两种方式
 try:
-    from .point_cloud_utils import voxel_downsample
+    from utils.voxel_downsample import voxel_downsample
 except ImportError:
-    from point_cloud_utils import voxel_downsample
+    try:
+        from ..utils.voxel_downsample import voxel_downsample
+    except ImportError:
+        from point_cloud_utils import voxel_downsample
 
 
 def _signed_distance_to_hull(points: np.ndarray, hull_points: np.ndarray) -> np.ndarray:
@@ -4573,4 +4576,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
