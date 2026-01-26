@@ -1,28 +1,21 @@
 """
-点云处理工具模块
+点云过滤工具模块
 
-提供通用的点云处理功能：
-- 体素降采样 (Voxel Downsampling) - 从 utils.voxel_downsample 导入
-- 统计滤波去除离群点 (Statistical Outlier Removal) - 从 utils.statistical_filter 导入
-- 边界密度过滤 (Boundary-aware Filtering) - 从 utils.boundary_filter 导入
+提供点云过滤相关功能：
+- filter_by_track_length: 根据track长度过滤点云
+- find_duplicate_points: 使用KD-Tree找到重复点
+- process_point_cloud: 点云处理流水线（组合多种滤波操作）
 """
 
 import numpy as np
-from typing import Dict, Tuple, List, Optional, Set
+from typing import Dict, Set, Tuple
 from scipy.spatial import cKDTree
 
-# 从独立的体素降采样模块导入（为了向后兼容，在此重新导出）
+# 导入其他滤波模块（用于 process_point_cloud）
 from utils.voxel_downsample import voxel_downsample
-
-# 从独立的统计滤波模块导入（为了向后兼容，在此重新导出）
 from utils.statistical_filter import statistical_outlier_removal
+from utils.boundary_filter import boundary_aware_filter
 
-# 从独立的边界处理模块导入（为了向后兼容，在此重新导出）
-from utils.boundary_filter import (
-    boundary_aware_filter,
-    boundary_aware_filter_array,
-    smooth_boundary_points,
-)
 
 def filter_by_track_length(
     reconstruction,  # pycolmap.Reconstruction
@@ -101,8 +94,6 @@ def find_duplicate_points(
     
     return duplicates
 
-
-# ========== 便捷函数 ==========
 
 def process_point_cloud(
     points_xyz: Dict[int, np.ndarray],
@@ -212,3 +203,4 @@ def process_point_cloud(
         print(f"\n[Final] Processed point cloud: {len(current_xyz)} points")
     
     return current_xyz, current_color, id_mapping
+

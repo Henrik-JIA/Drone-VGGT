@@ -24,8 +24,8 @@ from utils.boundary_filter import (
     smooth_boundary_points,
 )
 
-# 从点云处理工具模块导入通用函数
-from point_cloud_utils import (
+# 从点云过滤模块导入
+from utils.point_filter import (
     filter_by_track_length,
     find_duplicate_points,
     process_point_cloud,

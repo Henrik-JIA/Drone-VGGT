@@ -511,23 +511,35 @@ def rescale_reconstruction_to_original_size(
             print("  Warning: No matching images found for alignment")
             return reconstruction
 
-        # 优化：预分配数组并一次性填充（避免列表追加和多次转换）
-        R_cameras = np.empty((num_images, 3, 3), dtype=np.float64)
-        tvecs = np.empty((num_images, 3, 1), dtype=np.float64)
+        # 从 reconstruction 中获取实际的图像名称，并与 ori_extrinsics 匹配
+        # 建立 image_name -> extrinsic 的映射
+        extrinsic_by_name = {ext['image_name']: ext for ext in ori_extrinsics}
         
-        for i, idx in enumerate(range(start_idx, end_idx)):
-            extrinsic_info = ori_extrinsics[idx]
-            R_cameras[i] = extrinsic_info['R_camera']
-            t = np.asarray(extrinsic_info['tvec'])
-            # 直接处理 tvec 形状
-            tvecs[i] = t.reshape(3, 1) if t.ndim == 1 else t
+        # 收集 reconstruction 中的图像及其对应的 GPS 位置
+        valid_names = []
+        camera_centers_list = []
         
-        # 向量化计算：camera_center = -R^T @ t
-        # 使用 einsum 比 transpose + matmul 更快
-        camera_centers = -np.einsum('nij,njk->nik', R_cameras.transpose(0, 2, 1), tvecs).squeeze(-1)
+        for img_id, image in reconstruction.images.items():
+            img_name = image.name
+            if img_name in extrinsic_by_name:
+                extrinsic_info = extrinsic_by_name[img_name]
+                R_camera = np.asarray(extrinsic_info['R_camera'], dtype=np.float64)
+                t = np.asarray(extrinsic_info['tvec'], dtype=np.float64)
+                if t.ndim == 1:
+                    t = t.reshape(3, 1)
+                # camera_center = -R^T @ t
+                camera_center = -R_camera.T @ t
+                valid_names.append(img_name)
+                camera_centers_list.append(camera_center.flatten())
         
-        # 生成有效名称列表
-        valid_names = [f"image_{fidx + 1}" for fidx in range(num_images)]
+        if len(valid_names) < 3:
+            print(f"  Warning: Not enough matching images for alignment ({len(valid_names)} found)")
+            return reconstruction
+        
+        camera_centers = np.array(camera_centers_list, dtype=np.float64)
+        
+        if verbose:
+            print(f"    Found {len(valid_names)} matching images in reconstruction")
 
         # RANSAC 对齐
         ransac_options = pycolmap.RANSACOptions()
@@ -548,7 +560,7 @@ def rescale_reconstruction_to_original_size(
                 if verbose:
                     print(f"  ✓ Reconstruction aligned to known poses")
                     print(f"    Scale: {sim3d.scale}")
-                    print(f"    Number of aligned images: {num_images}")
+                    print(f"    Number of aligned images: {len(valid_names)}")
             else:
                 print("  Warning: Failed to align reconstruction")
                 

@@ -2911,6 +2911,8 @@ class IncrementalFeatureMatcherSfM:
                 curr_xyz, curr_colors = self._extract_points_from_reconstruction(curr_recon)
                 self.merged_points_xyz = np.vstack([self.merged_points_xyz, curr_xyz])
                 self.merged_points_colors = np.vstack([self.merged_points_colors, curr_colors])
+                # 关键修复：即使对齐失败，也要更新 _prev_aligned_recon，保持链式对齐的连续性
+                self._prev_aligned_recon = pycolmap.Reconstruction(curr_recon)
             else:
                 if self.verbose:
                     print(f"    公共影像数: {len(common_images)}")
@@ -2940,6 +2942,8 @@ class IncrementalFeatureMatcherSfM:
                     curr_xyz, curr_colors = self._extract_points_from_reconstruction(curr_recon)
                     self.merged_points_xyz = np.vstack([self.merged_points_xyz, curr_xyz])
                     self.merged_points_colors = np.vstack([self.merged_points_colors, curr_colors])
+                    # 关键修复：即使对齐失败，也要更新 _prev_aligned_recon，保持链式对齐的连续性
+                    self._prev_aligned_recon = pycolmap.Reconstruction(curr_recon)
                 else:
                     # 4. 使用 RANSAC 估计 Sim3 变换（优化：根据点数动态调整迭代次数）
                     n_points = len(pts_prev)
@@ -2961,6 +2965,8 @@ class IncrementalFeatureMatcherSfM:
                         curr_xyz, curr_colors = self._extract_points_from_reconstruction(curr_recon)
                         self.merged_points_xyz = np.vstack([self.merged_points_xyz, curr_xyz])
                         self.merged_points_colors = np.vstack([self.merged_points_colors, curr_colors])
+                        # 关键修复：即使对齐失败，也要更新 _prev_aligned_recon，保持链式对齐的连续性
+                        self._prev_aligned_recon = pycolmap.Reconstruction(curr_recon)
                     else:
                         if self.verbose:
                             inlier_count = inlier_mask.sum() if inlier_mask is not None else 0
@@ -3883,7 +3889,7 @@ def run_incremental_feature_matching(
     target_crs: str = "auto_utm",  # 目标坐标系: "auto_utm", "EPSG:3857", "EPSG:4326", 等
     export_dsm: bool = True,  # 是否导出 DSM (数字表面模型)
     dsm_resolution: float = 0.1,  # DSM 分辨率（米），默认 10cm
-    merge_method: str = 'full',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only' 合并方式
+    merge_method: str = 'confidence',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only' 合并方式
     enable_visualization: bool = True,
     visualization_mode: str = 'merged',  # 'aligned' | 'merged'
     # FastVGGT 特有参数
