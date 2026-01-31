@@ -276,6 +276,72 @@ merge_method='full'
 - ✅ 支持多阶段精化对齐
 - ❌ 最慢
 
+### 重建类型与 3DGS 支持
+
+系统支持两种重建类型，决定了点云的生成方式和后续应用：
+
+| 重建类型 | 输出格式 | 3DGS 兼容性 | 适用场景 |
+|---------|---------|-------------|---------|
+| `each_pixel_feature_points` | 密集点云（每个像素一个3D点） | ❌ 不支持 | 纯点云可视化、DSM生成 |
+| `dense_feature_points` | COLMAP Reconstruction + 密集点云 | ✅ 支持 | 3DGS训练、传统MVS流程 |
+
+#### 为什么需要 `dense_feature_points` 才能支持 3DGS？
+
+3D Gaussian Splatting (3DGS) 训练需要标准的 COLMAP 输出格式，包括：
+- `cameras.txt` / `cameras.bin` - 相机内参
+- `images.txt` / `images.bin` - 相机位姿及 2D-3D 对应关系
+- `points3D.txt` / `points3D.bin` - 3D 点云及其观测信息
+
+只有 `dense_feature_points` 模式会通过特征跟踪建立多视图间的 2D-3D 对应关系，生成完整的 COLMAP Reconstruction 结构。
+
+#### 配置 3DGS 兼容输出
+
+要生成可用于 3DGS 训练的输出，需要正确配置以下参数：
+
+```python
+success = run_incremental_feature_matching(
+    image_paths=image_files,
+    output_dir=output_dir,
+    
+    # 关键参数：必须使用 dense_feature_points
+    reconstruction_type='dense_feature_points',
+    
+    # 重要：query_frame_num 应与 min_images_for_scale 一致
+    # 这确保每张影像都参与特征跟踪，满足 3DGS 的观测要求
+    min_images_for_scale=6,
+    query_frame_num=6,  # 必须 >= min_images_for_scale
+    
+    # 其他参数
+    model_type='vggt',
+    merge_method='confidence',
+    verbose=True,
+)
+```
+
+> ⚠️ **重要提示**：`query_frame_num` 参数控制特征跟踪时的查询帧数量。为确保每张影像都能建立 2D-3D 对应关系，且每个 3D 点至少被 3 个 2D 点观测到（3DGS 的基本要求），`query_frame_num` 必须与 `min_images_for_scale` 保持一致。
+
+#### 输出目录结构（3DGS 兼容）
+
+使用 `dense_feature_points` 模式后，输出目录将包含：
+
+```
+output/
+├── temp_merged/
+│   └── merged_N/
+│       ├── cameras.txt      # 相机内参 ← 3DGS 需要
+│       ├── images.txt       # 影像位姿 + 2D-3D 对应 ← 3DGS 需要
+│       ├── points3D.txt     # 3D 点云 + 观测信息 ← 3DGS 需要
+│       └── points3D.ply     # PLY 格式点云
+└── temp_merged_reconstruction_georeferenced/
+    └── ...                  # 地理坐标版本
+```
+
+可直接用于 3DGS 训练：
+```bash
+# 使用 gaussian-splatting 官方实现
+python train.py -s output/temp_merged/merged_N/
+```
+
 ## API 参考
 
 ### `IncrementalFeatureMatcherSfM` 类
@@ -325,17 +391,26 @@ from SfM.incremental_feature_matcher import run_incremental_feature_matching
 success = run_incremental_feature_matching(
     image_paths=image_files,        # 影像路径列表
     output_dir=output_dir,          # 输出目录
-    reconstruction_type='each_pixel_feature_points',
-    model_type='mapanything',       # 'mapanything' | 'vggt' | 'fastvggt'
+    
+    # 重建类型：'each_pixel_feature_points'（纯密集点云）或 'dense_feature_points'（支持3DGS）
+    reconstruction_type='dense_feature_points',
+    
+    model_type='vggt',              # 'mapanything' | 'vggt' | 'fastvggt'
     model_path=None,                # 模型权重路径
     image_interval=1,               # 影像间隔
     min_images_for_scale=6,         # 每批次影像数
     overlap=2,                      # 批次重叠数
-    pred_vis_scores_thres_value=0.8,
+    
+    # 特征跟踪参数（仅 dense_feature_points 模式）
+    # query_frame_num 应与 min_images_for_scale 一致以支持 3DGS
+    query_frame_num=6,
+    max_query_pts=12288,
+    
+    pred_vis_scores_thres_value=0.7,
     max_reproj_error=5.0,
     run_global_sfm_first=True,      # 先运行全局 SfM
     merge_method='confidence',
-    merge_voxel_size=1.5,           # 体素大小（米）
+    merge_voxel_size=0.5,           # 体素大小（米）
     enable_visualization=True,
     visualization_mode='merged',    # 'aligned' | 'merged'
     export_georef=True,
@@ -350,6 +425,7 @@ success = run_incremental_feature_matching(
 
 | 参数 | 默认值 | 描述 |
 |------|--------|------|
+| `reconstruction_type` | 'each_pixel_feature_points' | 重建类型：`'each_pixel_feature_points'`（纯密集点云）或 `'dense_feature_points'`（COLMAP格式，支持3DGS） |
 | `min_images_for_scale` | 6 | 每批次处理的影像数量 |
 | `overlap` | 2 | 相邻批次间的重叠影像数 |
 | `merge_method` | 'confidence' | 点云合并方法 |
@@ -369,6 +445,15 @@ success = run_incremental_feature_matching(
 | `fastvggt_merging` | 0 | Token Merging 参数（0=禁用） |
 | `fastvggt_merge_ratio` | 0.9 | Token Merge 比例 (0.0-1.0) |
 | `fastvggt_depth_conf_thresh` | 3.0 | 深度置信度阈值 |
+
+### 特征跟踪参数（仅 `dense_feature_points` 模式）
+
+| 参数 | 默认值 | 描述 |
+|------|--------|------|
+| `max_query_pts` | 12288 | 每个查询帧最大特征点数 |
+| `query_frame_num` | 6 | 查询帧数量，**建议与 `min_images_for_scale` 保持一致** |
+
+> 💡 **3DGS 兼容性提示**：为确保生成的 COLMAP 输出满足 3DGS 训练要求（每个 3D 点至少被 3 个 2D 点观测到），`query_frame_num` 必须 ≥ `min_images_for_scale`。推荐设置两者相等。
 
 ### 重建质量参数
 
