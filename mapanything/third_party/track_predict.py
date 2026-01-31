@@ -371,20 +371,22 @@ def _forward_on_query(
         ]
 
         # heuristic to remove low confidence points
-        # should I export this as an input parameter?
+        # 降低置信度阈值以保留更多点（原来是1.2，改为0.5）
+        conf_threshold = 1.2
+        min_points_after_filter = 512
         
         if isinstance(pred_conf, np.ndarray):
             pred_conf = torch.from_numpy(pred_conf)
-            valid_mask = pred_conf > 1.2
-            if valid_mask.sum() > 512:
+            valid_mask = pred_conf > conf_threshold
+            if valid_mask.sum() > min_points_after_filter:
                 valid_mask = valid_mask.cpu().numpy()
                 query_points = query_points[:, valid_mask]  # Make sure shape is compatible
                 pred_conf = pred_conf[valid_mask].cpu()
                 pred_point_3d = pred_point_3d[valid_mask]
                 pred_color = pred_color[valid_mask]
         else:
-            valid_mask = pred_conf > 1.2
-            if valid_mask.sum() > 512:
+            valid_mask = pred_conf > conf_threshold
+            if valid_mask.sum() > min_points_after_filter:
                 valid_mask = valid_mask.cpu().numpy()
                 query_points = query_points[:, valid_mask]  # Make sure shape is compatible
                 pred_conf = pred_conf[valid_mask].cpu()

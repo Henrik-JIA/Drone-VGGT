@@ -138,7 +138,7 @@ class IncrementalFeatureMatcherSfM:
         min_images_for_scale: int = 2,
         overlap: int = 1,
         max_reproj_error: float = 10.0,
-        max_points3D_val: int = 5000,
+        max_points3D_val: int = 100000,  # 增大默认值，5000 对航拍场景太小
         min_inlier_per_frame: int = 32,
         pred_vis_scores_thres_value: float = 0.3, 
         filter_edge_margin: float = 10.0,  # 边缘过滤范围（像素），默认10，设为0禁用
@@ -148,6 +148,9 @@ class IncrementalFeatureMatcherSfM:
         merge_method: str = 'confidence_blend',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only' 合并方式
         enable_visualization: bool = True,
         visualization_mode: str = 'merged',  # 'aligned' | 'merged'，点云可视化模式
+        # 特征点跟踪参数（仅 reconstruction_type='dense_feature_points' 模式有效）
+        max_query_pts: int = 4096,  # 每个查询帧最大特征点数 4096 8192 12288
+        query_frame_num: int = 3,    # 查询帧数量（建议 >= min_images_for_scale）
         # FastVGGT 特有参数
         fastvggt_merging: int = 0,  # FastVGGT token merging 参数
         fastvggt_merge_ratio: float = 0.9,  # FastVGGT token merge ratio (0.0-1.0)
@@ -229,6 +232,10 @@ class IncrementalFeatureMatcherSfM:
         self.merge_boundary_filter = merge_boundary_filter
         self.merge_statistical_filter = merge_statistical_filter
         self.merge_method = merge_method  # 'full', 'confidence', or 'confidence_blend'
+        
+        # 特征点跟踪参数
+        self.max_query_pts = max_query_pts
+        self.query_frame_num = query_frame_num
         
         # Visualization mode: 'aligned' (每个batch单独点云) or 'merged' (合并后整体点云)
         if visualization_mode not in ['aligned', 'merged']:
@@ -799,7 +806,7 @@ class IncrementalFeatureMatcherSfM:
                         image_size=image_size,         # (2,)
                         masks=masks,                   # (N, P)
                         max_reproj_error=self.max_reproj_error,  # 重投影误差阈值
-                        max_points3D_val=3000,
+                        max_points3D_val=self.max_points3D_val,  # 使用实例参数而不是硬编码
                         shared_camera=shared_camera,
                         camera_type=camera_type,
                         min_inlier_per_frame=self.min_inlier_per_frame,
@@ -1672,8 +1679,8 @@ class IncrementalFeatureMatcherSfM:
                             batch_images_tensor,
                             conf=batch_confs_tensor,
                             points_3d=batch_points_3d_tensor,
-                            max_query_pts=4096,
-                            query_frame_num=3,
+                            max_query_pts=self.max_query_pts,
+                            query_frame_num=self.query_frame_num,
                             keypoint_extractor="aliked+sp+sift",
                             fine_tracking=True,
                             original_images=batch_original_images,
@@ -1828,6 +1835,28 @@ class IncrementalFeatureMatcherSfM:
             # 可见性阈值可以调整
             masks = pred_vis_scores > self.pred_vis_scores_thres_value  # (N, P)
             
+            # === 调试输出：点云过滤统计 ===
+            if self.verbose:
+                total_points = points_3d.shape[0] if points_3d is not None else 0
+                vis_filtered_per_frame = masks.sum(axis=1)  # 每帧通过可见性过滤的点数
+                vis_filtered_total = masks.any(axis=0).sum()  # 至少在一帧可见的点数
+                vis_filtered_2frames = (masks.sum(axis=0) >= 2).sum()  # 至少在2帧可见的点数
+                print(f"  [Debug] 点云过滤统计:")
+                print(f"    原始点数: {total_points}")
+                print(f"    可见性阈值: {self.pred_vis_scores_thres_value}")
+                print(f"    每帧通过可见性过滤的点数: {vis_filtered_per_frame}")
+                print(f"    至少在1帧可见的点数: {vis_filtered_total}")
+                print(f"    至少在2帧可见的点数（将保留）: {vis_filtered_2frames}")
+                
+                # 检查3D点坐标范围
+                if points_3d is not None:
+                    pts_min = points_3d.min(axis=0)
+                    pts_max = points_3d.max(axis=0)
+                    pts_in_range = (np.abs(points_3d).max(axis=1) < self.max_points3D_val).sum()
+                    print(f"    3D点坐标范围: min={pts_min}, max={pts_max}")
+                    print(f"    坐标范围阈值: {self.max_points3D_val}")
+                    print(f"    坐标在范围内的点数: {pts_in_range}/{total_points}")
+            
             # 调用 batch_np_matrix_to_pycolmap
             reconstruction, valid_track_mask = batch_np_matrix_to_pycolmap(
                 points3d=points_3d,
@@ -1847,6 +1876,12 @@ class IncrementalFeatureMatcherSfM:
             if reconstruction is None:
                 print("  Warning: Failed to build pycolmap reconstruction")
                 return False
+            
+            # === 调试输出：重建后的点数 ===
+            if self.verbose:
+                print(f"  [Debug] batch_np_matrix_to_pycolmap 完成:")
+                print(f"    重建后3D点数: {len(reconstruction.points3D)}")
+                print(f"    有效track mask 中 True 的数量: {valid_track_mask.sum() if valid_track_mask is not None else 'N/A'}")
 
             # # Bundle Adjustment
             # ba_options = pycolmap.BundleAdjustmentOptions()
@@ -1903,6 +1938,11 @@ class IncrementalFeatureMatcherSfM:
                     image_alignment_min_inlier_ratio=0.3,
                     verbose=self.verbose,
                 )
+            # === 调试输出：rescale 后的点数 ===
+            if self.verbose:
+                print(f"  [Debug] rescale_reconstruction_to_original_size 完成:")
+                print(f"    rescale后3D点数: {len(reconstruction.points3D)}")
+            
             # 保存重建结果
             temp_path = self.output_dir / "temp_rescale" / f"{start_idx}_{end_idx}"
             temp_path.mkdir(parents=True, exist_ok=True)
@@ -1923,6 +1963,24 @@ class IncrementalFeatureMatcherSfM:
                     reconstruction,
                     match_type='use_bidirectional',
                 )
+            
+            # === 调试输出：对齐结果检查 ===
+            if self.verbose:
+                if aligned_recon is False:
+                    print(f"  [Debug] ⚠ _align_current_reconstruction_by_point_cloud 返回 False（对齐失败）")
+                    print(f"    将使用原始 reconstruction（未对齐）")
+                    aligned_recon = reconstruction  # 回退到原始 reconstruction
+                elif isinstance(aligned_recon, pycolmap.Reconstruction):
+                    print(f"  [Debug] _align_current_reconstruction_by_point_cloud 完成:")
+                    print(f"    对齐后3D点数: {len(aligned_recon.points3D)}")
+                else:
+                    print(f"  [Debug] ⚠ 意外的返回类型: {type(aligned_recon)}")
+                    aligned_recon = reconstruction
+            else:
+                # 非 verbose 模式下也需要处理 False 返回值
+                if aligned_recon is False:
+                    aligned_recon = reconstruction
+            
             # 保存重建结果
             temp_path = self.output_dir / "temp_aligned" / f"{start_idx}_{end_idx}"
             temp_path.mkdir(parents=True, exist_ok=True)
@@ -3022,7 +3080,7 @@ class IncrementalFeatureMatcherSfM:
         
         # ==================== 统一保存结果 ====================
         output_path = output_dir / f"merged_{num_batches}.ply"
-        save_ply_binary(output_path, self.merged_points_xyz, self.merged_points_colors)
+        save_ply_binary(output_path, self.merged_points_xyz, self.merged_points_colors, include_normals=True)
         
         # 导出 LAS 格式
         las_path = output_dir / f"merged_{num_batches}.las"
@@ -3876,15 +3934,15 @@ def run_incremental_feature_matching(
     image_interval: int = 2,
     min_images_for_scale: int = 6,
     overlap: int = 2,
-    pred_vis_scores_thres_value: float = 0.8, 
+    pred_vis_scores_thres_value: float = 0.7, 
     max_reproj_error: float = 5.0,
     max_points3D_val: int = 1000000,
     min_inlier_per_frame: int = 32,
     run_global_sfm_first: bool = True,
     filter_edge_margin: float = 100.0, # 边缘过滤范围（像素），默认50，设为0禁用
-    merge_voxel_size: float = 1.5,  # 点云合并时的体素大小（米）
-    merge_boundary_filter: bool = True,  # 是否启用边界过滤
-    merge_statistical_filter: bool = True,  # 是否启用统计过滤
+    merge_voxel_size: float = 0.5,  # 点云合并时的体素大小（米）
+    merge_boundary_filter: bool = False,  # 是否启用边界过滤
+    merge_statistical_filter: bool = False,  # 是否启用统计过滤
     export_georef: bool = True,  # 是否导出地理坐标系的重建结果
     target_crs: str = "auto_utm",  # 目标坐标系: "auto_utm", "EPSG:3857", "EPSG:4326", 等
     export_dsm: bool = True,  # 是否导出 DSM (数字表面模型)
@@ -3892,6 +3950,9 @@ def run_incremental_feature_matching(
     merge_method: str = 'confidence',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only' 合并方式
     enable_visualization: bool = True,
     visualization_mode: str = 'merged',  # 'aligned' | 'merged'
+    # 特征点跟踪参数（仅 reconstruction_type='dense_feature_points' 模式有效）
+    max_query_pts: int = 12288,  # 每个查询帧最大特征点数
+    query_frame_num: int = 6,    # 查询帧数量（建议 >= min_images_for_scale）
     # FastVGGT 特有参数
     fastvggt_merging: int = 0,  # FastVGGT token merging 参数
     fastvggt_merge_ratio: float = 0.9,  # FastVGGT token merge ratio (0.0-1.0)
@@ -4023,6 +4084,9 @@ def run_incremental_feature_matching(
         merge_statistical_filter=merge_statistical_filter,
         merge_method=merge_method,
         enable_visualization=enable_visualization,
+        # 特征点跟踪参数
+        max_query_pts=max_query_pts,
+        query_frame_num=query_frame_num,
         # FastVGGT 参数
         fastvggt_merging=fastvggt_merging,
         fastvggt_merge_ratio=fastvggt_merge_ratio,

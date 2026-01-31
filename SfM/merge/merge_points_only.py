@@ -502,6 +502,8 @@ def save_ply_binary(
     filepath: Union[str, Path],
     xyz: np.ndarray,
     colors: np.ndarray,
+    normals: Optional[np.ndarray] = None,
+    include_normals: bool = False,
     chunk_size: int = 100000
 ) -> None:
     """
@@ -511,6 +513,8 @@ def save_ply_binary(
         filepath: 输出文件路径
         xyz: (N, 3) 点云坐标
         colors: (N, 3) RGB 颜色 (uint8)
+        normals: (N, 3) 法线向量，可选。若为 None 且 include_normals=True，则输出零法线
+        include_normals: 是否包含法线字段（FastGS 等工具需要）
         chunk_size: 分块写入的大小（减少内存峰值）
     """
     filepath = Path(filepath)
@@ -518,19 +522,47 @@ def save_ply_binary(
     
     n_points = len(xyz)
     
-    # 写入头部
-    header = (
-        "ply\n"
-        "format binary_little_endian 1.0\n"
-        f"element vertex {n_points}\n"
-        "property float x\n"
-        "property float y\n"
-        "property float z\n"
-        "property uchar red\n"
-        "property uchar green\n"
-        "property uchar blue\n"
-        "end_header\n"
-    )
+    # 构建头部
+    if include_normals:
+        header = (
+            "ply\n"
+            "format binary_little_endian 1.0\n"
+            f"element vertex {n_points}\n"
+            "property float x\n"
+            "property float y\n"
+            "property float z\n"
+            "property float nx\n"
+            "property float ny\n"
+            "property float nz\n"
+            "property uchar red\n"
+            "property uchar green\n"
+            "property uchar blue\n"
+            "end_header\n"
+        )
+        # 数据结构：x, y, z, nx, ny, nz, r, g, b
+        dtype = [
+            ('x', np.float32), ('y', np.float32), ('z', np.float32),
+            ('nx', np.float32), ('ny', np.float32), ('nz', np.float32),
+            ('r', np.uint8), ('g', np.uint8), ('b', np.uint8)
+        ]
+    else:
+        header = (
+            "ply\n"
+            "format binary_little_endian 1.0\n"
+            f"element vertex {n_points}\n"
+            "property float x\n"
+            "property float y\n"
+            "property float z\n"
+            "property uchar red\n"
+            "property uchar green\n"
+            "property uchar blue\n"
+            "end_header\n"
+        )
+        # 数据结构：x, y, z, r, g, b
+        dtype = [
+            ('x', np.float32), ('y', np.float32), ('z', np.float32),
+            ('r', np.uint8), ('g', np.uint8), ('b', np.uint8)
+        ]
     
     with open(filepath, 'wb') as f:
         f.write(header.encode('ascii'))
@@ -544,13 +576,22 @@ def save_ply_binary(
             chunk_colors = colors[start:end].astype(np.uint8, copy=False)
             
             # 使用结构化数组一次性写入（更快）
-            chunk_data = np.empty(end - start, dtype=[
-                ('x', np.float32), ('y', np.float32), ('z', np.float32),
-                ('r', np.uint8), ('g', np.uint8), ('b', np.uint8)
-            ])
+            chunk_data = np.empty(end - start, dtype=dtype)
             chunk_data['x'] = chunk_xyz[:, 0]
             chunk_data['y'] = chunk_xyz[:, 1]
             chunk_data['z'] = chunk_xyz[:, 2]
+            
+            if include_normals:
+                if normals is not None:
+                    chunk_normals = normals[start:end].astype(np.float32, copy=False)
+                else:
+                    # 输出零法线
+                    chunk_normals = np.zeros((end - start, 3), dtype=np.float32)
+                chunk_data['nx'] = chunk_normals[:, 0]
+                chunk_data['ny'] = chunk_normals[:, 1]
+                chunk_data['nz'] = chunk_normals[:, 2]
+                del chunk_normals
+            
             chunk_data['r'] = chunk_colors[:, 0]
             chunk_data['g'] = chunk_colors[:, 1]
             chunk_data['b'] = chunk_colors[:, 2]
