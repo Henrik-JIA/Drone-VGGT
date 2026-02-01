@@ -4083,7 +4083,7 @@ def run_incremental_feature_matching(
     export_dsm: bool = True,  # 是否导出 DSM (数字表面模型)
     dsm_resolution: float = 0.1,  # DSM 分辨率（米），默认 10cm
     # ==================== 导出参数 - FastGS ====================
-    export_fastgs: bool = True,  # 是否导出 FastGS 格式（3D Gaussian Splatting）
+    export_fastgs: bool = False,  # 是否导出 FastGS 格式（3D Gaussian Splatting）
     fastgs_output_dir: Optional[Path] = None,  # FastGS 输出目录
     fastgs_copy_images: bool = True,  # 是否复制图像（True）或创建符号链接（False）
     fastgs_filter_outliers: bool = False,  # 是否在 FastGS 导出时过滤离散点
