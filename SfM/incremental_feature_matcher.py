@@ -50,6 +50,7 @@ from merge.merge_confidence_blend import (
 )
 from merge.merge_confidence import merge_two_reconstructions as merge_by_confidence
 from merge.merge_points_only import merge_all_reconstructions_points_only, save_ply_binary
+from convert.convert_to_fastgs import create_fastgs_structure
 from utils.voxel_downsample import _voxel_dedup, voxel_dedup
 from sfm_extraction import extract_sfm_reconstruction_from_global
 from sfm_visualizer import SfMVisualizer
@@ -265,6 +266,7 @@ class IncrementalFeatureMatcherSfM:
         self.inference_reconstructions: List[Dict] = []  # 存储推理结果构建的 pycolmap 重建结果
         self.sfm_reconstructions: List[Dict] = []  # 存储传统SfM重建结果
         self.merged_reconstruction: Optional[pycolmap.Reconstruction] = None # 每次合并后更新的重建结果
+        self.merged_reconstruction_path: Optional[str] = None # 每次合并后更新的重建结果路径
         self.recovered_inference_outputs: List[Dict] = []
         
         # points_only 模式专用：存储合并后的点云（不维护 Reconstruction 结构）
@@ -544,7 +546,13 @@ class IncrementalFeatureMatcherSfM:
                 )
 
                 # ==================== 合并reconstruction中间结果 ====================
-                merge_reconstruction_success = self._merge_reconstruction_intermediate_results()
+                # 只有当 pycolmap 重建成功后才进行合并
+                if pycolmap_success:
+                    merge_reconstruction_success = self._merge_reconstruction_intermediate_results()
+                else:
+                    merge_reconstruction_success = False
+                    if self.verbose:
+                        print(f"  [Skip] Merge skipped: pycolmap reconstruction failed")
 
                 # # ==================== 批量恢复位姿和3D点到真实坐标系 ====================
                 # batch_recover_success = self._batch_recover_original_poses(
@@ -2503,6 +2511,12 @@ class IncrementalFeatureMatcherSfM:
             True if successful, False otherwise
         """
         
+        # ========== 检查是否有 reconstruction 可合并 ==========
+        if len(self.inference_reconstructions) == 0:
+            if self.verbose:
+                print("  [Skip] No reconstruction to merge yet")
+            return True  # 返回 True 表示正常，只是还没有数据
+        
         # ========== points_only 模式：特殊处理 ==========
         # 每次新增 batch 时，将所有已有的 reconstruction 一起合并
         if self.merge_method == 'points_only':
@@ -2518,6 +2532,7 @@ class IncrementalFeatureMatcherSfM:
                 self.visualizer.update_merged_point_cloud(merged_recon)
             # 保存merged_reconstruction
             temp_path = self.output_dir / "temp_merged" / f"merged_{len(self.inference_reconstructions)}"
+            self.merged_reconstruction_path = str(temp_path)
             temp_path.mkdir(parents=True, exist_ok=True)
             merged_recon.write_text(str(temp_path))
             merged_recon.export_PLY(str(temp_path / "points3D.ply"))
@@ -2565,6 +2580,7 @@ class IncrementalFeatureMatcherSfM:
         
         # 保存merged_reconstruction
         temp_path = self.output_dir / "temp_merged" / f"merged_{len(self.inference_reconstructions)}"
+        self.merged_reconstruction_path = str(temp_path)
         temp_path.mkdir(parents=True, exist_ok=True)
         merged_recon.write_text(str(temp_path))
         merged_recon.export_PLY(str(temp_path / "points3D.ply"))
@@ -3924,39 +3940,162 @@ class IncrementalFeatureMatcherSfM:
         
         return None
 
+    def export_fastgs(
+        self,
+        reconstruction: Optional[pycolmap.Reconstruction] = None,
+        images_dir: Optional[Path] = None,
+        output_dir: Optional[Path] = None,
+        copy_images: bool = True,
+        resize: bool = False,
+        output_format: str = "binary",
+        filter_outliers_enabled: bool = False,
+        outlier_std_ratio: float = 2.5,
+        outlier_max_coord: float = 1000.0,
+        use_georef: bool = False,
+    ) -> bool:
+        """
+        将重建结果导出为 FastGS (3D Gaussian Splatting) 训练格式。
+        
+        FastGS 期望的目录结构:
+            output_dir/
+            ├── images/                   # 去畸变图像
+            └── sparse/
+                └── 0/
+                    ├── cameras.bin/txt   # 相机内参
+                    ├── images.bin/txt    # 相机位姿
+                    ├── points3D.bin/txt  # 3D点（稀疏或密集）
+                    └── points3D.ply      # 带法向量的PLY文件（FastGS需要）
+        
+        Args:
+            reconstruction: pycolmap 重建对象（已弃用，使用 use_georef 参数）
+            images_dir: 原始图像目录，默认从 self.image_paths 推断
+            output_dir: 输出目录，默认为 self.output_dir / "temp_convert_fastgs"
+            copy_images: 是否复制图像（True）或创建符号链接（False）
+            resize: 是否创建缩小版本（images_2, images_4, images_8）
+            output_format: COLMAP 文件输出格式，"binary" 或 "text"
+            filter_outliers_enabled: 是否启用离散点过滤
+            outlier_std_ratio: 标准差倍数阈值（越小过滤越严格）
+            outlier_max_coord: 坐标绝对值最大阈值
+            use_georef: 是否使用地理参考坐标系（默认 False 使用本地坐标系）
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        
+        # 根据 use_georef 选择使用哪个已保存的重建路径
+        if use_georef:
+            if self.rec_georef_dir is None:
+                print("Error: 地理参考重建路径不存在。请先调用 export_georeferenced()。")
+                return False
+            colmap_model_dir = Path(self.rec_georef_dir)
+            coord_system = "georeferenced"
+        else:
+            if self.merged_reconstruction_path is None:
+                print("Error: 合并重建路径不存在。请先完成重建合并。")
+                return False
+            colmap_model_dir = Path(self.merged_reconstruction_path)
+            coord_system = "local"
+        
+        # 检查路径是否存在
+        if not colmap_model_dir.exists():
+            print(f"Error: COLMAP 模型目录不存在: {colmap_model_dir}")
+            return False
+        
+        # 推断图像目录
+        if images_dir is None:
+            if len(self.image_paths) > 0:
+                images_dir = self.image_paths[0].parent
+            else:
+                print("Error: Cannot determine images directory. Please provide images_dir.")
+                return False
+        
+        # 设置输出目录
+        if output_dir is None:
+            output_dir = self.output_dir / "temp_convert_fastgs"
+        
+        if self.verbose:
+            print(f"\n{'='*60}")
+            print(f"Exporting to FastGS format...")
+            print(f"{'='*60}")
+            print(f"  COLMAP model dir: {colmap_model_dir} ({coord_system})")
+            print(f"  Images directory: {images_dir}")
+            print(f"  Output directory: {output_dir}")
+            print(f"  Copy images: {copy_images}")
+            print(f"  Output format: {output_format}")
+            print(f"  Filter outliers: {filter_outliers_enabled}")
+        
+        # 调用 create_fastgs_structure（直接使用已保存的重建路径）
+        success = create_fastgs_structure(
+            colmap_model_dir=colmap_model_dir,
+            images_dir=images_dir,
+            output_dir=output_dir,
+            copy_images=copy_images,
+            resize=resize,
+            output_format=output_format,
+            filter_outliers_enabled=filter_outliers_enabled,
+            outlier_std_ratio=outlier_std_ratio,
+            outlier_max_coord=outlier_max_coord,
+        )
+        
+        if success:
+            if self.verbose:
+                print(f"\n✓ FastGS export complete!")
+                print(f"  Output directory: {output_dir}")
+                print(f"\nTo train FastGS, run:")
+                print(f"  python train.py -s {output_dir}")
+        else:
+            print("Error: FastGS export failed.")
+        
+        return success
+
 
 def run_incremental_feature_matching(
     image_paths: List[Path],
     output_dir: Path,
-    reconstruction_type: str = 'each_pixel_feature_points', # 'dense_feature_points' | 'each_pixel_feature_points'
+    # ==================== 重建类型 ====================
+    reconstruction_type: str = 'each_pixel_feature_points',  # 'dense_feature_points' | 'each_pixel_feature_points'
+    # ==================== 模型参数 ====================
     model_type: str = 'vggt',  # 'mapanything' | 'vggt' | 'fastvggt'
     model_path: Optional[str] = None,  # 模型权重路径（VGGT/FastVGGT需要）
-    image_interval: int = 2,
-    min_images_for_scale: int = 6,
-    overlap: int = 2,
-    pred_vis_scores_thres_value: float = 0.7, 
-    max_reproj_error: float = 5.0,
-    max_points3D_val: int = 1000000,
-    min_inlier_per_frame: int = 32,
-    run_global_sfm_first: bool = True,
-    filter_edge_margin: float = 100.0, # 边缘过滤范围（像素），默认50，设为0禁用
+    # ==================== 影像处理参数 ====================
+    image_interval: int = 2,  # 影像选取间隔（1=全部, 2=每隔1张, etc.）
+    min_images_for_scale: int = 6,  # 每批次处理的影像数量
+    overlap: int = 2,  # 相邻批次间的重叠影像数
+    run_global_sfm_first: bool = True,  # 是否先运行全局SfM
+    # ==================== 重建质量参数 ====================
+    pred_vis_scores_thres_value: float = 0.7,  # 特征点可见性阈值
+    max_reproj_error: float = 5.0,  # 最大重投影误差（像素）
+    max_points3D_val: int = 1000000,  # 3D点坐标最大绝对值
+    min_inlier_per_frame: int = 32,  # 每帧最少内点数
+    filter_edge_margin: float = 100.0,  # 边缘过滤范围（像素），设为0禁用
+    # ==================== 特征点跟踪参数（仅 dense_feature_points 模式）====================
+    max_query_pts: int = 8192,  # 每个查询帧最大特征点数 4096 8192 12288
+    query_frame_num: int = 6,  # 查询帧数量（建议 >= min_images_for_scale）
+    # ==================== 点云合并参数 ====================
+    merge_method: str = 'confidence',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only'
     merge_voxel_size: float = 0.5,  # 点云合并时的体素大小（米）
     merge_boundary_filter: bool = False,  # 是否启用边界过滤
     merge_statistical_filter: bool = False,  # 是否启用统计过滤
+    # ==================== 导出参数 - 地理坐标 ====================
     export_georef: bool = True,  # 是否导出地理坐标系的重建结果
     target_crs: str = "auto_utm",  # 目标坐标系: "auto_utm", "EPSG:3857", "EPSG:4326", 等
+    # ==================== 导出参数 - DSM ====================
     export_dsm: bool = True,  # 是否导出 DSM (数字表面模型)
     dsm_resolution: float = 0.1,  # DSM 分辨率（米），默认 10cm
-    merge_method: str = 'confidence',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only' 合并方式
-    enable_visualization: bool = True,
+    # ==================== 导出参数 - FastGS ====================
+    export_fastgs: bool = True,  # 是否导出 FastGS 格式（3D Gaussian Splatting）
+    fastgs_output_dir: Optional[Path] = None,  # FastGS 输出目录
+    fastgs_copy_images: bool = True,  # 是否复制图像（True）或创建符号链接（False）
+    fastgs_filter_outliers: bool = False,  # 是否在 FastGS 导出时过滤离散点
+    fastgs_use_georef: bool = False,  # 是否使用地理坐标系（注意：可能影响训练精度）
+    # ==================== 可视化参数 ====================
+    enable_visualization: bool = True,  # 是否启用 Viser 可视化
     visualization_mode: str = 'merged',  # 'aligned' | 'merged'
-    # 特征点跟踪参数（仅 reconstruction_type='dense_feature_points' 模式有效）
-    max_query_pts: int = 12288,  # 每个查询帧最大特征点数
-    query_frame_num: int = 6,    # 查询帧数量（建议 >= min_images_for_scale）
-    # FastVGGT 特有参数
-    fastvggt_merging: int = 0,  # FastVGGT token merging 参数
-    fastvggt_merge_ratio: float = 0.9,  # FastVGGT token merge ratio (0.0-1.0)
-    fastvggt_depth_conf_thresh: float = 3.0,  # FastVGGT 深度置信度阈值
+    # ==================== FastVGGT 特有参数 ====================
+    fastvggt_merging: int = 0,  # Token merging 参数（0=禁用）
+    fastvggt_merge_ratio: float = 0.9,  # Token merge ratio (0.0-1.0)
+    fastvggt_depth_conf_thresh: float = 3.0,  # 深度置信度阈值
+    # ==================== 日志参数 ====================
     verbose: bool = False,
 ) -> bool:
     """Run incremental image initialization pipeline.
@@ -3964,42 +4103,75 @@ def run_incremental_feature_matching(
     Args:
         image_paths: List of image file paths in processing order
         output_dir: Directory for output files
-        reconstruction_type: Type of reconstruction, 'dense_feature_points' or 'each_pixel_feature_points'
-        model_type: Type of model to use, 'mapanything', 'vggt', or 'fastvggt'
-        model_path: Path to model weights (required for VGGT/FastVGGT, optional for MapAnything)
-        image_interval: Interval for selecting images (1=all, 2=every 2nd, etc.)
-        min_images_for_scale: Minimum number of images required for scale estimation
-        overlap: Number of overlapping images between consecutive reconstructions
-        pred_vis_scores_thres_value: Minimum visibility threshold for feature tracking
-        max_reproj_error: Maximum reprojection error for feature matching
-        max_points3D_val: Maximum number of 3D points in the reconstruction
-        min_inlier_per_frame: Minimum number of inliers per frame for feature matching
-        run_global_sfm_first: Whether to run global SfM first
-        filter_edge_margin: Edge margin for filtering points (in pixels), default 10, set to 0 to disable
-        merge_voxel_size: Voxel size for point cloud merging (in meters), default 1.0
-        merge_boundary_filter: Whether to enable boundary filtering during merge, default True
-        merge_statistical_filter: Whether to enable statistical filtering during merge, default False
-        export_georef: Whether to export reconstruction in georeferenced coordinates
-        target_crs: Target coordinate system for georeferenced export:
+        
+        # 重建类型
+        reconstruction_type: 重建类型
+            - 'each_pixel_feature_points': 纯密集点云（默认）
+            - 'dense_feature_points': COLMAP格式输出，支持3DGS训练
+        
+        # 模型参数
+        model_type: 模型类型 'mapanything' | 'vggt' | 'fastvggt'
+        model_path: 模型权重路径（VGGT/FastVGGT需要，MapAnything自动下载）
+        
+        # 影像处理参数
+        image_interval: 影像选取间隔（1=全部, 2=每隔1张, etc.）
+        min_images_for_scale: 每批次处理的影像数量
+        overlap: 相邻批次间的重叠影像数
+        run_global_sfm_first: 是否先运行全局SfM获取稀疏重建
+        
+        # 重建质量参数
+        pred_vis_scores_thres_value: 特征点可见性阈值
+        max_reproj_error: 最大重投影误差（像素）
+        max_points3D_val: 3D点坐标最大绝对值
+        min_inlier_per_frame: 每帧最少内点数
+        filter_edge_margin: 边缘过滤范围（像素），设为0禁用
+        
+        # 特征点跟踪参数（仅 dense_feature_points 模式有效）
+        max_query_pts: 每个查询帧最大特征点数
+        query_frame_num: 查询帧数量（建议 >= min_images_for_scale 以支持3DGS）
+        
+        # 点云合并参数
+        merge_method: 合并方式
+            - 'full': 完整流程
+            - 'confidence': 简单置信度选择
+            - 'confidence_blend': 置信度选择+边缘平滑插值（默认）
+            - 'points_only': 仅合并点云（无COLMAP结构，更快）
+        merge_voxel_size: 点云合并时的体素大小（米）
+        merge_boundary_filter: 是否启用边界过滤
+        merge_statistical_filter: 是否启用统计过滤
+        
+        # 导出参数 - 地理坐标
+        export_georef: 是否导出地理坐标系的重建结果
+        target_crs: 目标坐标系
             - "auto_utm": 自动检测UTM区域（默认）
-            - "EPSG:3857": Web Mercator（适合网页地图可视化）
-            - "EPSG:4326": WGS84 经纬度坐标
+            - "EPSG:3857": Web Mercator
+            - "EPSG:4326": WGS84 经纬度
             - "EPSG:XXXX": 任意EPSG代码
-        export_dsm: Whether to export Digital Surface Model (DSM) as GeoTIFF
-        dsm_resolution: DSM resolution in meters (default 0.1m = 10cm)
-        merge_method: Merge method selection: 
-            'full' - use merge_full_pipeline.py with full pipeline
-            'confidence' - use merge_confidence.py with simple confidence-based selection
-            'confidence_blend' - use merge_confidence_blend.py with confidence-based selection
-                                 and smooth edge blending/interpolation (default)
-            'points_only' - use merge_points_only.py for lightweight point cloud only merge
-                            (no pycolmap Reconstruction, faster, outputs xyz/colors only)
-        enable_visualization: Whether to start viser server for visualization
-        visualization_mode: Point cloud visualization mode, 'aligned' (per batch) or 'merged' (unified)
-        fastvggt_merging: FastVGGT token merging parameter (0=disabled, default)
-        fastvggt_merge_ratio: FastVGGT token merge ratio (0.0-1.0, default 0.9)
-        fastvggt_depth_conf_thresh: FastVGGT depth confidence threshold (default 3.0)
-        verbose: Enable verbose logging
+        
+        # 导出参数 - DSM
+        export_dsm: 是否导出DSM（数字表面模型）
+        dsm_resolution: DSM分辨率（米），默认0.1m (10cm)
+        
+        # 导出参数 - FastGS (3D Gaussian Splatting)
+        export_fastgs: 是否导出FastGS训练格式
+        fastgs_output_dir: FastGS输出目录，默认 output_dir / "temp_convert_fastgs"
+        fastgs_copy_images: 是否复制图像（True）或创建符号链接（False）
+        fastgs_filter_outliers: 是否在FastGS导出时过滤离散点
+        fastgs_use_georef: 是否使用地理坐标系导出（默认False）
+            - False: 使用本地坐标系（推荐，训练更稳定）
+            - True: 使用地理坐标系（需先启用export_georef，坐标值较大可能影响精度）
+        
+        # 可视化参数
+        enable_visualization: 是否启用Viser可视化
+        visualization_mode: 可视化模式 'aligned' | 'merged'
+        
+        # FastVGGT 特有参数
+        fastvggt_merging: Token merging参数（0=禁用）
+        fastvggt_merge_ratio: Token merge ratio (0.0-1.0)
+        fastvggt_depth_conf_thresh: 深度置信度阈值
+        
+        # 日志参数
+        verbose: 是否启用详细日志
     
     Returns:
         True if successful, False otherwise
@@ -4068,30 +4240,37 @@ def run_incremental_feature_matching(
 
     matcher = IncrementalFeatureMatcherSfM(
         output_dir=output_dir,
+        # 重建类型
         reconstruction_type=reconstruction_type,
+        # 模型参数
         model_type=model_type,
         model_path=model_path,
+        # 影像处理参数
         global_sparse_reconstruction=global_sparse_reconstruction,
         min_images_for_scale=min_images_for_scale,
         overlap=overlap,
+        # 重建质量参数
         pred_vis_scores_thres_value=pred_vis_scores_thres_value,
         max_reproj_error=max_reproj_error,
         max_points3D_val=max_points3D_val,
         min_inlier_per_frame=min_inlier_per_frame,
         filter_edge_margin=filter_edge_margin,
-        merge_voxel_size=merge_voxel_size,
-        merge_boundary_filter=merge_boundary_filter,
-        merge_statistical_filter=merge_statistical_filter,
-        merge_method=merge_method,
-        enable_visualization=enable_visualization,
         # 特征点跟踪参数
         max_query_pts=max_query_pts,
         query_frame_num=query_frame_num,
+        # 点云合并参数
+        merge_method=merge_method,
+        merge_voxel_size=merge_voxel_size,
+        merge_boundary_filter=merge_boundary_filter,
+        merge_statistical_filter=merge_statistical_filter,
+        # 可视化参数
+        enable_visualization=enable_visualization,
+        visualization_mode=visualization_mode,
         # FastVGGT 参数
         fastvggt_merging=fastvggt_merging,
         fastvggt_merge_ratio=fastvggt_merge_ratio,
         fastvggt_depth_conf_thresh=fastvggt_depth_conf_thresh,
-        visualization_mode=visualization_mode,
+        # 日志参数
         verbose=verbose,
     )
 
@@ -4167,6 +4346,48 @@ def run_incremental_feature_matching(
                 if verbose:
                     print(f"  ✓ Georeferenced DSM exported to: {output_dir / 'temp_dsm' / 'dsm_georeferenced.tif'}")
 
+    # Export FastGS format if requested
+    if export_fastgs:
+        if matcher.merged_reconstruction is not None:
+            if verbose:
+                print(f"\n{'='*60}")
+                print(f"Exporting to FastGS (3D Gaussian Splatting) format...")
+                print(f"{'='*60}")
+            
+            # 确定 FastGS 输出目录
+            if fastgs_output_dir is None:
+                fastgs_output_dir = output_dir / "temp_convert_fastgs"
+            
+            # 获取图像目录
+            images_dir = selected_image_paths[0].parent if len(selected_image_paths) > 0 else None
+            
+            fastgs_success = matcher.export_fastgs(
+                images_dir=images_dir,
+                output_dir=fastgs_output_dir,
+                copy_images=fastgs_copy_images,
+                resize=False,
+                output_format="binary",
+                filter_outliers_enabled=fastgs_filter_outliers,
+                use_georef=fastgs_use_georef,
+            )
+            if not fastgs_success:
+                print("  Warning: FastGS export failed")
+            else:
+                if verbose:
+                    coord_system = "georeferenced" if fastgs_use_georef else "local"
+                    print(f"  ✓ FastGS format exported to: {fastgs_output_dir} ({coord_system} coordinates)")
+                    print(f"\n  To train FastGS, run:")
+                    print(f"    python train.py -s {fastgs_output_dir}")
+        elif merge_method == 'points_only':
+            if verbose:
+                print(f"\n{'='*60}")
+                print(f"Note: FastGS export requires 'dense_feature_points' reconstruction type")
+                print(f"      with merge_method != 'points_only' to maintain COLMAP structure.")
+                print(f"{'='*60}")
+        else:
+            if verbose:
+                print(f"\n  [Skip] FastGS export: merged_reconstruction is None")
+
     if verbose:
         stats = matcher.get_statistics()
         print(f"\n{'='*60}")
@@ -4210,6 +4431,7 @@ if __name__ == "__main__":
     # input_dir = Path(r"drone-map-anything\examples\WenChuan\images")
     # output_dir = Path(r"drone-map-anything\output\WenChuan\sparse_incremental_reconstruction")
 
+    # ==================== 模型参数 ====================
     # 模型选择: 'mapanything', 'vggt', 或 'fastvggt'
     MODEL_TYPE = 'vggt'  # 切换模型类型: 'mapanything' | 'vggt' | 'fastvggt'
     
@@ -4218,8 +4440,9 @@ if __name__ == "__main__":
     # - FastVGGT: "weights/fastvggt/model_tracker_fixed_e20.pt" (参考 eval_custom_colmap.py 默认路径)
     MODEL_PATH = "weights/vggt/model.pt"
     
+    # ==================== FastVGGT 特有参数 ====================
     # FastVGGT 特有参数（仅当 MODEL_TYPE='fastvggt' 时生效）
-    FASTVGGT_MERGING = 0  # Token merging 参数，0=禁用
+    FASTVGGT_MERGING = 0  # Token merging 参数（0=禁用）
     FASTVGGT_MERGE_RATIO = 0.5  # Token merge ratio (0.0-1.0)
     FASTVGGT_DEPTH_CONF_THRESH = 0.5  # 深度置信度阈值
     
@@ -4239,12 +4462,14 @@ if __name__ == "__main__":
     success = run_incremental_feature_matching(
         image_paths=image_files,
         output_dir=output_dir,
+        # 模型参数
         model_type=MODEL_TYPE,
         model_path=MODEL_PATH,
-        # FastVGGT 参数（仅当 model_type='fastvggt' 时生效）
+        # FastVGGT 参数
         fastvggt_merging=FASTVGGT_MERGING,
         fastvggt_merge_ratio=FASTVGGT_MERGE_RATIO,
         fastvggt_depth_conf_thresh=FASTVGGT_DEPTH_CONF_THRESH,
+        # 日志参数
         verbose=True,
     )
     
