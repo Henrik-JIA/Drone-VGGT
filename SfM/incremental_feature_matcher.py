@@ -141,7 +141,8 @@ class IncrementalFeatureMatcherSfM:
         max_reproj_error: float = 10.0,
         max_points3D_val: int = 100000,  # 增大默认值，5000 对航拍场景太小
         min_inlier_per_frame: int = 32,
-        pred_vis_scores_thres_value: float = 0.3, 
+        pred_vis_scores_thres_value: float = 0.3,
+        min_visible_frames: int = 2,  # 3D点至少在多少帧中可见才保留（仅 each_pixel_feature_points 模式）
         filter_edge_margin: float = 10.0,  # 边缘过滤范围（像素），默认10，设为0禁用
         merge_voxel_size: float = 1.0,  # 点云合并时的体素大小（米）
         merge_boundary_filter: bool = True,  # 是否启用边界过滤
@@ -225,6 +226,7 @@ class IncrementalFeatureMatcherSfM:
         self.min_images_for_scale = max(2, min_images_for_scale)
         self.overlap = overlap       
         self.pred_vis_scores_thres_value = pred_vis_scores_thres_value
+        self.min_visible_frames = max(1, min_visible_frames)  # 至少为1
         self.max_reproj_error = max_reproj_error
         self.max_points3D_val = max_points3D_val
         self.min_inlier_per_frame = min_inlier_per_frame
@@ -656,7 +658,7 @@ class IncrementalFeatureMatcherSfM:
                     
                     # 步骤8: 在GPU上筛选有效点
                     points_visible_count_gpu = visible_mask_gpu.sum(dim=0)  # (N,)
-                    valid_points_mask_gpu = points_visible_count_gpu > 0
+                    valid_points_mask_gpu = points_visible_count_gpu >= self.min_visible_frames  # 至少在 min_visible_frames 帧中可见
                     valid_point_indices_gpu = torch.nonzero(valid_points_mask_gpu, as_tuple=True)[0]
                     num_tracks = valid_point_indices_gpu.size(0)
                     
@@ -1185,6 +1187,7 @@ class IncrementalFeatureMatcherSfM:
         self.input_views.append(input_view)
 
         # Preprocess this single view
+        # 将图像缩放到固定分辨率（resolution_set=518），以适配神经网络的输入要求。
         preprocessed_view = preprocess_inputs(
             [input_view],
             resize_mode="fixed_mapping",
@@ -4059,11 +4062,12 @@ def run_incremental_feature_matching(
     model_path: Optional[str] = None,  # 模型权重路径（VGGT/FastVGGT需要）
     # ==================== 影像处理参数 ====================
     image_interval: int = 2,  # 影像选取间隔（1=全部, 2=每隔1张, etc.）
-    min_images_for_scale: int = 6,  # 每批次处理的影像数量
+    min_images_for_scale: int = 4,  # 每批次处理的影像数量
     overlap: int = 2,  # 相邻批次间的重叠影像数
     run_global_sfm_first: bool = True,  # 是否先运行全局SfM
     # ==================== 重建质量参数 ====================
     pred_vis_scores_thres_value: float = 0.7,  # 特征点可见性阈值
+    min_visible_frames: int = 2,  # 3D点至少在多少帧中可见才保留（仅 each_pixel_feature_points 模式）
     max_reproj_error: float = 5.0,  # 最大重投影误差（像素）
     max_points3D_val: int = 1000000,  # 3D点坐标最大绝对值
     min_inlier_per_frame: int = 32,  # 每帧最少内点数
@@ -4121,6 +4125,7 @@ def run_incremental_feature_matching(
         
         # 重建质量参数
         pred_vis_scores_thres_value: 特征点可见性阈值
+        min_visible_frames: 3D点至少在多少帧中可见才保留（仅 each_pixel_feature_points 模式）
         max_reproj_error: 最大重投影误差（像素）
         max_points3D_val: 3D点坐标最大绝对值
         min_inlier_per_frame: 每帧最少内点数
@@ -4251,6 +4256,7 @@ def run_incremental_feature_matching(
         overlap=overlap,
         # 重建质量参数
         pred_vis_scores_thres_value=pred_vis_scores_thres_value,
+        min_visible_frames=min_visible_frames,
         max_reproj_error=max_reproj_error,
         max_points3D_val=max_points3D_val,
         min_inlier_per_frame=min_inlier_per_frame,
