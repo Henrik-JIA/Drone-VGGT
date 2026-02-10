@@ -4062,7 +4062,7 @@ def run_incremental_feature_matching(
     model_path: Optional[str] = None,  # 模型权重路径（VGGT/FastVGGT需要）
     # ==================== 影像处理参数 ====================
     image_interval: int = 2,  # 影像选取间隔（1=全部, 2=每隔1张, etc.）
-    min_images_for_scale: int = 4,  # 每批次处理的影像数量
+    min_images_for_scale: int = 6,  # 每批次处理的影像数量
     overlap: int = 2,  # 相邻批次间的重叠影像数
     run_global_sfm_first: bool = True,  # 是否先运行全局SfM
     # ==================== 重建质量参数 ====================
@@ -4085,9 +4085,9 @@ def run_incremental_feature_matching(
     target_crs: str = "auto_utm",  # 目标坐标系: "auto_utm", "EPSG:3857", "EPSG:4326", 等
     # ==================== 导出参数 - DSM ====================
     export_dsm: bool = True,  # 是否导出 DSM (数字表面模型)
-    dsm_resolution: float = 0.1,  # DSM 分辨率（米），默认 10cm
+    dsm_resolution: float = 1.0,  # DSM 分辨率（米），默认 100cm
     # ==================== 导出参数 - FastGS ====================
-    export_fastgs: bool = False,  # 是否导出 FastGS 格式（3D Gaussian Splatting）
+    export_fastgs: bool = True,  # 是否导出 FastGS 格式（3D Gaussian Splatting）
     fastgs_output_dir: Optional[Path] = None,  # FastGS 输出目录
     fastgs_copy_images: bool = True,  # 是否复制图像（True）或创建符号链接（False）
     fastgs_filter_outliers: bool = False,  # 是否在 FastGS 导出时过滤离散点

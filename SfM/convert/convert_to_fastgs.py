@@ -494,7 +494,7 @@ if __name__ == "__main__":
         # 直接指定输入输出路径（方便调试）
         # 使用绝对路径，避免工作目录问题
         # 支持从 binary 或 text 格式的 COLMAP 重建读取
-        COLMAP_MODEL_DIR = SCRIPT_DIR / "../../output/Ganluo_images/sparse_incremental_reconstruction/temp_merged/merged_8"
+        COLMAP_MODEL_DIR = SCRIPT_DIR / "../../output/Ganluo_images/sparse_incremental_reconstruction/recon_2_2_6_vggt74_dense_feature_points/temp_merged/merged_8"
         IMAGES_DIR = SCRIPT_DIR / "../../examples/Ganluo_images/images"
         OUTPUT_DIR = SCRIPT_DIR / "./fastgs_Ganluo"
         COPY_IMAGES = True      # True: 复制图片, False: 创建符号链接

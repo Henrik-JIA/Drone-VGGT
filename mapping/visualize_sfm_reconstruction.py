@@ -98,6 +98,7 @@ class SfMVisualizerO3D:
         viewpoint_file: Optional[str] = None,
         projection_mode: str = "perspective",
         ortho_zoom: float = 0.5,
+        transparent_background: bool = False,
         verbose: bool = True,
     ):
         """
@@ -116,6 +117,7 @@ class SfMVisualizerO3D:
             viewpoint_file: 视角保存文件路径 (可选，默认保存到重建结果文件夹)
             projection_mode: 投影模式 ('perspective' 透视 | 'orthographic' 正射)
             ortho_zoom: 正射投影的缩放因子 (数值越小场景显示越大)
+            transparent_background: 是否使用透明背景 (仅对 PNG 格式有效)
             verbose: 是否输出详细信息
         """
         self.reconstruction_path = Path(reconstruction_path)
@@ -128,7 +130,12 @@ class SfMVisualizerO3D:
         self.show_points = show_points
         self.projection_mode = projection_mode  # 'perspective' or 'orthographic'
         self.ortho_zoom = ortho_zoom
+        self.transparent_background = transparent_background
         self.verbose = verbose
+        
+        # 透明背景使用的特殊颜色 (用于后期替换为透明)
+        # 使用一个极少出现的颜色：纯品红 (magenta)
+        self.chroma_key_color = [1.0, 0.0, 1.0]  # RGB: (255, 0, 255)
 
         # 设置颜色主题
         theme_map = {
@@ -290,6 +297,42 @@ class SfMVisualizerO3D:
     def get_saved_viewpoint_names(self) -> List[str]:
         """获取所有已保存的视角名称。"""
         return list(self.saved_viewpoints.keys())
+
+    def _make_background_transparent(self, image_path: str, tolerance: int = 10) -> bool:
+        """
+        将截图中的特殊背景色替换为透明。
+        
+        Args:
+            image_path: 图像文件路径
+            tolerance: 颜色匹配容差 (0-255)
+            
+        Returns:
+            是否成功处理
+        """
+        try:
+            img = Image.open(image_path)
+            img = img.convert("RGBA")
+            data = np.array(img)
+            
+            # 目标颜色 (chroma key color)
+            target_color = np.array([255, 0, 255])  # magenta
+            
+            # 计算每个像素与目标颜色的距离
+            diff = np.abs(data[:, :, :3].astype(np.int16) - target_color.astype(np.int16))
+            mask = np.all(diff <= tolerance, axis=2)
+            
+            # 将匹配的像素设为透明
+            data[mask, 3] = 0
+            
+            # 保存为 PNG (支持透明通道)
+            result = Image.fromarray(data, 'RGBA')
+            result.save(image_path)
+            
+            return True
+        except Exception as e:
+            if self.verbose:
+                print(f"  ⚠ 透明背景处理失败: {e}")
+            return False
 
     def load_reconstruction(self) -> bool:
         """
@@ -637,7 +680,11 @@ class SfMVisualizerO3D:
 
         # 设置渲染选项
         opt = vis.get_render_option()
-        opt.background_color = np.array(self.theme["background"])
+        # 如果需要透明背景，使用 chroma key 颜色；否则使用主题背景色
+        if self.transparent_background:
+            opt.background_color = np.array(self.chroma_key_color)
+        else:
+            opt.background_color = np.array(self.theme["background"])
         opt.point_size = self.point_size
         opt.line_width = self.frustum_line_width
 
@@ -676,16 +723,21 @@ class SfMVisualizerO3D:
             return False
         
         def take_screenshot(vis):
-            """P键: 截图保存 (带 DPI 设置)"""
+            """P键: 截图保存 (带 DPI 设置和可选透明背景)"""
             screenshot_counter["count"] += 1
             filename = screenshot_path / f"screenshot_{screenshot_counter['count']:03d}.png"
             vis.capture_screen_image(str(filename), do_render=True)
+            
+            # 处理透明背景
+            if visualizer_self.transparent_background:
+                visualizer_self._make_background_transparent(str(filename))
             
             # 使用 PIL 设置 DPI
             try:
                 img = Image.open(str(filename))
                 img.save(str(filename), dpi=(screenshot_dpi, screenshot_dpi))
-                print(f"\n  📷 截图已保存: {filename} ({screenshot_dpi} DPI)")
+                transparency_info = " (透明背景)" if visualizer_self.transparent_background else ""
+                print(f"\n  📷 截图已保存: {filename} ({screenshot_dpi} DPI){transparency_info}")
             except Exception as e:
                 print(f"\n  📷 截图已保存: {filename} (DPI 设置失败: {e})")
             
@@ -842,7 +894,11 @@ class SfMVisualizerO3D:
 
             # 设置渲染选项
             opt = vis.get_render_option()
-            opt.background_color = np.array(self.theme["background"])
+            # 如果需要透明背景，使用 chroma key 颜色
+            if self.transparent_background:
+                opt.background_color = np.array(self.chroma_key_color)
+            else:
+                opt.background_color = np.array(self.theme["background"])
             opt.point_size = self.point_size
             opt.line_width = self.frustum_line_width
 
@@ -871,6 +927,10 @@ class SfMVisualizerO3D:
             output_file = output_path / f"reconstruction_{view_name}.{format}"
             vis.capture_screen_image(str(output_file), do_render=True)
             
+            # 处理透明背景
+            if self.transparent_background and format.lower() == "png":
+                self._make_background_transparent(str(output_file))
+            
             # 设置 DPI
             try:
                 img = Image.open(str(output_file))
@@ -879,7 +939,8 @@ class SfMVisualizerO3D:
                 pass  # 静默忽略 DPI 设置失败
 
             if self.verbose:
-                print(f"  ✓ 保存: {output_file} ({dpi} DPI)")
+                transparency_info = " (透明背景)" if self.transparent_background else ""
+                print(f"  ✓ 保存: {output_file} ({dpi} DPI){transparency_info}")
 
             vis.destroy_window()
     
@@ -1037,7 +1098,10 @@ def create_custom_visualization(
 USE_DIRECT_CONFIG = True
 
 # 📁 重建结果路径（包含 cameras.txt, images.txt, points3D.txt/ply 的文件夹）
-RECONSTRUCTION_PATH = r"D:\Github_code\drone-map-anything\output\Ganluo_images\sparse_incremental_reconstruction\temp_merged_reconstruction_georeferenced"
+# RECONSTRUCTION_PATH = r"D:\Github_code\drone-map-anything\output\Ganluo_images\sparse_incremental_reconstruction\temp_merged_reconstruction_georeferenced"
+# RECONSTRUCTION_PATH = r"D:\Github_code\drone-map-anything\output\Ganluo_images\sparse_incremental_reconstruction\temp_merged\merged_2"
+RECONSTRUCTION_PATH = r"D:\Github_code\drone-map-anything\output\Ganluo_images\sparse_incremental_reconstruction\global_sfm1\enu"
+# RECONSTRUCTION_PATH = r"D:\Github_code\drone-map-anything\output\Ganluo_images\sparse_incremental_reconstruction\recon_2_2_6_vggt74_dense_feature_points\temp_merged\merged_1"
 
 # 📂 截图输出目录（设为 None 则保存到重建路径下的 visualization 文件夹）
 OUTPUT_DIR = r"D:\Github_code\drone-map-anything\output\Ganluo_images\sparse_incremental_reconstruction\temp_paper_figures"
@@ -1046,10 +1110,10 @@ OUTPUT_DIR = r"D:\Github_code\drone-map-anything\output\Ganluo_images\sparse_inc
 THEME = "paper_light"
 
 # 🔘 点云点大小 (推荐: 1.0 ~ 3.0)
-POINT_SIZE = 0.7
+POINT_SIZE = 1.2
 
 # 📷 视锥体缩放比例 (根据场景大小调整，推荐: 1.0 ~ 10.0)
-FRUSTUM_SCALE = 20.0
+FRUSTUM_SCALE = 25.0
 
 # 🎨 视锥体颜色 [R, G, B]，取值 0.0~1.0 (设为 None 则使用主题默认颜色)
 # FRUSTUM_COLOR = None  # 使用主题颜色
@@ -1095,6 +1159,9 @@ SCREENSHOT_DIR = None  # 默认使用 OUTPUT_DIR
 # 🖨️ 截图 DPI (用于论文打印，推荐 300 DPI)
 SCREENSHOT_DPI = 300
 
+# 🔲 透明背景 (截图时将背景替换为透明，仅对 PNG 格式有效)
+TRANSPARENT_BACKGROUND = True
+
 
 def main():
     """主程序入口"""
@@ -1119,6 +1186,7 @@ def main():
             viewpoint_file=VIEWPOINT_FILE,
             projection_mode=PROJECTION_MODE,
             ortho_zoom=ORTHO_ZOOM,
+            transparent_background=TRANSPARENT_BACKGROUND,
             verbose=True,
         )
 
@@ -1278,6 +1346,12 @@ def main():
             default=300,
             help="截图 DPI (默认: 300，用于论文打印)",
         )
+        
+        parser.add_argument(
+            "--transparent",
+            action="store_true",
+            help="使用透明背景 (仅对 PNG 格式有效)",
+        )
 
         args = parser.parse_args()
 
@@ -1295,6 +1369,7 @@ def main():
             viewpoint_file=args.viewpoint_file,
             projection_mode=args.projection,
             ortho_zoom=args.ortho_zoom,
+            transparent_background=args.transparent,
             verbose=True,
         )
 
