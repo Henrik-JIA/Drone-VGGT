@@ -8,8 +8,11 @@ build tracks, and triangulate.
 import os
 import sys
 import copy
+import time
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
+from datetime import datetime
+from contextlib import contextmanager
 
 import numpy as np
 import pycolmap
@@ -21,6 +24,153 @@ from scipy.spatial.transform import Rotation as R
 from collections import defaultdict
 import subprocess
 import cv2
+
+
+class TimingTracker:
+    """用于跟踪代码各步骤耗时的工具类"""
+    
+    def __init__(self, output_dir: Path = None):
+        self.timings: Dict[str, List[float]] = defaultdict(list)
+        self.current_step: Dict[str, float] = {}
+        self.total_start_time: float = None
+        self.output_dir = output_dir or Path("temp_time")
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+    def start_total(self):
+        """开始总计时"""
+        self.total_start_time = time.time()
+        
+    def start(self, step_name: str):
+        """开始某个步骤的计时"""
+        self.current_step[step_name] = time.time()
+        
+    def end(self, step_name: str):
+        """结束某个步骤的计时并记录"""
+        if step_name in self.current_step:
+            elapsed = time.time() - self.current_step[step_name]
+            self.timings[step_name].append(elapsed)
+            del self.current_step[step_name]
+            return elapsed
+        return 0.0
+    
+    @contextmanager
+    def track(self, step_name: str):
+        """上下文管理器用于跟踪步骤耗时"""
+        self.start(step_name)
+        try:
+            yield
+        finally:
+            self.end(step_name)
+    
+    def get_total_time(self) -> float:
+        """获取总耗时"""
+        if self.total_start_time is None:
+            return 0.0
+        return time.time() - self.total_start_time
+    
+    def get_step_summary(self, step_name: str) -> Dict:
+        """获取某个步骤的统计信息"""
+        times = self.timings.get(step_name, [])
+        if not times:
+            return {"count": 0, "total": 0, "mean": 0, "min": 0, "max": 0}
+        return {
+            "count": len(times),
+            "total": sum(times),
+            "mean": sum(times) / len(times),
+            "min": min(times),
+            "max": max(times),
+        }
+    
+    def export_to_file(self, filename: str = None) -> Path:
+        """导出计时信息到文本文件"""
+        if filename is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"timing_report_{timestamp}.txt"
+        
+        output_path = self.output_dir / filename
+        
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write("=" * 80 + "\n")
+            f.write("                    Incremental Dense Reconstruction Timing Report\n")
+            f.write("=" * 80 + "\n")
+            f.write(f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Total Runtime: {self.get_total_time():.2f} seconds ({self.get_total_time()/60:.2f} minutes)\n")
+            f.write("=" * 80 + "\n\n")
+            
+            # 按类别分组输出
+            categories = {
+                "Initialization": ["global_sfm", "model_loading"],
+                "Per-Image Processing": ["add_image", "initialize_image", "run_inference"],
+                "Batch Processing": ["predict_tracks", "build_pycolmap", "merge_reconstruction"],
+                "Export": ["export_georef", "export_dsm", "export_dsm_georef", "export_fastgs"],
+            }
+            
+            all_listed_steps = set()
+            for cat_name, steps in categories.items():
+                f.write(f"\n{'─' * 40}\n")
+                f.write(f"  {cat_name}\n")
+                f.write(f"{'─' * 40}\n")
+                
+                for step in steps:
+                    all_listed_steps.add(step)
+                    summary = self.get_step_summary(step)
+                    if summary["count"] > 0:
+                        f.write(f"\n  [{step}]\n")
+                        f.write(f"    调用次数: {summary['count']}\n")
+                        f.write(f"    总耗时:   {summary['total']:.3f}s ({summary['total']/60:.2f}min)\n")
+                        f.write(f"    平均耗时: {summary['mean']:.3f}s\n")
+                        f.write(f"    最小耗时: {summary['min']:.3f}s\n")
+                        f.write(f"    最大耗时: {summary['max']:.3f}s\n")
+            
+            # 输出其他未分类的步骤
+            other_steps = set(self.timings.keys()) - all_listed_steps
+            if other_steps:
+                f.write(f"\n{'─' * 40}\n")
+                f.write(f"  Other Steps\n")
+                f.write(f"{'─' * 40}\n")
+                for step in sorted(other_steps):
+                    summary = self.get_step_summary(step)
+                    if summary["count"] > 0:
+                        f.write(f"\n  [{step}]\n")
+                        f.write(f"    调用次数: {summary['count']}\n")
+                        f.write(f"    总耗时:   {summary['total']:.3f}s ({summary['total']/60:.2f}min)\n")
+                        f.write(f"    平均耗时: {summary['mean']:.3f}s\n")
+            
+            # 总结表格
+            f.write(f"\n\n{'=' * 80}\n")
+            f.write("                              Summary Table\n")
+            f.write("=" * 80 + "\n")
+            f.write(f"{'Step':<30} {'Count':>8} {'Total(s)':>12} {'Mean(s)':>10} {'%':>8}\n")
+            f.write("-" * 80 + "\n")
+            
+            total_time = self.get_total_time()
+            sorted_steps = sorted(
+                self.timings.items(),
+                key=lambda x: sum(x[1]),
+                reverse=True
+            )
+            
+            for step_name, times in sorted_steps:
+                step_total = sum(times)
+                step_mean = step_total / len(times) if times else 0
+                pct = (step_total / total_time * 100) if total_time > 0 else 0
+                f.write(f"{step_name:<30} {len(times):>8} {step_total:>12.3f} {step_mean:>10.3f} {pct:>7.1f}%\n")
+            
+            f.write("-" * 80 + "\n")
+            f.write(f"{'TOTAL':<30} {'-':>8} {total_time:>12.3f} {'-':>10} {'100.0':>7}%\n")
+            f.write("=" * 80 + "\n")
+        
+        print(f"Timing report saved to: {output_path}")
+        return output_path
+
+
+# 全局计时器实例（在 run_incremental_feature_matching 中初始化）
+_timing_tracker: Optional[TimingTracker] = None
+
+
+def get_timing_tracker() -> Optional[TimingTracker]:
+    """获取全局计时器实例"""
+    return _timing_tracker
 
 # UTM coordinate conversion imports (conditional)
 try:
@@ -1099,6 +1249,10 @@ class IncrementalFeatureMatcherSfM:
         Returns:
             True if successful, False otherwise
         """
+        tracker = get_timing_tracker()
+        if tracker:
+            tracker.start("initialize_image")
+        
         if self.verbose:
             print(f"\n{'='*60}")
             print(f"Initializing image {len(self.ori_extrinsic) + 1}: {image_path.name}")
@@ -1224,6 +1378,9 @@ class IncrementalFeatureMatcherSfM:
         if self.verbose:
             print(f"✓ Image initialized: {image_name} (ID: {image_id})")
         
+        tracker = get_timing_tracker()
+        if tracker:
+            tracker.end("initialize_image")
         return True
 
     def _run_inference(self, image_path: Path, preprocessed_view: Dict) -> bool:
@@ -1236,8 +1393,17 @@ class IncrementalFeatureMatcherSfM:
         Returns:
             True if successful, False otherwise
         """
+        # 获取全局计时器
+        tracker = get_timing_tracker()
+        if tracker:
+            tracker.start("run_inference")
+        
         # Load model loader
+        if tracker:
+            tracker.start("model_loading")
         model_loader = self._load_model()
+        if tracker:
+            tracker.end("model_loading")
 
         # 判断是第几张图像
         num_images = len(self.preprocessed_views)
@@ -1319,6 +1485,11 @@ class IncrementalFeatureMatcherSfM:
         # 清理CUDA缓存
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+        # 结束计时
+        tracker = get_timing_tracker()
+        if tracker:
+            tracker.end("run_inference")
 
         return True
 
@@ -1565,6 +1736,10 @@ class IncrementalFeatureMatcherSfM:
         Returns:
             True if successful, False otherwise
         """
+        tracker = get_timing_tracker()
+        if tracker:
+            tracker.start("predict_tracks")
+        
         try:
             if self.verbose:
                 print(f"\n  Predicting tracks for batch (indices {start_idx} to {end_idx-1})...")
@@ -1743,15 +1918,24 @@ class IncrementalFeatureMatcherSfM:
                     print(f"    Number of tracked points: {pred_tracks.shape[1]}")
                 
                 torch.cuda.empty_cache()
+                tracker = get_timing_tracker()
+                if tracker:
+                    tracker.end("predict_tracks")
                 return True
             else:
                 print("  Warning: No images available for track prediction")
+                tracker = get_timing_tracker()
+                if tracker:
+                    tracker.end("predict_tracks")
                 return False
                 
         except Exception as e:
             print(f"  Error during track prediction: {e}")
             import traceback
             traceback.print_exc()
+            tracker = get_timing_tracker()
+            if tracker:
+                tracker.end("predict_tracks")
             return False
 
     def _build_pycolmap_reconstruction(self, start_idx: int, end_idx: int, use_recovered: bool = False) -> bool:
@@ -1764,6 +1948,10 @@ class IncrementalFeatureMatcherSfM:
         Returns:
             True if successful, False otherwise
         """
+        tracker = get_timing_tracker()
+        if tracker:
+            tracker.start("build_pycolmap")
+        
         try:
             if self.verbose:
                 print(f"\n  Building pycolmap reconstruction for images {start_idx} to {end_idx-1}...")
@@ -2029,12 +2217,18 @@ class IncrementalFeatureMatcherSfM:
                 print(f"    Number of cameras: {len(aligned_recon.cameras)}")
                 print(f"    Number of images: {len(aligned_recon.images)}")
             
+            tracker = get_timing_tracker()
+            if tracker:
+                tracker.end("build_pycolmap")
             return True
             
         except Exception as e:
             print(f"  Error building pycolmap reconstruction: {e}")
             import traceback
             traceback.print_exc()
+            tracker = get_timing_tracker()
+            if tracker:
+                tracker.end("build_pycolmap")
             return False
 
     def _extract_and_resize_pts3d_for_batch(
@@ -2513,17 +2707,26 @@ class IncrementalFeatureMatcherSfM:
         Returns:
             True if successful, False otherwise
         """
+        tracker = get_timing_tracker()
+        if tracker:
+            tracker.start("merge_reconstruction")
         
         # ========== 检查是否有 reconstruction 可合并 ==========
         if len(self.inference_reconstructions) == 0:
             if self.verbose:
                 print("  [Skip] No reconstruction to merge yet")
+            if tracker:
+                tracker.end("merge_reconstruction")
             return True  # 返回 True 表示正常，只是还没有数据
         
         # ========== points_only 模式：特殊处理 ==========
         # 每次新增 batch 时，将所有已有的 reconstruction 一起合并
         if self.merge_method == 'points_only':
-            return self._merge_by_points_only()
+            result = self._merge_by_points_only()
+            tracker = get_timing_tracker()
+            if tracker:
+                tracker.end("merge_reconstruction")
+            return result
         
         # ========== 其他模式：两两递增合并 ==========
         # 如果这是第一个reconstruction，直接设置为merged
@@ -2540,6 +2743,9 @@ class IncrementalFeatureMatcherSfM:
             merged_recon.write_text(str(temp_path))
             merged_recon.export_PLY(str(temp_path / "points3D.ply"))
             export_reconstruction_to_las(merged_recon, str(temp_path / "points3D.las"), verbose=self.verbose)
+            tracker = get_timing_tracker()
+            if tracker:
+                tracker.end("merge_reconstruction")
             return True
 
         # 获取当前reconstruction信息
@@ -2572,6 +2778,9 @@ class IncrementalFeatureMatcherSfM:
         if merged_recon is None:
             if self.verbose:
                 print(f"  ✗ 合并失败")
+            tracker = get_timing_tracker()
+            if tracker:
+                tracker.end("merge_reconstruction")
             return False
         
         # 更新merged_reconstruction
@@ -2598,6 +2807,9 @@ class IncrementalFeatureMatcherSfM:
         # 清理不再需要的中间数据以释放内存
         self._cleanup_intermediate_data(keep_last_n=2)
 
+        tracker = get_timing_tracker()
+        if tracker:
+            tracker.end("merge_reconstruction")
         return True
     
     def _merge_by_confidence_blend(
@@ -4073,8 +4285,8 @@ def run_incremental_feature_matching(
     min_inlier_per_frame: int = 32,  # 每帧最少内点数
     filter_edge_margin: float = 100.0,  # 边缘过滤范围（像素），设为0禁用
     # ==================== 特征点跟踪参数（仅 dense_feature_points 模式）====================
-    max_query_pts: int = 8192,  # 每个查询帧最大特征点数 4096 8192 12288
-    query_frame_num: int = 6,  # 查询帧数量（建议 >= min_images_for_scale）
+    max_query_pts: int = 4096,  # 每个查询帧最大特征点数 4096 8192 12288
+    query_frame_num: int = 4,  # 查询帧数量（建议 >= min_images_for_scale）
     # ==================== 点云合并参数 ====================
     merge_method: str = 'confidence',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only'
     merge_voxel_size: float = 0.5,  # 点云合并时的体素大小（米）
@@ -4101,6 +4313,8 @@ def run_incremental_feature_matching(
     fastvggt_depth_conf_thresh: float = 3.0,  # 深度置信度阈值
     # ==================== 日志参数 ====================
     verbose: bool = False,
+    # ==================== 计时参数 ====================
+    enable_timing: bool = True,  # 是否启用计时统计
 ) -> bool:
     """Run incremental image initialization pipeline.
     
@@ -4177,10 +4391,28 @@ def run_incremental_feature_matching(
         
         # 日志参数
         verbose: 是否启用详细日志
+        
+        # 计时参数
+        enable_timing: 是否启用计时统计
+            - True: 记录各步骤耗时并在完成后导出报告到 output_dir/temp_time/ 目录
+            - False: 不记录计时信息（默认True）
     
     Returns:
         True if successful, False otherwise
     """
+    # ==================== 初始化计时器 ====================
+    global _timing_tracker
+    if enable_timing:
+        timing_output_dir = output_dir / "temp_time"
+        _timing_tracker = TimingTracker(output_dir=timing_output_dir)
+        _timing_tracker.start_total()
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"Timing enabled. Report will be saved to: {timing_output_dir}")
+            print(f"{'='*60}\n")
+    else:
+        _timing_tracker = None
+    
     # Process images one by one with interval control
     selected_image_paths = image_paths[::image_interval]
 
@@ -4188,6 +4420,8 @@ def run_incremental_feature_matching(
     global_sparse_reconstruction = None
 
     if run_global_sfm_first:
+        if _timing_tracker:
+            _timing_tracker.start("global_sfm")
         # Get input directory (all images should be in the same directory)
         input_dir = selected_image_paths[0].parent
         # Create output directory for global SfM
@@ -4241,7 +4475,12 @@ def run_incremental_feature_matching(
                 global_sparse_reconstruction = global_sparse_matcher.rec_prior
             else:
                 print("  Warning: Failed to run global SfM")
+                if _timing_tracker:
+                    _timing_tracker.end("global_sfm")
                 return False
+        
+        if _timing_tracker:
+            _timing_tracker.end("global_sfm")
 
     matcher = IncrementalFeatureMatcherSfM(
         output_dir=output_dir,
@@ -4282,7 +4521,13 @@ def run_incremental_feature_matching(
 
     # Process images one by one
     for i, image_path in enumerate(selected_image_paths):
+        if _timing_tracker:
+            _timing_tracker.start("add_image")
+        
         success = matcher.add_image(image_path)
+        
+        if _timing_tracker:
+            _timing_tracker.end("add_image")
         
         if not success:
             print(f"Failed to process image: {image_path}")
@@ -4299,6 +4544,10 @@ def run_incremental_feature_matching(
                 print(f"\n{'='*60}")
                 print(f"Exporting to georeferenced coordinates (target_crs: {target_crs})...")
                 print(f"{'='*60}")
+            
+            if _timing_tracker:
+                _timing_tracker.start("export_georef")
+            
             # align_to_global_sfm: Whether to align merged reconstruction to global sparse SfM first
             # center_at_first_camera: Whether to center reconstruction at first camera position
             georef_export_success = matcher.export_georeferenced(
@@ -4306,6 +4555,10 @@ def run_incremental_feature_matching(
                 align_to_global_sfm=True, # 是否先对齐到全局稀疏SfM
                 center_at_first_camera=False # 是否将第一个相机位置设为世界坐标系原点
             )
+            
+            if _timing_tracker:
+                _timing_tracker.end("export_georef")
+            
             if not georef_export_success:
                 print("  Warning: Georeferenced export failed, but ENU reconstruction is still available")
         elif merge_method == 'points_only' and matcher.merged_points_xyz is not None:
@@ -4324,11 +4577,19 @@ def run_incremental_feature_matching(
             print(f"\n{'='*60}")
             print(f"Exporting Digital Surface Model (DSM)...")
             print(f"{'='*60}")
+        
+        if _timing_tracker:
+            _timing_tracker.start("export_dsm")
+        
         dsm_success = matcher.export_dsm(
             resolution=dsm_resolution,
             interpolation_method="nearest",
             aggregation="max",
         )
+        
+        if _timing_tracker:
+            _timing_tracker.end("export_dsm")
+        
         if not dsm_success:
             print("  Warning: DSM export failed")
         else:
@@ -4341,11 +4602,19 @@ def run_incremental_feature_matching(
                 print(f"\n{'='*60}")
                 print(f"Exporting DSM from georeferenced point cloud...")
                 print(f"{'='*60}")
+            
+            if _timing_tracker:
+                _timing_tracker.start("export_dsm_georef")
+            
             georef_dsm_success = matcher.export_dsm_georeferenced(
                 resolution=dsm_resolution,
                 interpolation_method="nearest",
                 aggregation="max",
             )
+            
+            if _timing_tracker:
+                _timing_tracker.end("export_dsm_georef")
+            
             if not georef_dsm_success:
                 print("  Warning: Georeferenced DSM export failed")
             else:
@@ -4359,6 +4628,9 @@ def run_incremental_feature_matching(
                 print(f"\n{'='*60}")
                 print(f"Exporting to FastGS (3D Gaussian Splatting) format...")
                 print(f"{'='*60}")
+            
+            if _timing_tracker:
+                _timing_tracker.start("export_fastgs")
             
             # 确定 FastGS 输出目录
             if fastgs_output_dir is None:
@@ -4376,6 +4648,10 @@ def run_incremental_feature_matching(
                 filter_outliers_enabled=fastgs_filter_outliers,
                 use_georef=fastgs_use_georef,
             )
+            
+            if _timing_tracker:
+                _timing_tracker.end("export_fastgs")
+            
             if not fastgs_success:
                 print("  Warning: FastGS export failed")
             else:
@@ -4401,6 +4677,14 @@ def run_incremental_feature_matching(
         print(f"{'='*60}")
         for key, value in stats.items():
             print(f"  {key}: {value}")
+    
+    # ==================== 导出计时报告 ====================
+    if _timing_tracker:
+        print(f"\n{'='*60}")
+        print("Exporting Timing Report...")
+        print(f"{'='*60}")
+        timing_report_path = _timing_tracker.export_to_file()
+        print(f"Total runtime: {_timing_tracker.get_total_time():.2f} seconds ({_timing_tracker.get_total_time()/60:.2f} minutes)")
     
     return True
 

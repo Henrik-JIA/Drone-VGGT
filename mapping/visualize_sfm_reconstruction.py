@@ -1100,8 +1100,10 @@ USE_DIRECT_CONFIG = True
 # 📁 重建结果路径（包含 cameras.txt, images.txt, points3D.txt/ply 的文件夹）
 # RECONSTRUCTION_PATH = r"D:\Github_code\drone-map-anything\output\Ganluo_images\sparse_incremental_reconstruction\temp_merged_reconstruction_georeferenced"
 # RECONSTRUCTION_PATH = r"D:\Github_code\drone-map-anything\output\Ganluo_images\sparse_incremental_reconstruction\temp_merged\merged_2"
-RECONSTRUCTION_PATH = r"D:\Github_code\drone-map-anything\output\Ganluo_images\sparse_incremental_reconstruction\global_sfm1\enu"
+# RECONSTRUCTION_PATH = r"D:\Github_code\drone-map-anything\output\Ganluo_images\sparse_incremental_reconstruction\global_sfm1\enu"
 # RECONSTRUCTION_PATH = r"D:\Github_code\drone-map-anything\output\Ganluo_images\sparse_incremental_reconstruction\recon_2_2_6_vggt74_dense_feature_points\temp_merged\merged_1"
+RECONSTRUCTION_PATH = r"D:\Github_code\drone-map-anything\output\Ganluo_images\sparse_incremental_reconstruction\recon_2_2_6_vggt74_dense_feature_points\temp_merged_reconstruction_georeferenced"
+
 
 # 📂 截图输出目录（设为 None 则保存到重建路径下的 visualization 文件夹）
 OUTPUT_DIR = r"D:\Github_code\drone-map-anything\output\Ganluo_images\sparse_incremental_reconstruction\temp_paper_figures"
@@ -1110,10 +1112,10 @@ OUTPUT_DIR = r"D:\Github_code\drone-map-anything\output\Ganluo_images\sparse_inc
 THEME = "paper_light"
 
 # 🔘 点云点大小 (推荐: 1.0 ~ 3.0)
-POINT_SIZE = 1.2
+POINT_SIZE = 2.5
 
 # 📷 视锥体缩放比例 (根据场景大小调整，推荐: 1.0 ~ 10.0)
-FRUSTUM_SCALE = 25.0
+FRUSTUM_SCALE = 35.0
 
 # 🎨 视锥体颜色 [R, G, B]，取值 0.0~1.0 (设为 None 则使用主题默认颜色)
 # FRUSTUM_COLOR = None  # 使用主题颜色
