@@ -1,6 +1,6 @@
 <div align="center">
 
-# Drone-Map-Anything
+# Drone-VGGT
 
 **基于视觉基础模型推理的无人机影像增量式 3D 重建系统**
 
@@ -12,7 +12,7 @@
 
 ## 概述
 
-Drone-Map-Anything 是一个专为无人机航拍影像设计的增量式 3D 重建系统。系统支持多种深度学习模型（MapAnything、VGGT、FastVGGT），实现了高效的增量式点云重建和合并，并支持实时可视化和地理坐标导出。
+Drone-VGGT 是一个专为无人机航拍影像设计的增量式 3D 重建系统。系统支持多种深度学习模型（MapAnything、VGGT、FastVGGT），实现了高效的增量式点云重建和合并，并支持实时可视化和地理坐标导出。
 
 ![记录03推理密集点云Ganluo](./assets/记录03推理密集点云Ganluo.gif)
 
