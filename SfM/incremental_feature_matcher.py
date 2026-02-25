@@ -172,6 +172,223 @@ def get_timing_tracker() -> Optional[TimingTracker]:
     """获取全局计时器实例"""
     return _timing_tracker
 
+
+class GPUMemoryTracker:
+    """用于跟踪GPU显存使用情况的简化工具类
+    
+    使用 pynvml 获取真实的GPU显存占用（与任务管理器一致），
+    同时也记录 PyTorch 报告的显存用于对比分析。
+    """
+    
+    def __init__(self, output_dir: Path = None):
+        self.memory_records: List[Dict] = []
+        self.output_dir = output_dir or Path("temp_memory")
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.peak_gpu_memory: float = 0.0  # 真实显存峰值
+        self.initial_gpu_memory: float = 0.0
+        self.nvml_initialized: bool = False
+        self.nvml_handle = None
+        
+        # 尝试初始化 pynvml
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            self.nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            self.nvml_initialized = True
+        except Exception as e:
+            print(f"Warning: pynvml not available, using torch.cuda for memory tracking: {e}")
+            self.nvml_initialized = False
+    
+    def _get_gpu_memory_mb(self) -> Dict[str, float]:
+        """获取GPU显存使用情况（MB）
+        
+        Returns:
+            Dict包含:
+            - nvml_used: pynvml报告的实际使用显存（与任务管理器一致）
+            - nvml_total: GPU总显存
+            - torch_allocated: PyTorch分配的显存
+            - torch_reserved: PyTorch保留的显存
+        """
+        result = {
+            "nvml_used": 0.0,
+            "nvml_total": 0.0,
+            "torch_allocated": 0.0,
+            "torch_reserved": 0.0,
+        }
+        
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()  # 确保所有操作完成
+            result["torch_allocated"] = torch.cuda.memory_allocated() / (1024 ** 2)
+            result["torch_reserved"] = torch.cuda.memory_reserved() / (1024 ** 2)
+            result["nvml_total"] = torch.cuda.get_device_properties(0).total_memory / (1024 ** 2)
+        
+        # 使用 pynvml 获取真实显存占用
+        if self.nvml_initialized and self.nvml_handle:
+            try:
+                import pynvml
+                mem_info = pynvml.nvmlDeviceGetMemoryInfo(self.nvml_handle)
+                result["nvml_used"] = mem_info.used / (1024 ** 2)
+                result["nvml_total"] = mem_info.total / (1024 ** 2)
+            except Exception:
+                # 如果 pynvml 失败，使用 torch_reserved 作为近似值
+                result["nvml_used"] = result["torch_reserved"]
+        else:
+            # 没有 pynvml 时使用 torch_reserved 作为近似值
+            result["nvml_used"] = result["torch_reserved"]
+        
+        return result
+    
+    def start_monitoring(self):
+        """开始监控，记录初始显存状态"""
+        mem_info = self._get_gpu_memory_mb()
+        self.initial_gpu_memory = mem_info["nvml_used"]
+        self.peak_gpu_memory = mem_info["nvml_used"]
+        self.record("initial_state", "开始监控", 0)
+    
+    def record(self, step_name: str, description: str = "", image_idx: int = 0):
+        """记录当前GPU显存使用状态
+        
+        Args:
+            step_name: 步骤名称
+            description: 步骤描述
+            image_idx: 当前处理的图像索引
+        """
+        mem_info = self._get_gpu_memory_mb()
+        
+        # 更新峰值（使用真实显存占用）
+        self.peak_gpu_memory = max(self.peak_gpu_memory, mem_info["nvml_used"])
+        
+        record = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "image_idx": image_idx,
+            "step_name": step_name,
+            "description": description,
+            # 真实显存占用（与任务管理器一致）
+            "gpu_real_used_mb": mem_info["nvml_used"],
+            # PyTorch 报告的显存（用于对比）
+            "torch_allocated_mb": mem_info["torch_allocated"],
+            "torch_reserved_mb": mem_info["torch_reserved"],
+            # 总显存
+            "gpu_total_mb": mem_info["nvml_total"],
+            "gpu_usage_percent": (mem_info["nvml_used"] / mem_info["nvml_total"] * 100) if mem_info["nvml_total"] > 0 else 0,
+        }
+        self.memory_records.append(record)
+    
+    def export_to_file(self, filename: str = None) -> Path:
+        """导出GPU显存使用信息到文本文件"""
+        if filename is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"gpu_memory_report_{timestamp}.txt"
+        
+        output_path = self.output_dir / filename
+        
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write("=" * 100 + "\n")
+            f.write("                         GPU Memory Usage Report for Model Inference\n")
+            f.write("=" * 100 + "\n")
+            f.write(f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("=" * 100 + "\n\n")
+            
+            # GPU信息
+            f.write("─" * 50 + "\n")
+            f.write("  GPU Information\n")
+            f.write("─" * 50 + "\n")
+            
+            if torch.cuda.is_available():
+                gpu_props = torch.cuda.get_device_properties(0)
+                f.write(f"  GPU Device: {gpu_props.name}\n")
+                f.write(f"  GPU Total Memory: {gpu_props.total_memory / (1024**3):.2f} GB\n\n")
+            else:
+                f.write("  GPU: Not available\n\n")
+            
+            # 峰值显存使用
+            f.write("─" * 50 + "\n")
+            f.write("  Peak GPU Memory Usage\n")
+            f.write("─" * 50 + "\n")
+            f.write(f"  Initial: {self.initial_gpu_memory:.2f} MB ({self.initial_gpu_memory/1024:.2f} GB)\n")
+            f.write(f"  Peak:    {self.peak_gpu_memory:.2f} MB ({self.peak_gpu_memory/1024:.2f} GB)\n")
+            f.write(f"  Increase: {self.peak_gpu_memory - self.initial_gpu_memory:.2f} MB\n\n")
+            
+            # ==================== 按步骤类型统计 ====================
+            f.write("=" * 110 + "\n")
+            f.write("                              Average GPU Memory by Step Type\n")
+            f.write("=" * 110 + "\n\n")
+            
+            # 按步骤名称分组统计（使用真实显存值）
+            step_stats: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: {"real": [], "torch_alloc": []})
+            for record in self.memory_records:
+                step_stats[record["step_name"]]["real"].append(record["gpu_real_used_mb"])
+                step_stats[record["step_name"]]["torch_alloc"].append(record["torch_allocated_mb"])
+            
+            f.write(f"{'Step':<30} {'Count':>6} {'Real Avg(MB)':>14} {'Real Max(MB)':>14} {'Torch Avg(MB)':>14} {'Torch Max(MB)':>14}\n")
+            f.write("-" * 110 + "\n")
+            
+            for step_name in sorted(step_stats.keys()):
+                real_values = step_stats[step_name]["real"]
+                torch_values = step_stats[step_name]["torch_alloc"]
+                count = len(real_values)
+                real_avg = sum(real_values) / count if count > 0 else 0
+                real_max = max(real_values) if real_values else 0
+                torch_avg = sum(torch_values) / count if count > 0 else 0
+                torch_max = max(torch_values) if torch_values else 0
+                f.write(f"{step_name:<30} {count:>6} {real_avg:>14.2f} {real_max:>14.2f} {torch_avg:>14.2f} {torch_max:>14.2f}\n")
+            
+            f.write("-" * 110 + "\n\n")
+            
+            # ==================== 关键步骤增量统计 ====================
+            f.write("─" * 60 + "\n")
+            f.write("  Key Step Memory Delta (Real GPU Memory - matches Task Manager)\n")
+            f.write("─" * 60 + "\n\n")
+            
+            def calc_delta_stats(before_key, after_key, label):
+                """计算步骤前后的显存增量统计"""
+                before_data = step_stats.get(before_key, {"real": []})
+                after_data = step_stats.get(after_key, {"real": []})
+                before_real = before_data["real"]
+                after_real = after_data["real"]
+                
+                if before_real and after_real:
+                    num = min(len(before_real), len(after_real))
+                    real_deltas = [after_real[i] - before_real[i] for i in range(num)]
+                    f.write(f"  [{label}] (Calls: {num})\n")
+                    f.write(f"    Real GPU Delta - Avg: {sum(real_deltas)/num:+.2f} MB, Min: {min(real_deltas):+.2f} MB, Max: {max(real_deltas):+.2f} MB\n\n")
+            
+            calc_delta_stats("model_loading_before", "model_loading_after", "Model Loading")
+            calc_delta_stats("model_inference_before", "model_inference_after", "Model Inference")
+            calc_delta_stats("cuda_cache_before", "cuda_cache_after", "CUDA Cache Cleanup")
+            
+            # ==================== 详细记录表格 ====================
+            f.write("\n" + "=" * 120 + "\n")
+            f.write("                                    Detailed Memory Records\n")
+            f.write("  Note: 'Real Used' matches Task Manager, 'Torch Alloc/Reserved' are PyTorch internal values\n")
+            f.write("=" * 120 + "\n")
+            f.write(f"{'Timestamp':<20} {'Img':>4} {'Step':<28} {'Real Used(MB)':>14} {'Torch Alloc':>12} {'Torch Rsv':>12} {'Usage%':>8}\n")
+            f.write("-" * 120 + "\n")
+            
+            for record in self.memory_records:
+                f.write(f"{record['timestamp']:<20} "
+                       f"{record['image_idx']:>4} "
+                       f"{record['step_name'][:28]:<28} "
+                       f"{record['gpu_real_used_mb']:>14.2f} "
+                       f"{record['torch_allocated_mb']:>12.2f} "
+                       f"{record['torch_reserved_mb']:>12.2f} "
+                       f"{record['gpu_usage_percent']:>7.1f}%\n")
+            
+            f.write("=" * 120 + "\n")
+        
+        print(f"GPU Memory report saved to: {output_path}")
+        return output_path
+
+
+# 全局GPU显存跟踪器实例
+_gpu_memory_tracker: Optional[GPUMemoryTracker] = None
+
+
+def get_gpu_memory_tracker() -> Optional[GPUMemoryTracker]:
+    """获取全局GPU显存跟踪器实例"""
+    return _gpu_memory_tracker
+
+
 # UTM coordinate conversion imports (conditional)
 try:
     import pymap3d as pm
@@ -1393,20 +1610,37 @@ class IncrementalFeatureMatcherSfM:
         Returns:
             True if successful, False otherwise
         """
-        # 获取全局计时器
+        # 获取全局计时器和GPU显存跟踪器
         tracker = get_timing_tracker()
+        gpu_tracker = get_gpu_memory_tracker()
+        
+        # 判断是第几张图像
+        num_images = len(self.preprocessed_views)
+        
         if tracker:
             tracker.start("run_inference")
         
-        # Load model loader
+        # ==================== 模型加载 ====================
         if tracker:
             tracker.start("model_loading")
+        
+        # 记录模型加载前的GPU显存
+        if gpu_tracker:
+            gpu_tracker.record("model_loading_before", "模型加载前", num_images)
+        
         model_loader = self._load_model()
+        
+        # 记录模型加载后的GPU显存
+        if gpu_tracker:
+            gpu_tracker.record("model_loading_after", "模型加载后", num_images)
+        
         if tracker:
             tracker.end("model_loading")
 
-        # 判断是第几张图像
-        num_images = len(self.preprocessed_views)
+        # ==================== 模型推理 ====================
+        # 记录推理前的GPU显存
+        if gpu_tracker:
+            gpu_tracker.record("model_inference_before", f"模型推理前", num_images)
 
         # 使用模型加载器运行推理
         outputs = model_loader.run_inference(
@@ -1415,6 +1649,10 @@ class IncrementalFeatureMatcherSfM:
             num_images=num_images,
             min_images_for_scale=self.min_images_for_scale,
         )
+        
+        # 记录推理后的GPU显存
+        if gpu_tracker:
+            gpu_tracker.record("model_inference_after", f"模型推理后", num_images)
 
         # ==================== 计算 scale_ratio =====================
         scale_ratio = 1.0
@@ -1482,9 +1720,17 @@ class IncrementalFeatureMatcherSfM:
         }
         self.inference_outputs.append(inference_outputs)
 
-        # 清理CUDA缓存
+        # ==================== 清理CUDA缓存 ====================
+        # 记录清理前的GPU显存
+        if gpu_tracker:
+            gpu_tracker.record("cuda_cache_before", "CUDA缓存清理前", num_images)
+        
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        
+        # 记录清理后的GPU显存
+        if gpu_tracker:
+            gpu_tracker.record("cuda_cache_after", "CUDA缓存清理后", num_images)
 
         # 结束计时
         tracker = get_timing_tracker()
@@ -4270,11 +4516,11 @@ def run_incremental_feature_matching(
     # ==================== 重建类型 ====================
     reconstruction_type: str = 'each_pixel_feature_points',  # 'dense_feature_points' | 'each_pixel_feature_points'
     # ==================== 模型参数 ====================
-    model_type: str = 'vggt',  # 'mapanything' | 'vggt' | 'fastvggt'
+    model_type: str = 'mapanything',  # 'mapanything' | 'vggt' | 'fastvggt'
     model_path: Optional[str] = None,  # 模型权重路径（VGGT/FastVGGT需要）
     # ==================== 影像处理参数 ====================
-    image_interval: int = 2,  # 影像选取间隔（1=全部, 2=每隔1张, etc.）
-    min_images_for_scale: int = 6,  # 每批次处理的影像数量
+    image_interval: int = 5,  # 影像选取间隔（1=全部, 2=每隔1张, etc.）
+    min_images_for_scale: int = 9,  # 每批次处理的影像数量
     overlap: int = 2,  # 相邻批次间的重叠影像数
     run_global_sfm_first: bool = True,  # 是否先运行全局SfM
     # ==================== 重建质量参数 ====================
@@ -4288,7 +4534,7 @@ def run_incremental_feature_matching(
     max_query_pts: int = 4096,  # 每个查询帧最大特征点数 4096 8192 12288
     query_frame_num: int = 4,  # 查询帧数量（建议 >= min_images_for_scale）
     # ==================== 点云合并参数 ====================
-    merge_method: str = 'confidence',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only'
+    merge_method: str = 'points_only',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only'
     merge_voxel_size: float = 0.5,  # 点云合并时的体素大小（米）
     merge_boundary_filter: bool = False,  # 是否启用边界过滤
     merge_statistical_filter: bool = False,  # 是否启用统计过滤
@@ -4315,6 +4561,8 @@ def run_incremental_feature_matching(
     verbose: bool = False,
     # ==================== 计时参数 ====================
     enable_timing: bool = True,  # 是否启用计时统计
+    # ==================== GPU显存监控参数 ====================
+    enable_gpu_memory_tracking: bool = True,  # 是否启用GPU显存监控
 ) -> bool:
     """Run incremental image initialization pipeline.
     
@@ -4396,6 +4644,11 @@ def run_incremental_feature_matching(
         enable_timing: 是否启用计时统计
             - True: 记录各步骤耗时并在完成后导出报告到 output_dir/temp_time/ 目录
             - False: 不记录计时信息（默认True）
+        
+        # GPU显存监控参数
+        enable_gpu_memory_tracking: 是否启用GPU显存监控
+            - True: 记录模型加载、推理、缓存清理等步骤的GPU显存使用情况
+            - False: 不记录GPU显存信息（默认True）
     
     Returns:
         True if successful, False otherwise
@@ -4412,6 +4665,19 @@ def run_incremental_feature_matching(
             print(f"{'='*60}\n")
     else:
         _timing_tracker = None
+    
+    # ==================== 初始化GPU显存跟踪器 ====================
+    global _gpu_memory_tracker
+    if enable_gpu_memory_tracking:
+        gpu_memory_output_dir = output_dir / "temp_memory"
+        _gpu_memory_tracker = GPUMemoryTracker(output_dir=gpu_memory_output_dir)
+        _gpu_memory_tracker.start_monitoring()
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"GPU Memory tracking enabled. Report will be saved to: {gpu_memory_output_dir}")
+            print(f"{'='*60}\n")
+    else:
+        _gpu_memory_tracker = None
     
     # Process images one by one with interval control
     selected_image_paths = image_paths[::image_interval]
@@ -4686,6 +4952,17 @@ def run_incremental_feature_matching(
         timing_report_path = _timing_tracker.export_to_file()
         print(f"Total runtime: {_timing_tracker.get_total_time():.2f} seconds ({_timing_tracker.get_total_time()/60:.2f} minutes)")
     
+    # ==================== 导出GPU显存报告 ====================
+    if _gpu_memory_tracker:
+        print(f"\n{'='*60}")
+        print("Exporting GPU Memory Report...")
+        print(f"{'='*60}")
+        # 记录最终显存状态
+        _gpu_memory_tracker.record("final_state", "处理完成", 0)
+        # 导出报告
+        gpu_memory_report_path = _gpu_memory_tracker.export_to_file()
+        print(f"Peak GPU Memory: {_gpu_memory_tracker.peak_gpu_memory:.2f} MB ({_gpu_memory_tracker.peak_gpu_memory/1024:.2f} GB)")
+    
     return True
 
 
@@ -4699,8 +4976,8 @@ if __name__ == "__main__":
     # output_dir = Path(r"drone-map-anything\output\Comprehensive_building_sel\sparse_incremental_reconstruction")
     
     # windows path
-    input_dir = Path(r"drone-map-anything\examples\Ganluo_images\images")
-    output_dir = Path(r"drone-map-anything\output\Ganluo_images\sparse_incremental_reconstruction")
+    # input_dir = Path(r"drone-map-anything\examples\Ganluo_images\images")
+    # output_dir = Path(r"drone-map-anything\output\Ganluo_images\sparse_incremental_reconstruction")
 
     # linux path
     # input_dir = Path("examples/Ganluo_images/images")
@@ -4712,8 +4989,8 @@ if __name__ == "__main__":
     # input_dir = Path(r"drone-map-anything\examples\SWJTU_gongdi\images")
     # output_dir = Path(r"drone-map-anything\output\SWJTU_gongdi\sparse_incremental_reconstruction")
 
-    # input_dir = Path(r"drone-map-anything\examples\SWJTU_7th_teaching_building\images")
-    # output_dir = Path(r"drone-map-anything\output\SWJTU_7th_teaching_building\sparse_incremental_reconstruction")
+    input_dir = Path(r"drone-map-anything\examples\SWJTU_7th_teaching_building\images")
+    output_dir = Path(r"drone-map-anything\output\SWJTU_7th_teaching_building\sparse_incremental_reconstruction")
     
     # input_dir = Path(r"drone-map-anything\examples\HuaPo\images")
     # output_dir = Path(r"drone-map-anything\output\HuaPo\sparse_incremental_reconstruction")
