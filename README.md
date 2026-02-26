@@ -2,358 +2,360 @@
 
 # Drone-VGGT
 
-**基于视觉基础模型推理的无人机影像增量式 3D 重建系统**
+**Modular Incremental Dense 3D Reconstruction from UAV Imagery with Plug-and-Play Visual Geometry Transformer Models**
 
+[![Project Page](https://img.shields.io/badge/Project-Page-blue.svg)](https://drone-vggt.github.io/)
+[![中文文档](https://img.shields.io/badge/中文-README-orange.svg)](assets/README_CN.md)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)](https://pytorch.org/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
 
 </div>
 
-## 概述
+## Overview
 
-Drone-VGGT 是一个专为无人机航拍影像设计的增量式 3D 重建系统。系统支持多种深度学习模型（MapAnything、VGGT、FastVGGT），实现了高效的增量式点云重建和合并，并支持实时可视化和地理坐标导出。
+Drone-VGGT is an incremental 3D reconstruction system designed specifically for UAV aerial imagery. The system supports multiple deep learning models (MapAnything, VGGT, FastVGGT), enabling efficient incremental point cloud reconstruction and merging, with real-time visualization and georeferenced coordinate export.
 
-![记录03推理密集点云Ganluo](./assets/记录03推理密集点云Ganluo.gif)
+![Incremental Dense Point Cloud Reconstruction](./assets/记录03推理密集点云Ganluo.gif)
 
-### 主要特性
+### Key Features
 
-- 🚀 **增量式处理**：逐张添加影像，实时更新重建结果
-- 🧠 **多模型支持**：MapAnything、VGGT、FastVGGT 三种模型可选
-- 🔗 **智能点云合并**：四种合并策略（full、confidence、confidence_blend、points_only）
-- 🌍 **地理坐标导出**：自动检测 UTM 区域，支持多种坐标系导出
-- 👁️ **实时可视化**：基于 Viser 的 3D 点云和相机位姿可视化
-- 📊 **GPS/XMP 元数据**：自动从无人机影像中提取位姿信息
+- 🚀 **Incremental Processing**: Frame-by-frame image addition with real-time reconstruction updates
+- 🧠 **Multi-Model Support**: MapAnything, VGGT, and FastVGGT models available
+- 🔗 **Intelligent Point Cloud Merging**: Four merging strategies (full, confidence, confidence_blend, points_only)
+- 🌍 **Georeferenced Export**: Automatic UTM zone detection with multi-coordinate system support
+- 👁️ **Real-time Visualization**: Viser-based 3D point cloud and camera pose visualization
+- 📊 **GPS/XMP Metadata**: Automatic pose extraction from UAV imagery
 
-## 目录
+## Table of Contents
 
-- [安装](#安装)
-- [快速开始](#快速开始)
-- [核心功能](#核心功能)
-  - [增量式重建流程](#增量式重建流程)
-  - [模型选择](#模型选择)
-  - [点云合并方法](#点云合并方法)
-- [API 参考](#api-参考)
-- [配置参数](#配置参数)
-- [输出格式](#输出格式)
-- [示例数据集](#示例数据集)
-- [致谢](#致谢)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Core Features](#core-features)
+  - [Incremental Reconstruction Pipeline](#incremental-reconstruction-pipeline)
+  - [Model Selection](#model-selection)
+  - [Point Cloud Merging Methods](#point-cloud-merging-methods)
+- [API Reference](#api-reference)
+- [Configuration Parameters](#configuration-parameters)
+- [Output Format](#output-format)
+- [Example Datasets](#example-datasets)
+- [Acknowledgements](#acknowledgements)
 
-## 安装
+## Installation
 
-### 环境要求
+### Requirements
 
 - Python 3.10 - 3.11
 - PyTorch 2.3.1
 - CUDA 11.8
-- [Pixi](https://pixi.sh/) (推荐) 或 Conda
+- [Pixi](https://pixi.sh/) (recommended) or Conda
 
-### 方式一：使用 Pixi 安装（推荐）
+### Option 1: Install with Pixi (Recommended)
 
-[Pixi](https://pixi.sh/) 是一个现代化的包管理器，能够自动处理 Conda 和 PyPI 依赖。
+[Pixi](https://pixi.sh/) is a modern package manager that automatically handles Conda and PyPI dependencies.
 
 ```bash
-# 1. 安装 Pixi (如果尚未安装)
+# 1. Install Pixi (if not already installed)
 # Windows (PowerShell)
 iwr -useb https://pixi.sh/install.ps1 | iex
 
 # Linux/macOS
 curl -fsSL https://pixi.sh/install.sh | bash
 
-# 2. 克隆仓库
-git clone https://github.com/your-repo/drone-map-anything.git
-cd drone-map-anything
+# 2. Clone the repository
+git clone https://github.com/Henrik-JIA/Drone-VGGT.git
+cd Drone-VGGT
 
-# 3. 一键安装所有依赖并激活环境
+# 3. Install all dependencies and activate environment
 pixi install
 
-# 4. 完整安装（包括本地包和第三方子模块）
+# 4. Complete installation (including local packages and third-party submodules)
 pixi run setup
 
-# 5. 激活环境
+# 5. Activate environment
 pixi shell
 ```
 
-#### Pixi 常用命令
+#### Common Pixi Commands
 
 ```bash
-# 查看环境信息（PyTorch 版本、CUDA 状态等）
+# View environment info (PyTorch version, CUDA status, etc.)
 pixi run info
 
-# 运行增量 SfM 重建
+# Run incremental SfM reconstruction
 pixi run run-sfm
 
-# 运行 Delaunay 网格化
+# Run Delaunay meshing
 pixi run run-mesh
 
-# 生成 DSM
+# Generate DSM
 pixi run run-dsm
 
-# 代码格式检查
+# Code linting
 pixi run lint
 pixi run format
 ```
 
-#### Pixi 环境说明
+#### Pixi Environment Description
 
-项目提供了三种预配置环境：
+The project provides three pre-configured environments:
 
-| 环境 | 说明 | 激活命令 |
-|------|------|---------|
-| `default` | 完整环境，包含所有功能 | `pixi shell` |
-| `dev` | 开发环境，包含测试工具 | `pixi shell -e dev` |
-| `minimal` | 最小环境，仅核心依赖 | `pixi shell -e minimal` |
+| Environment | Description | Activation Command |
+|-------------|-------------|-------------------|
+| `default` | Full environment with all features | `pixi shell` |
+| `dev` | Development environment with testing tools | `pixi shell -e dev` |
+| `minimal` | Minimal environment with core dependencies only | `pixi shell -e minimal` |
 
-### 方式二：使用 Conda/Pip 安装
+### Option 2: Install with Conda/Pip
 
 ```bash
-# 克隆仓库
-git clone https://github.com/your-repo/drone-map-anything.git
-cd drone-map-anything
+# Clone the repository
+git clone https://github.com/Henrik-JIA/Drone-VGGT.git
+cd Drone-VGGT
 
-# 创建 conda 环境
-conda create -n drone-map python=3.11 -y
-conda activate drone-map
+# Create conda environment
+conda create -n drone-vggt python=3.11 -y
+conda activate drone-vggt
 
-# 安装 PyTorch (CUDA 11.8)
+# Install PyTorch (CUDA 11.8)
 pip install torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 --index-url https://download.pytorch.org/whl/cu118
 
-# 安装项目依赖
+# Install project dependencies
 pip install -e .
 
-# 安装可选依赖 (可视化、地理坐标导出等)
+# Install optional dependencies (visualization, georeferenced export, etc.)
 pip install -e ".[all]"
 
-# 安装第三方子模块
+# Install third-party submodules
 pip install -e third/vggt --no-deps
 pip install -e third/fastvggt --no-deps
 pip install git+https://github.com/cvg/LightGlue.git --no-deps
 ```
 
-### 模型权重
+### Model Weights
 
-根据选择的模型类型，下载相应的权重：
+Download the corresponding weights based on your chosen model:
 
-| 模型 | 权重路径 | 下载地址 |
-|------|---------|---------|
-| MapAnything | 自动从 HuggingFace 下载 | [facebook/map-anything](https://huggingface.co/facebook/map-anything) |
-| VGGT | `weights/vggt/model.pt` | [VGGT 官方仓库](https://github.com/facebookresearch/vggt) |
-| FastVGGT | `weights/fastvggt/model_tracker_fixed_e20.pt` | 联系作者获取 |
+| Model | Weight Path | Download Link |
+|-------|-------------|---------------|
+| MapAnything | Auto-download from HuggingFace | [facebook/map-anything](https://huggingface.co/facebook/map-anything) |
+| VGGT | `weights/vggt/model.pt` | [VGGT Official Repository](https://github.com/facebookresearch/vggt) |
+| FastVGGT | `weights/fastvggt/model_tracker_fixed_e20.pt` | Contact authors |
 
-## 快速开始
+## Quick Start
 
-### 基础用法
+### Basic Usage
 
 ```python
 from pathlib import Path
 from SfM.incremental_feature_matcher import run_incremental_feature_matching
 
-# 配置输入输出路径
+# Configure input/output paths
 input_dir = Path("examples/your_drone_images/images")
 output_dir = Path("output/your_project")
 
-# 获取所有影像文件
+# Get all image files
 image_files = sorted(input_dir.glob("*.JPG"))
 
-# 运行增量式重建
+# Run incremental reconstruction
 success = run_incremental_feature_matching(
     image_paths=image_files,
     output_dir=output_dir,
     model_type='mapanything',      # 'mapanything' | 'vggt' | 'fastvggt'
-    min_images_for_scale=6,        # 每批次处理的影像数量
-    overlap=2,                     # 批次间的重叠影像数
-    merge_method='confidence',     # 点云合并方法
-    enable_visualization=True,     # 启用实时可视化
-    export_georef=True,            # 导出地理坐标
+    min_images_for_scale=6,        # Number of images per batch
+    overlap=2,                     # Overlap images between batches
+    merge_method='confidence',     # Point cloud merging method
+    enable_visualization=True,     # Enable real-time visualization
+    export_georef=True,            # Export georeferenced coordinates
     verbose=True,
 )
 ```
 
-### 命令行运行
+### Command Line Execution
 
 ```bash
-# 直接运行主脚本
+# Run the main script directly
 python SfM/incremental_feature_matcher.py
 ```
 
-修改脚本底部的配置参数来处理你自己的数据集：
+Modify the configuration parameters at the bottom of the script to process your own dataset:
 
 ```python
-# 在 if __name__ == "__main__": 部分修改
+# Modify in the if __name__ == "__main__": section
 input_dir = Path(r"your/image/folder/images")
 output_dir = Path(r"your/output/folder")
-MODEL_TYPE = 'vggt'  # 选择模型
+MODEL_TYPE = 'vggt'  # Select model
 ```
 
-## 核心功能
+## Core Features
 
-### 增量式重建流程
+### Incremental Reconstruction Pipeline
 
-系统采用增量式处理策略，将大量影像分批处理，显著降低内存消耗：
+The system employs an incremental processing strategy, processing large numbers of images in batches to significantly reduce memory consumption:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     增量式重建流程                           │
+│              Incremental Reconstruction Pipeline             │
 ├─────────────────────────────────────────────────────────────┤
 │                                                             │
 │  Batch 0: [img_0, img_1, img_2, img_3, img_4, img_5]        │
-│           └── 推理 → 重建 → 初始点云                         │
+│           └── Inference → Reconstruction → Initial Cloud    │
 │                                                             │
 │  Batch 1: [img_4, img_5, img_6, img_7, img_8, img_9]        │
-│           └── 推理 → 重建 → Sim3 对齐 → 合并到主点云          │
+│           └── Inference → Reconstruction → Sim3 Align → Merge│
 │                  ↑                                          │
-│              重叠影像                                        │
+│              Overlap Images                                 │
 │                                                             │
 │  Batch 2: [img_8, img_9, img_10, img_11, ...]               │
-│           └── 推理 → 重建 → Sim3 对齐 → 合并到主点云          │
+│           └── Inference → Reconstruction → Sim3 Align → Merge│
 │                                                             │
 │  ...                                                        │
 │                                                             │
-│  最终输出: 完整的合并点云 + 地理坐标 Reconstruction           │
+│  Final Output: Complete Merged Point Cloud + Georef Recon   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 模型选择
+### Model Selection
 
-| 模型 | 特点 | 适用场景 |
-|------|------|---------|
-| **MapAnything** | 端到端 Transformer，支持多种输入模态 | 通用场景，高精度需求 |
-| **VGGT** | 视觉几何基础模型 | 大规模场景，需要稳定性 |
-| **FastVGGT** | VGGT 加速版本，支持 Token Merging | 实时处理，内存受限场景 |
+| Model | Features | Use Cases |
+|-------|----------|-----------|
+| **MapAnything** | End-to-end Transformer, supports multiple input modalities | General scenarios, high precision requirements |
+| **VGGT** | Visual Geometry Grounded Transformer | Large-scale scenes, stability required |
+| **FastVGGT** | Accelerated VGGT with Token Merging | Real-time processing, memory-constrained scenarios |
 
-### 点云合并方法
+### Point Cloud Merging Methods
 
-系统提供四种点云合并策略：
+The system provides four point cloud merging strategies:
 
-#### 1. `points_only` (推荐用于大规模数据)
+#### 1. `points_only` (Recommended for large-scale data)
 
 ```python
 merge_method='points_only'
 ```
 
-- ✅ 最轻量级，仅维护点云数组
-- ✅ 内存效率最高
-- ✅ 支持增量式体素去重
-- ❌ 不维护 pycolmap Reconstruction 结构
+- ✅ Most lightweight, maintains only point cloud arrays
+- ✅ Highest memory efficiency
+- ✅ Supports incremental voxel deduplication
+- ❌ Does not maintain pycolmap Reconstruction structure
 
-**合并流程**：
+**Merging Process**:
 ```
-1. 通过公共影像估计 Sim3 变换
-2. 使用 2D 像素匹配识别重叠区
-3. 只添加非重叠区的点（重叠区已存在于累积点云中）
-4. 可选：延迟体素去重（点数超过阈值时执行）
+1. Estimate Sim3 transformation via common images
+2. Identify overlapping regions using 2D pixel matching
+3. Add only non-overlapping points (overlapping regions already exist in accumulated cloud)
+4. Optional: Delayed voxel deduplication (executed when point count exceeds threshold)
 ```
 
-#### 2. `confidence` (推荐用于高质量输出)
+#### 2. `confidence` (Recommended for high-quality output)
 
 ```python
 merge_method='confidence'
 ```
 
-- ✅ 基于置信度选择最优点
-- ✅ 维护完整的 Reconstruction 结构
-- ✅ 支持精确的像素级匹配
-- ❌ 内存消耗较高
+- ✅ Selects optimal points based on confidence
+- ✅ Maintains complete Reconstruction structure
+- ✅ Supports precise pixel-level matching
+- ❌ Higher memory consumption
 
-#### 3. `confidence_blend` (最高质量)
+#### 3. `confidence_blend` (Highest quality)
 
 ```python
 merge_method='confidence_blend'
 ```
 
-- ✅ 置信度加权混合
-- ✅ 融合带平滑插值
-- ✅ 密度均衡化
-- ❌ 计算开销最大
+- ✅ Confidence-weighted blending
+- ✅ Fusion band with smooth interpolation
+- ✅ Density equalization
+- ❌ Highest computational overhead
 
-#### 4. `full` (完整流程)
+#### 4. `full` (Complete pipeline)
 
 ```python
 merge_method='full'
 ```
 
-- ✅ 使用完整的 merge_full_pipeline
-- ✅ 支持多阶段精化对齐
-- ❌ 最慢
+- ✅ Uses complete merge_full_pipeline
+- ✅ Supports multi-stage refinement alignment
+- ❌ Slowest
 
-### 重建类型与 3DGS 支持
+### Reconstruction Types and 3DGS Support
 
-系统支持两种重建类型，决定了点云的生成方式和后续应用：
+The system supports two reconstruction types, determining point cloud generation and downstream applications:
 
-| 重建类型 | 输出格式 | 3DGS 兼容性 | 适用场景 |
-|---------|---------|-------------|---------|
-| `each_pixel_feature_points` | 密集点云（每个像素一个3D点） | ❌ 不支持 | 纯点云可视化、DSM生成 |
-| `dense_feature_points` | COLMAP Reconstruction + 密集点云 | ✅ 支持 | 3DGS训练、传统MVS流程 |
+| Reconstruction Type | Output Format | 3DGS Compatibility | Use Cases |
+|--------------------|---------------|---------------------|-----------|
+| `each_pixel_feature_points` | Dense point cloud (one 3D point per pixel) | ❌ Not supported | Pure point cloud visualization, DSM generation |
+| `dense_feature_points` | COLMAP Reconstruction + Dense point cloud | ✅ Supported | 3DGS training, traditional MVS pipeline |
 
-#### 为什么需要 `dense_feature_points` 才能支持 3DGS？
+#### Why is `dense_feature_points` required for 3DGS?
 
-3D Gaussian Splatting (3DGS) 训练需要标准的 COLMAP 输出格式，包括：
-- `cameras.txt` / `cameras.bin` - 相机内参
-- `images.txt` / `images.bin` - 相机位姿及 2D-3D 对应关系
-- `points3D.txt` / `points3D.bin` - 3D 点云及其观测信息
+3D Gaussian Splatting (3DGS) training requires standard COLMAP output format, including:
+- `cameras.txt` / `cameras.bin` - Camera intrinsics
+- `images.txt` / `images.bin` - Camera poses and 2D-3D correspondences
+- `points3D.txt` / `points3D.bin` - 3D point cloud with observation information
 
-只有 `dense_feature_points` 模式会通过特征跟踪建立多视图间的 2D-3D 对应关系，生成完整的 COLMAP Reconstruction 结构。
+Only `dense_feature_points` mode establishes 2D-3D correspondences across multiple views through feature tracking, generating a complete COLMAP Reconstruction structure.
 
-#### 配置 3DGS 兼容输出
+#### Configuring 3DGS-Compatible Output
 
-要生成可用于 3DGS 训练的输出，需要正确配置以下参数：
+To generate output usable for 3DGS training, configure the following parameters correctly:
 
 ```python
 success = run_incremental_feature_matching(
     image_paths=image_files,
     output_dir=output_dir,
     
-    # 关键参数：必须使用 dense_feature_points
+    # Key parameter: must use dense_feature_points
     reconstruction_type='dense_feature_points',
     
-    # 重要：query_frame_num 应与 min_images_for_scale 一致
-    # 这确保每张影像都参与特征跟踪，满足 3DGS 的观测要求
+    # Important: query_frame_num should match min_images_for_scale
+    # This ensures every image participates in feature tracking, meeting 3DGS observation requirements
     min_images_for_scale=6,
-    query_frame_num=6,  # 必须 >= min_images_for_scale
+    query_frame_num=6,  # Must be >= min_images_for_scale
     
-    # 其他参数
+    # Other parameters
     model_type='vggt',
     merge_method='confidence',
     verbose=True,
 )
 ```
 
-> ⚠️ **重要提示**：`query_frame_num` 参数控制特征跟踪时的查询帧数量。为确保每张影像都能建立 2D-3D 对应关系，且每个 3D 点至少被 3 个 2D 点观测到（3DGS 的基本要求），`query_frame_num` 必须与 `min_images_for_scale` 保持一致。
+> ⚠️ **Important Note**: The `query_frame_num` parameter controls the number of query frames during feature tracking. To ensure every image establishes 2D-3D correspondences and each 3D point is observed by at least 3 2D points (basic 3DGS requirement), `query_frame_num` must match `min_images_for_scale`.
 
-#### 输出目录结构（3DGS 兼容）
+#### Output Directory Structure (3DGS Compatible)
 
-使用 `dense_feature_points` 模式后，输出目录将包含：
+When using `dense_feature_points` mode, the output directory will contain:
 
 ```
 output/
 ├── temp_merged/
 │   └── merged_N/
-│       ├── cameras.txt      # 相机内参 ← 3DGS 需要
-│       ├── images.txt       # 影像位姿 + 2D-3D 对应 ← 3DGS 需要
-│       ├── points3D.txt     # 3D 点云 + 观测信息 ← 3DGS 需要
-│       └── points3D.ply     # PLY 格式点云
+│       ├── cameras.txt      # Camera intrinsics ← Required by 3DGS
+│       ├── images.txt       # Image poses + 2D-3D correspondences ← Required by 3DGS
+│       ├── points3D.txt     # 3D point cloud + observation info ← Required by 3DGS
+│       └── points3D.ply     # PLY format point cloud
 └── temp_merged_reconstruction_georeferenced/
-    └── ...                  # 地理坐标版本
+    └── ...                  # Georeferenced version
 ```
 
-可直接用于 3DGS 训练：
+Can be used directly for 3DGS training:
 ```bash
-# 使用 gaussian-splatting 官方实现
+# Using official gaussian-splatting implementation
 python train.py -s output/temp_merged/merged_N/
 ```
 
-## API 参考
+## API Reference
 
-### `IncrementalFeatureMatcherSfM` 类
+### `IncrementalFeatureMatcherSfM` Class
 
-核心类，管理增量式重建的完整生命周期。
+Core class managing the complete lifecycle of incremental reconstruction.
 
 ```python
 from SfM.incremental_feature_matcher import IncrementalFeatureMatcherSfM
 
 matcher = IncrementalFeatureMatcherSfM(
     output_dir=Path("output"),
-    reconstruction_type='each_pixel_feature_points',  # 或 'dense_feature_points'
+    reconstruction_type='each_pixel_feature_points',  # or 'dense_feature_points'
     model_type='mapanything',
     min_images_for_scale=6,
     overlap=2,
@@ -363,54 +365,54 @@ matcher = IncrementalFeatureMatcherSfM(
 )
 ```
 
-#### 主要方法
+#### Main Methods
 
-| 方法 | 描述 |
-|------|------|
-| `add_image(image_path)` | 添加单张影像并处理 |
-| `export_georeferenced(target_crs)` | 导出地理坐标系下的重建结果 |
-| `export_utm()` | 导出 UTM 坐标（自动检测区域） |
-| `get_statistics()` | 获取当前统计信息 |
+| Method | Description |
+|--------|-------------|
+| `add_image(image_path)` | Add and process a single image |
+| `export_georeferenced(target_crs)` | Export reconstruction in georeferenced coordinate system |
+| `export_utm()` | Export UTM coordinates (auto-detect zone) |
+| `get_statistics()` | Get current statistics |
 
-#### 属性
+#### Properties
 
-| 属性 | 类型 | 描述 |
-|------|------|------|
-| `merged_reconstruction` | `pycolmap.Reconstruction` | 合并后的重建结果 |
-| `merged_points_xyz` | `np.ndarray` | 合并后的点云坐标 (N, 3) |
-| `merged_points_colors` | `np.ndarray` | 合并后的点云颜色 (N, 3) |
-| `inference_reconstructions` | `List[Dict]` | 每个批次的重建结果 |
+| Property | Type | Description |
+|----------|------|-------------|
+| `merged_reconstruction` | `pycolmap.Reconstruction` | Merged reconstruction result |
+| `merged_points_xyz` | `np.ndarray` | Merged point cloud coordinates (N, 3) |
+| `merged_points_colors` | `np.ndarray` | Merged point cloud colors (N, 3) |
+| `inference_reconstructions` | `List[Dict]` | Reconstruction results for each batch |
 
-### `run_incremental_feature_matching` 函数
+### `run_incremental_feature_matching` Function
 
-便捷函数，封装完整的增量式重建流程。
+Convenience function encapsulating the complete incremental reconstruction pipeline.
 
 ```python
 from SfM.incremental_feature_matcher import run_incremental_feature_matching
 
 success = run_incremental_feature_matching(
-    image_paths=image_files,        # 影像路径列表
-    output_dir=output_dir,          # 输出目录
+    image_paths=image_files,        # List of image paths
+    output_dir=output_dir,          # Output directory
     
-    # 重建类型：'each_pixel_feature_points'（纯密集点云）或 'dense_feature_points'（支持3DGS）
+    # Reconstruction type: 'each_pixel_feature_points' (pure dense cloud) or 'dense_feature_points' (3DGS support)
     reconstruction_type='dense_feature_points',
     
     model_type='vggt',              # 'mapanything' | 'vggt' | 'fastvggt'
-    model_path=None,                # 模型权重路径
-    image_interval=1,               # 影像间隔
-    min_images_for_scale=6,         # 每批次影像数
-    overlap=2,                      # 批次重叠数
+    model_path=None,                # Model weights path
+    image_interval=1,               # Image interval
+    min_images_for_scale=6,         # Images per batch
+    overlap=2,                      # Batch overlap count
     
-    # 特征跟踪参数（仅 dense_feature_points 模式）
-    # query_frame_num 应与 min_images_for_scale 一致以支持 3DGS
+    # Feature tracking parameters (dense_feature_points mode only)
+    # query_frame_num should match min_images_for_scale for 3DGS support
     query_frame_num=6,
     max_query_pts=12288,
     
     pred_vis_scores_thres_value=0.7,
     max_reproj_error=5.0,
-    run_global_sfm_first=True,      # 先运行全局 SfM
+    run_global_sfm_first=True,      # Run global SfM first
     merge_method='confidence',
-    merge_voxel_size=0.5,           # 体素大小（米）
+    merge_voxel_size=0.5,           # Voxel size (meters)
     enable_visualization=True,
     visualization_mode='merged',    # 'aligned' | 'merged'
     export_georef=True,
@@ -419,87 +421,87 @@ success = run_incremental_feature_matching(
 )
 ```
 
-## 配置参数
+## Configuration Parameters
 
-### 核心参数
+### Core Parameters
 
-| 参数 | 默认值 | 描述 |
-|------|--------|------|
-| `reconstruction_type` | 'each_pixel_feature_points' | 重建类型：`'each_pixel_feature_points'`（纯密集点云）或 `'dense_feature_points'`（COLMAP格式，支持3DGS） |
-| `min_images_for_scale` | 6 | 每批次处理的影像数量 |
-| `overlap` | 2 | 相邻批次间的重叠影像数 |
-| `merge_method` | 'confidence' | 点云合并方法 |
-| `merge_voxel_size` | 1.5 | 体素去重大小（米） |
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `reconstruction_type` | 'each_pixel_feature_points' | Reconstruction type: `'each_pixel_feature_points'` (pure dense cloud) or `'dense_feature_points'` (COLMAP format, 3DGS support) |
+| `min_images_for_scale` | 6 | Number of images per batch |
+| `overlap` | 2 | Number of overlapping images between adjacent batches |
+| `merge_method` | 'confidence' | Point cloud merging method |
+| `merge_voxel_size` | 1.5 | Voxel deduplication size (meters) |
 
-### 模型参数
+### Model Parameters
 
-| 参数 | 默认值 | 描述 |
-|------|--------|------|
-| `model_type` | 'mapanything' | 模型类型 |
-| `model_path` | None | 模型权重路径（MapAnything 自动下载） |
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `model_type` | 'mapanything' | Model type |
+| `model_path` | None | Model weights path (MapAnything auto-downloads) |
 
-### FastVGGT 专用参数
+### FastVGGT-Specific Parameters
 
-| 参数 | 默认值 | 描述 |
-|------|--------|------|
-| `fastvggt_merging` | 0 | Token Merging 参数（0=禁用） |
-| `fastvggt_merge_ratio` | 0.9 | Token Merge 比例 (0.0-1.0) |
-| `fastvggt_depth_conf_thresh` | 3.0 | 深度置信度阈值 |
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `fastvggt_merging` | 0 | Token Merging parameter (0=disabled) |
+| `fastvggt_merge_ratio` | 0.9 | Token Merge ratio (0.0-1.0) |
+| `fastvggt_depth_conf_thresh` | 3.0 | Depth confidence threshold |
 
-### 特征跟踪参数（仅 `dense_feature_points` 模式）
+### Feature Tracking Parameters (`dense_feature_points` mode only)
 
-| 参数 | 默认值 | 描述 |
-|------|--------|------|
-| `max_query_pts` | 12288 | 每个查询帧最大特征点数 |
-| `query_frame_num` | 6 | 查询帧数量，**建议与 `min_images_for_scale` 保持一致** |
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_query_pts` | 12288 | Maximum feature points per query frame |
+| `query_frame_num` | 6 | Number of query frames, **recommended to match `min_images_for_scale`** |
 
-> 💡 **3DGS 兼容性提示**：为确保生成的 COLMAP 输出满足 3DGS 训练要求（每个 3D 点至少被 3 个 2D 点观测到），`query_frame_num` 必须 ≥ `min_images_for_scale`。推荐设置两者相等。
+> 💡 **3DGS Compatibility Tip**: To ensure generated COLMAP output meets 3DGS training requirements (each 3D point observed by at least 3 2D points), `query_frame_num` must be ≥ `min_images_for_scale`. Setting them equal is recommended.
 
-### 重建质量参数
+### Reconstruction Quality Parameters
 
-| 参数 | 默认值 | 描述 |
-|------|--------|------|
-| `max_reproj_error` | 5.0 | 最大重投影误差（像素） |
-| `max_points3D_val` | 1000000 | 3D 点坐标最大绝对值 |
-| `pred_vis_scores_thres_value` | 0.8 | 特征点可见性阈值 |
-| `filter_edge_margin` | 100.0 | 边缘过滤范围（像素） |
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_reproj_error` | 5.0 | Maximum reprojection error (pixels) |
+| `max_points3D_val` | 1000000 | Maximum absolute value for 3D point coordinates |
+| `pred_vis_scores_thres_value` | 0.8 | Feature point visibility threshold |
+| `filter_edge_margin` | 100.0 | Edge filtering range (pixels) |
 
-### 可视化参数
+### Visualization Parameters
 
-| 参数 | 默认值 | 描述 |
-|------|--------|------|
-| `enable_visualization` | True | 启用 Viser 可视化 |
-| `visualization_mode` | 'merged' | 可视化模式：'aligned' 或 'merged' |
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `enable_visualization` | True | Enable Viser visualization |
+| `visualization_mode` | 'merged' | Visualization mode: 'aligned' or 'merged' |
 
-### 地理坐标导出参数
+### Georeferenced Export Parameters
 
-| 参数 | 默认值 | 描述 |
-|------|--------|------|
-| `export_georef` | True | 是否导出地理坐标 |
-| `target_crs` | 'auto_utm' | 目标坐标系 |
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `export_georef` | True | Whether to export georeferenced coordinates |
+| `target_crs` | 'auto_utm' | Target coordinate system |
 
-支持的坐标系：
-- `auto_utm`: 自动检测 UTM 区域
+Supported coordinate systems:
+- `auto_utm`: Automatic UTM zone detection
 - `EPSG:3857`: Web Mercator
-- `EPSG:4326`: WGS84 经纬度
-- `EPSG:XXXX`: 任意 EPSG 代码
+- `EPSG:4326`: WGS84 lat/lon
+- `EPSG:XXXX`: Any EPSG code
 
-## 输出格式
+## Output Format
 
-运行完成后，输出目录结构如下：
+After execution, the output directory structure is as follows:
 
 ```
 output/
-├── global_sfm/                    # 全局 SfM 结果
+├── global_sfm/                    # Global SfM results
 │   └── enu/
 │       ├── cameras.txt
 │       ├── images.txt
 │       └── points3D.txt
-├── temp_aligned/                  # 每批次对齐后的重建
+├── temp_aligned/                  # Aligned reconstruction per batch
 │   ├── 0_6/
 │   ├── 4_10/
 │   └── ...
-├── temp_merged/                   # 合并后的重建
+├── temp_merged/                   # Merged reconstruction
 │   ├── merged_1/
 │   ├── merged_2/
 │   └── ...
@@ -508,11 +510,11 @@ output/
 │       ├── points3D.txt
 │       ├── points3D.ply
 │       └── points3D.las
-├── temp_merged_points_only/       # points_only 模式输出
+├── temp_merged_points_only/       # points_only mode output
 │   ├── merged_1.ply
 │   ├── merged_1.las
 │   └── ...
-└── temp_merged_reconstruction_georeferenced/  # 地理坐标输出
+└── temp_merged_reconstruction_georeferenced/  # Georeferenced output
     ├── cameras.txt
     ├── images.txt
     ├── points3D.txt
@@ -520,65 +522,73 @@ output/
     └── sparse_points.las
 ```
 
-### 输出文件格式
+### Output File Formats
 
-| 格式 | 描述 |
-|------|------|
-| `.txt` | COLMAP 文本格式 |
-| `.bin` | COLMAP 二进制格式 |
-| `.ply` | 标准 PLY 点云格式 |
-| `.las` | LAS 点云格式（支持 GIS 软件） |
+| Format | Description |
+|--------|-------------|
+| `.txt` | COLMAP text format |
+| `.bin` | COLMAP binary format |
+| `.ply` | Standard PLY point cloud format |
+| `.las` | LAS point cloud format (GIS software compatible) |
 
-## 示例数据集
+## Example Datasets
 
-项目提供了多个示例数据集用于测试：
+The project provides several example datasets for testing:
 
 ```
 examples/
-├── Ganluo_images/          # 甘洛数据集
-├── Tazishan/               # 塔子山数据集
-├── SWJTU_gongdi/           # 西南交大工地数据集
-├── SWJTU_7th_teaching_building/  # 西南交大七教数据集
-├── HuaPo/                  # 滑坡数据集
-├── WenChuan/               # 汶川数据集
-└── Comprehensive_building_sel/   # 综合建筑数据集
+├── Ganluo_images/          # Ganluo dataset
+├── Tazishan/               # Tazishan dataset
+├── SWJTU_gongdi/           # SWJTU construction site dataset
+├── SWJTU_7th_teaching_building/  # SWJTU 7th teaching building dataset
+├── HuaPo/                  # Landslide dataset
+├── WenChuan/               # Wenchuan dataset
+└── Comprehensive_building_sel/   # Comprehensive building dataset
 ```
 
-## 可视化
+## Visualization
 
-系统支持基于 [Viser](https://github.com/nerfstudio-project/viser) 的实时 3D 可视化：
+The system supports real-time 3D visualization based on [Viser](https://github.com/nerfstudio-project/viser):
 
 ```python
-# 启用可视化（默认开启）
+# Enable visualization (enabled by default)
 matcher = IncrementalFeatureMatcherSfM(
     ...,
     enable_visualization=True,
-    visualization_mode='merged',  # 显示合并后的点云
+    visualization_mode='merged',  # Display merged point cloud
 )
 ```
 
-启动后，在浏览器中访问 `http://localhost:8080` 查看：
+After starting, access `http://localhost:8080` in your browser to view:
 
-- 📍 相机位姿（frustum 显示）
-- 🔵 3D 点云
-- 🖼️ 影像缩略图
+- 📍 Camera poses (frustum display)
+- 🔵 3D point cloud
+- 🖼️ Image thumbnails
 
-## 致谢
+## Acknowledgements
 
-本项目基于以下优秀的开源项目：
+This project is built upon the following excellent open-source projects:
 
-- [MapAnything](https://github.com/facebookresearch/map-anything) - Meta 的端到端 3D 重建模型
-- [VGGT](https://github.com/facebookresearch/vggt) - 视觉几何基础模型
-- [COLMAP](https://colmap.github.io/) - 经典 SfM/MVS 框架
-- [pycolmap](https://github.com/colmap/pycolmap) - COLMAP Python 绑定
-- [Viser](https://github.com/nerfstudio-project/viser) - 3D 可视化工具
-- [laspy](https://github.com/laspy/laspy) - LAS 文件读写库
+- [MapAnything](https://github.com/facebookresearch/map-anything) - Meta's end-to-end 3D reconstruction model
+- [VGGT](https://github.com/facebookresearch/vggt) - Visual Geometry Grounded Transformer
+- [COLMAP](https://colmap.github.io/) - Classic SfM/MVS framework
+- [pycolmap](https://github.com/colmap/pycolmap) - COLMAP Python bindings
+- [Viser](https://github.com/nerfstudio-project/viser) - 3D visualization tool
+- [laspy](https://github.com/laspy/laspy) - LAS file I/O library
 
-## 引用
+## Citation
 
-如果您使用了本项目，请引用以下论文：
+If you use this project, please cite the following papers:
 
 ```bibtex
+@article{jia2025dronevggt,
+  title={Modular Incremental Dense 3D Reconstruction from UAV Imagery with Plug-and-Play Visual Geometry Transformer Models},
+  author={Jia, Zhihao and Ding, Yulin and Hu, Han},
+  journal={},
+  year={2025},
+  url={https://github.com/Henrik-JIA/Drone-VGGT}
+}
+
 @inproceedings{wang2025vggt,
   title={Vggt: Visual geometry grounded transformer},
   author={Wang, Jianyuan and Chen, Minghao and Karaev, Nikita and Vedaldi, Andrea and Rupprecht, Christian and Novotny, David},
@@ -602,14 +612,14 @@ matcher = IncrementalFeatureMatcherSfM(
 }
 ```
 
-## 许可证
+## License
 
-本项目采用 [Apache 2.0 许可证](LICENSE)。
+This project is licensed under the [Apache 2.0 License](LICENSE).
 
 ---
 
 <div align="center">
 
-**如有问题或建议，欢迎提交 Issue 或 Pull Request！**
+**If you have questions or suggestions, feel free to submit an Issue or Pull Request!**
 
 </div>
