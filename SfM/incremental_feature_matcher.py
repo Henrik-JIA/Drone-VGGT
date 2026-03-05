@@ -691,9 +691,11 @@ class IncrementalFeatureMatcherSfM:
                 fastvggt_depth_conf_thresh=self.fastvggt_depth_conf_thresh,
             )
             
-            # 预加载模型
+            # 预加载模型（可能会 fallback 到 CPU）
             self.model_loader.load_model()
             self.dtype = self.model_loader.dtype
+            # 同步 device（load_model 可能因 cuBLAS 不可用而回退到 CPU）
+            self.device = self.model_loader.device
         
         return self.model_loader
 
@@ -2801,7 +2803,8 @@ class IncrementalFeatureMatcherSfM:
             return False
             
         # 应用变换到curr_recon
-        curr_recon_aligned = pycolmap.Reconstruction(curr_recon)
+        # curr_recon_aligned = pycolmap.Reconstruction(curr_recon)
+        curr_recon_aligned = copy.deepcopy(curr_recon)
         curr_recon_aligned.transform(sim3_transform)
 
         return curr_recon_aligned
@@ -3426,7 +3429,8 @@ class IncrementalFeatureMatcherSfM:
             self.merged_points_xyz, self.merged_points_colors = self._extract_points_from_reconstruction(curr_recon)
             
             # 保存当前 reconstruction 用于下一次对齐（深拷贝）
-            self._prev_aligned_recon = pycolmap.Reconstruction(curr_recon)
+            # self._prev_aligned_recon = pycolmap.Reconstruction(curr_recon)
+            self._prev_aligned_recon = copy.deepcopy(curr_recon)
         
         # ==================== 后续 batch：增量式对齐与合并 ====================
         else:
@@ -3447,7 +3451,8 @@ class IncrementalFeatureMatcherSfM:
                 self.merged_points_xyz = np.vstack([self.merged_points_xyz, curr_xyz])
                 self.merged_points_colors = np.vstack([self.merged_points_colors, curr_colors])
                 # 关键修复：即使对齐失败，也要更新 _prev_aligned_recon，保持链式对齐的连续性
-                self._prev_aligned_recon = pycolmap.Reconstruction(curr_recon)
+                # self._prev_aligned_recon = pycolmap.Reconstruction(curr_recon)
+                self._prev_aligned_recon = copy.deepcopy(curr_recon)
             else:
                 if self.verbose:
                     print(f"    公共影像数: {len(common_images)}")
@@ -3478,7 +3483,8 @@ class IncrementalFeatureMatcherSfM:
                     self.merged_points_xyz = np.vstack([self.merged_points_xyz, curr_xyz])
                     self.merged_points_colors = np.vstack([self.merged_points_colors, curr_colors])
                     # 关键修复：即使对齐失败，也要更新 _prev_aligned_recon，保持链式对齐的连续性
-                    self._prev_aligned_recon = pycolmap.Reconstruction(curr_recon)
+                    # self._prev_aligned_recon = pycolmap.Reconstruction(curr_recon)
+                    self._prev_aligned_recon = copy.deepcopy(curr_recon)
                 else:
                     # 4. 使用 RANSAC 估计 Sim3 变换（优化：根据点数动态调整迭代次数）
                     n_points = len(pts_prev)
@@ -3501,7 +3507,8 @@ class IncrementalFeatureMatcherSfM:
                         self.merged_points_xyz = np.vstack([self.merged_points_xyz, curr_xyz])
                         self.merged_points_colors = np.vstack([self.merged_points_colors, curr_colors])
                         # 关键修复：即使对齐失败，也要更新 _prev_aligned_recon，保持链式对齐的连续性
-                        self._prev_aligned_recon = pycolmap.Reconstruction(curr_recon)
+                        # self._prev_aligned_recon = pycolmap.Reconstruction(curr_recon)
+                        self._prev_aligned_recon = copy.deepcopy(curr_recon)
                     else:
                         if self.verbose:
                             inlier_count = inlier_mask.sum() if inlier_mask is not None else 0
@@ -3509,7 +3516,8 @@ class IncrementalFeatureMatcherSfM:
                         
                         # 5. 对齐当前 batch 的 reconstruction
                         sim3_transform = pycolmap.Sim3d(scale, pycolmap.Rotation3d(R), t)
-                        curr_recon_aligned = pycolmap.Reconstruction(curr_recon)
+                        # curr_recon_aligned = pycolmap.Reconstruction(curr_recon)
+                        curr_recon_aligned = copy.deepcopy(curr_recon)
                         curr_recon_aligned.transform(sim3_transform)
                         
                         # 6. 识别重叠区的点并只添加非重叠的点
