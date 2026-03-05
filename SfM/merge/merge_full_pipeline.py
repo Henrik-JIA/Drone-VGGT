@@ -5,6 +5,7 @@
 支持点云融合：去除重复点、平滑过渡。
 """
 
+import copy
 import numpy as np
 import pycolmap
 from pathlib import Path
@@ -648,7 +649,8 @@ def refine_alignment_from_matched_points(
             print(f"    Translation: {refined_transform.translation}")
     
     # 应用精化后的变换
-    recon2_refined = pycolmap.Reconstruction(recon2)
+    # recon2_refined = pycolmap.Reconstruction(recon2)
+    recon2_refined = copy.deepcopy(recon2)
     recon2_refined.transform(refined_transform)
     
     if verbose:
@@ -1696,7 +1698,8 @@ def merge_reconstructions(
             print(f"  Translation: {sim3_transform.translation}")
     
     # 5. 应用变换到 recon2
-    recon2_aligned = pycolmap.Reconstruction(recon2)
+    # recon2_aligned = pycolmap.Reconstruction(recon2)
+    recon2_aligned = copy.deepcopy(recon2)
     recon2_aligned.transform(sim3_transform)
     
     if verbose:

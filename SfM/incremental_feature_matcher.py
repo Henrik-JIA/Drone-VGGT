@@ -4516,11 +4516,11 @@ def run_incremental_feature_matching(
     # ==================== 重建类型 ====================
     reconstruction_type: str = 'each_pixel_feature_points',  # 'dense_feature_points' | 'each_pixel_feature_points'
     # ==================== 模型参数 ====================
-    model_type: str = 'mapanything',  # 'mapanything' | 'vggt' | 'fastvggt'
+    model_type: str = 'vggt',  # 'mapanything' | 'vggt' | 'fastvggt'
     model_path: Optional[str] = None,  # 模型权重路径（VGGT/FastVGGT需要）
     # ==================== 影像处理参数 ====================
-    image_interval: int = 5,  # 影像选取间隔（1=全部, 2=每隔1张, etc.）
-    min_images_for_scale: int = 9,  # 每批次处理的影像数量
+    image_interval: int = 2,  # 影像选取间隔（1=全部, 2=每隔1张, etc.）
+    min_images_for_scale: int = 6,  # 每批次处理的影像数量
     overlap: int = 2,  # 相邻批次间的重叠影像数
     run_global_sfm_first: bool = True,  # 是否先运行全局SfM
     # ==================== 重建质量参数 ====================
@@ -4534,7 +4534,7 @@ def run_incremental_feature_matching(
     max_query_pts: int = 4096,  # 每个查询帧最大特征点数 4096 8192 12288
     query_frame_num: int = 4,  # 查询帧数量（建议 >= min_images_for_scale）
     # ==================== 点云合并参数 ====================
-    merge_method: str = 'points_only',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only'
+    merge_method: str = 'confidence',  # 'full' | 'confidence' | 'confidence_blend' | 'points_only'
     merge_voxel_size: float = 0.5,  # 点云合并时的体素大小（米）
     merge_boundary_filter: bool = False,  # 是否启用边界过滤
     merge_statistical_filter: bool = False,  # 是否启用统计过滤
@@ -4976,8 +4976,8 @@ if __name__ == "__main__":
     # output_dir = Path(r"drone-map-anything\output\Comprehensive_building_sel\sparse_incremental_reconstruction")
     
     # windows path
-    # input_dir = Path(r"drone-map-anything\examples\Ganluo_images\images")
-    # output_dir = Path(r"drone-map-anything\output\Ganluo_images\sparse_incremental_reconstruction")
+    input_dir = Path(r"drone-map-anything\examples\Ganluo_images\images")
+    output_dir = Path(r"drone-map-anything\output\Ganluo_images\sparse_incremental_reconstruction")
 
     # linux path
     # input_dir = Path("examples/Ganluo_images/images")
@@ -4989,8 +4989,8 @@ if __name__ == "__main__":
     # input_dir = Path(r"drone-map-anything\examples\SWJTU_gongdi\images")
     # output_dir = Path(r"drone-map-anything\output\SWJTU_gongdi\sparse_incremental_reconstruction")
 
-    input_dir = Path(r"drone-map-anything\examples\SWJTU_7th_teaching_building\images")
-    output_dir = Path(r"drone-map-anything\output\SWJTU_7th_teaching_building\sparse_incremental_reconstruction")
+    # input_dir = Path(r"drone-map-anything\examples\SWJTU_7th_teaching_building\images")
+    # output_dir = Path(r"drone-map-anything\output\SWJTU_7th_teaching_building\sparse_incremental_reconstruction")
     
     # input_dir = Path(r"drone-map-anything\examples\HuaPo\images")
     # output_dir = Path(r"drone-map-anything\output\HuaPo\sparse_incremental_reconstruction")
