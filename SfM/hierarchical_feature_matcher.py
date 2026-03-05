@@ -2723,7 +2723,8 @@ class HierarchicalFeatureMatcherSfM:
             return False
             
         # 应用变换到curr_recon
-        curr_recon_aligned = pycolmap.Reconstruction(curr_recon)
+        # curr_recon_aligned = pycolmap.Reconstruction(curr_recon)
+        curr_recon_aligned = copy.deepcopy(curr_recon)
         curr_recon_aligned.transform(sim3_transform)
 
         return curr_recon_aligned
