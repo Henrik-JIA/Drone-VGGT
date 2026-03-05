@@ -234,14 +234,26 @@ class FastVGGTLoader(BaseModelLoader):
                 print(f"  merging: {self.merging}")
                 print(f"  merge_ratio: {self.merge_ratio}")
             
-            # 确定混合精度类型
+            # 探测 GPU matmul 是否可用
+            from .vggt_loader import _probe_cuda_matmul, _is_jetson_tegra
+            self._gpu_matmul_ok = False
             if torch.cuda.is_available():
-                self.dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-            else:
-                self.dtype = torch.float32
+                self._gpu_matmul_ok = _probe_cuda_matmul(self.device, verbose=self.verbose)
             
-            if self.verbose:
-                print(f"  Using dtype: {self.dtype}")
+            if not self._gpu_matmul_ok:
+                self.device = 'cpu'
+                self.dtype = torch.float32
+                if self.verbose:
+                    print(f"  Using CPU inference (dtype: float32)")
+            else:
+                cap = torch.cuda.get_device_capability()[0]
+                is_tegra = _is_jetson_tegra()
+                if is_tegra and cap < 9:
+                    self.dtype = torch.float16
+                else:
+                    self.dtype = torch.bfloat16 if cap >= 8 else torch.float16
+                if self.verbose:
+                    print(f"  Using GPU inference (dtype: {self.dtype})")
             
             # 初始化 FastVGGT 模型
             self.model = FastVGGT(
@@ -269,12 +281,12 @@ class FastVGGTLoader(BaseModelLoader):
             else:
                 raise ValueError("FastVGGT requires model_path to be specified")
             
-            # 移动到 GPU 并设置 eval 模式
-            self.model = self.model.cuda().eval()
-            self.model = self.model.to(torch.bfloat16)
+            # 移动到目标设备并设置 eval 模式
+            self.model = self.model.to(self.device).eval()
+            self.model = self.model.to(self.dtype)
             
             if self.verbose:
-                print("✓ FastVGGT model loaded")
+                print(f"✓ FastVGGT model loaded (device: {self.device})")
         
         return self.model
     
@@ -336,15 +348,22 @@ class FastVGGTLoader(BaseModelLoader):
         model.update_patch_dimensions(patch_width, patch_height)
         
         # 5. 运行推理
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats()
+        is_cuda = 'cuda' in str(self.device)
+        if is_cuda:
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
         
         with torch.no_grad():
-            with torch.amp.autocast("cuda", dtype=self.dtype):
-                vgg_input_cuda = vgg_input.cuda().to(torch.bfloat16)
-                predictions = model(vgg_input_cuda, image_paths=base_image_path_list)
+            if is_cuda and self.dtype in (torch.float16, torch.bfloat16):
+                with torch.amp.autocast("cuda", dtype=self.dtype):
+                    vgg_input_dev = vgg_input.cuda().to(self.dtype)
+                    predictions = model(vgg_input_dev, image_paths=base_image_path_list)
+            else:
+                vgg_input_dev = vgg_input.to(self.device).float()
+                predictions = model(vgg_input_dev, image_paths=base_image_path_list)
         
-        torch.cuda.synchronize()
+        if is_cuda:
+            torch.cuda.synchronize()
         
         if self.verbose:
             if torch.cuda.is_available():

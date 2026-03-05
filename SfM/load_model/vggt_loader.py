@@ -5,12 +5,46 @@ VGGT 模型加载器
 处理 VGGT 模型的加载和推理。
 """
 
+import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
 from .base import BaseModelLoader
+
+
+def _is_jetson_tegra() -> bool:
+    """检测是否运行在 Jetson/Tegra 平台上"""
+    try:
+        with open('/proc/version', 'r') as f:
+            if 'tegra' in f.read().lower():
+                return True
+    except (FileNotFoundError, PermissionError):
+        pass
+    return os.path.exists('/proc/device-tree/compatible') and os.path.exists('/sys/devices/soc0/family')
+
+
+def _probe_cuda_matmul(device: str, verbose: bool = False) -> bool:
+    """测试 GPU matmul 是否可用（cuBLAS 可能不支持新架构如 sm_110）"""
+    try:
+        a = torch.randn(8, 8, device=device, dtype=torch.float32)
+        _ = torch.matmul(a, a.transpose(-1, -2))
+        torch.cuda.synchronize()
+        del a
+        if verbose:
+            print(f"  cuBLAS matmul probe: OK")
+        return True
+    except RuntimeError as e:
+        if verbose:
+            print(f"  cuBLAS matmul probe: FAILED — GPU matmul unavailable")
+            print(f"    ({e.__class__.__name__}: {str(e)[:120]})")
+            print(f"    Falling back to CPU inference")
+        try:
+            torch.cuda.synchronize()
+        except RuntimeError:
+            pass
+        return False
 
 # VGGT 模型导入（条件导入）
 VGGT_AVAILABLE = False
@@ -55,17 +89,33 @@ class VGGTLoader(BaseModelLoader):
             if self.verbose:
                 print("Loading VGGT model...")
             
-            # 确定混合精度类型
-            if torch.cuda.is_available():
-                self.dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-            else:
+            # 探测 GPU matmul 是否可用
+            # 新架构 GPU（如 NVIDIA Thor sm_110）可能 cuBLAS 尚无支持
+            self._gpu_matmul_ok = False
+            if 'cuda' in str(self.device):
+                self._gpu_matmul_ok = _probe_cuda_matmul(self.device, verbose=self.verbose)
+            
+            # 如果 GPU matmul 不可用，回退到 CPU
+            if not self._gpu_matmul_ok:
+                self.device = 'cpu'
                 self.dtype = torch.float32
+                if self.verbose:
+                    print(f"  Using CPU inference (dtype: float32)")
+            else:
+                # GPU 可用，选择半精度类型
+                cap = torch.cuda.get_device_capability()[0]
+                is_tegra = _is_jetson_tegra()
+                if is_tegra and cap < 9:
+                    self.dtype = torch.float16
+                else:
+                    self.dtype = torch.bfloat16 if cap >= 8 else torch.float16
+                if self.verbose:
+                    print(f"  Using GPU inference (dtype: {self.dtype})")
             
             self.model = VGGT()
             
             # 加载权重
             if self.model_path:
-                # 处理相对路径：基于项目根目录解析
                 model_path = Path(self.model_path)
                 if not model_path.is_absolute():
                     model_path = project_root / model_path
@@ -75,7 +125,6 @@ class VGGTLoader(BaseModelLoader):
                 state_dict = torch.load(str(model_path), map_location='cpu')
                 self.model.load_state_dict(state_dict)
             else:
-                # 尝试从 HuggingFace Hub 加载
                 try:
                     self.model = VGGT.from_pretrained("facebook/vggt")
                     if self.verbose:
@@ -86,8 +135,9 @@ class VGGTLoader(BaseModelLoader):
                         print("Using randomly initialized VGGT model")
             
             self.model.to(self.device)
+            
             if self.verbose:
-                print("✓ VGGT model loaded")
+                print(f"✓ VGGT model loaded (device: {self.device})")
         
         return self.model
     
@@ -132,10 +182,21 @@ class VGGTLoader(BaseModelLoader):
         _, _, H, W = images.shape  # [S, 3, H, W]
         image_size_hw = (H, W)
         
+        # 推理前清理 CUDA 缓存
+        if 'cuda' in str(self.device):
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        
         # 运行推理
+        if self.verbose:
+            print(f"  Running on {self.device} with dtype {self.dtype}")
+        
         with torch.no_grad():
-            with torch.cuda.amp.autocast(dtype=self.dtype):
-                predictions = model(images)
+            if self.dtype in (torch.float16, torch.bfloat16) and 'cuda' in str(self.device):
+                with torch.amp.autocast(device_type='cuda', dtype=self.dtype):
+                    predictions = model(images)
+            else:
+                predictions = model(images.float())
         
         # 转换为统一格式
         outputs = self._convert_output_to_unified_format(
