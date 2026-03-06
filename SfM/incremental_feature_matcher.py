@@ -174,108 +174,140 @@ def get_timing_tracker() -> Optional[TimingTracker]:
 
 
 class GPUMemoryTracker:
-    """用于跟踪GPU显存使用情况的简化工具类
+    """用于跟踪GPU显存使用情况的工具类
     
-    使用 pynvml 获取真实的GPU显存占用（与任务管理器一致），
-    同时也记录 PyTorch 报告的显存用于对比分析。
+    桌面GPU：使用 pynvml 获取真实的GPU显存占用（与任务管理器一致）
+    Tegra设备（统一内存）：PyTorch CUDA stats 在 Tegra 上不准确，
+        改用进程级内存监控（/proc/self/status VmRSS/VmHWM）
     """
     
     def __init__(self, output_dir: Path = None):
         self.memory_records: List[Dict] = []
         self.output_dir = output_dir or Path("temp_memory")
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.peak_gpu_memory: float = 0.0  # 真实显存峰值
+        self.peak_gpu_memory: float = 0.0
         self.initial_gpu_memory: float = 0.0
         self.nvml_initialized: bool = False
         self.nvml_handle = None
+        self.is_tegra: bool = False
         
-        # 尝试初始化 pynvml
+        self._detect_platform()
+        
+        if not self.is_tegra:
+            try:
+                import pynvml
+                pynvml.nvmlInit()
+                self.nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                self.nvml_initialized = True
+            except Exception as e:
+                print(f"Warning: pynvml not available, using torch.cuda for memory tracking: {e}")
+                self.nvml_initialized = False
+    
+    def _detect_platform(self):
+        """检测是否运行在 Tegra 平台（统一内存架构）"""
+        if not torch.cuda.is_available():
+            return
         try:
-            import pynvml
-            pynvml.nvmlInit()
-            self.nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-            self.nvml_initialized = True
-        except Exception as e:
-            print(f"Warning: pynvml not available, using torch.cuda for memory tracking: {e}")
-            self.nvml_initialized = False
+            gpu_name = torch.cuda.get_device_properties(0).name.lower()
+            tegra_keywords = ['tegra', 'orin', 'xavier', 'thor', 'jetson']
+            self.is_tegra = any(kw in gpu_name for kw in tegra_keywords)
+            if not self.is_tegra:
+                import platform
+                self.is_tegra = 'tegra' in platform.release().lower()
+        except Exception:
+            self.is_tegra = False
+        
+        if self.is_tegra:
+            print(f"[GPUMemoryTracker] Tegra platform detected — using process RSS for memory tracking")
+
+    @staticmethod
+    def _read_proc_status_mb() -> Dict[str, float]:
+        """从 /proc/self/status 读取进程内存（适用于 Linux/Tegra）"""
+        result = {"VmRSS": 0.0, "VmHWM": 0.0, "VmSize": 0.0}
+        try:
+            with open('/proc/self/status', 'r') as f:
+                for line in f:
+                    for key in result:
+                        if line.startswith(key + ':'):
+                            result[key] = int(line.split()[1]) / 1024.0
+        except Exception:
+            pass
+        return result
     
     def _get_gpu_memory_mb(self) -> Dict[str, float]:
-        """获取GPU显存使用情况（MB）
-        
-        Returns:
-            Dict包含:
-            - nvml_used: pynvml报告的实际使用显存（与任务管理器一致）
-            - nvml_total: GPU总显存
-            - torch_allocated: PyTorch分配的显存
-            - torch_reserved: PyTorch保留的显存
-        """
+        """获取GPU/内存使用情况（MB）"""
         result = {
-            "nvml_used": 0.0,
-            "nvml_total": 0.0,
+            "real_used": 0.0,
+            "total": 0.0,
             "torch_allocated": 0.0,
             "torch_reserved": 0.0,
+            "proc_rss": 0.0,
+            "proc_hwm": 0.0,
         }
         
         if torch.cuda.is_available():
-            torch.cuda.synchronize()  # 确保所有操作完成
+            torch.cuda.synchronize()
             result["torch_allocated"] = torch.cuda.memory_allocated() / (1024 ** 2)
             result["torch_reserved"] = torch.cuda.memory_reserved() / (1024 ** 2)
-            result["nvml_total"] = torch.cuda.get_device_properties(0).total_memory / (1024 ** 2)
+            result["total"] = torch.cuda.get_device_properties(0).total_memory / (1024 ** 2)
         
-        # 使用 pynvml 获取真实显存占用
-        if self.nvml_initialized and self.nvml_handle:
+        if self.is_tegra:
+            proc = self._read_proc_status_mb()
+            result["proc_rss"] = proc["VmRSS"]
+            result["proc_hwm"] = proc["VmHWM"]
+            result["real_used"] = proc["VmRSS"]
+        elif self.nvml_initialized and self.nvml_handle:
             try:
                 import pynvml
                 mem_info = pynvml.nvmlDeviceGetMemoryInfo(self.nvml_handle)
-                result["nvml_used"] = mem_info.used / (1024 ** 2)
-                result["nvml_total"] = mem_info.total / (1024 ** 2)
+                result["real_used"] = mem_info.used / (1024 ** 2)
+                result["total"] = mem_info.total / (1024 ** 2)
             except Exception:
-                # 如果 pynvml 失败，使用 torch_reserved 作为近似值
-                result["nvml_used"] = result["torch_reserved"]
+                result["real_used"] = result["torch_reserved"]
         else:
-            # 没有 pynvml 时使用 torch_reserved 作为近似值
-            result["nvml_used"] = result["torch_reserved"]
+            result["real_used"] = result["torch_reserved"]
         
         return result
     
     def start_monitoring(self):
-        """开始监控，记录初始显存状态"""
+        """开始监控，记录初始状态"""
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.synchronize()
+        
         mem_info = self._get_gpu_memory_mb()
-        self.initial_gpu_memory = mem_info["nvml_used"]
-        self.peak_gpu_memory = mem_info["nvml_used"]
+        self.initial_gpu_memory = mem_info["real_used"]
+        self.peak_gpu_memory = mem_info["real_used"]
         self.record("initial_state", "开始监控", 0)
     
     def record(self, step_name: str, description: str = "", image_idx: int = 0):
-        """记录当前GPU显存使用状态
-        
-        Args:
-            step_name: 步骤名称
-            description: 步骤描述
-            image_idx: 当前处理的图像索引
-        """
+        """记录当前内存使用状态"""
         mem_info = self._get_gpu_memory_mb()
         
-        # 更新峰值（使用真实显存占用）
-        self.peak_gpu_memory = max(self.peak_gpu_memory, mem_info["nvml_used"])
+        current_used = mem_info["real_used"]
+        self.peak_gpu_memory = max(self.peak_gpu_memory, current_used)
+        
+        # Tegra: 同时用 VmHWM 作为峰值的补充（OS级别的峰值跟踪，不会遗漏）
+        if self.is_tegra and mem_info["proc_hwm"] > 0:
+            self.peak_gpu_memory = max(self.peak_gpu_memory, mem_info["proc_hwm"])
         
         record = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "image_idx": image_idx,
             "step_name": step_name,
             "description": description,
-            # 真实显存占用（与任务管理器一致）
-            "gpu_real_used_mb": mem_info["nvml_used"],
-            # PyTorch 报告的显存（用于对比）
+            "gpu_real_used_mb": current_used,
             "torch_allocated_mb": mem_info["torch_allocated"],
             "torch_reserved_mb": mem_info["torch_reserved"],
-            # 总显存
-            "gpu_total_mb": mem_info["nvml_total"],
-            "gpu_usage_percent": (mem_info["nvml_used"] / mem_info["nvml_total"] * 100) if mem_info["nvml_total"] > 0 else 0,
+            "proc_rss_mb": mem_info["proc_rss"],
+            "proc_hwm_mb": mem_info["proc_hwm"],
+            "gpu_total_mb": mem_info["total"],
+            "gpu_usage_percent": (current_used / mem_info["total"] * 100) if mem_info["total"] > 0 else 0,
         }
         self.memory_records.append(record)
     
     def export_to_file(self, filename: str = None) -> Path:
-        """导出GPU显存使用信息到文本文件"""
+        """导出内存使用信息到文本文件"""
         if filename is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"gpu_memory_report_{timestamp}.txt"
@@ -290,37 +322,57 @@ class GPUMemoryTracker:
             f.write("=" * 100 + "\n\n")
             
             # GPU信息
-            f.write("─" * 50 + "\n")
-            f.write("  GPU Information\n")
-            f.write("─" * 50 + "\n")
+            f.write("─" * 60 + "\n")
+            f.write("  GPU / Platform Information\n")
+            f.write("─" * 60 + "\n")
             
             if torch.cuda.is_available():
                 gpu_props = torch.cuda.get_device_properties(0)
-                f.write(f"  GPU Device: {gpu_props.name}\n")
-                f.write(f"  GPU Total Memory: {gpu_props.total_memory / (1024**3):.2f} GB\n\n")
+                f.write(f"  GPU Device:     {gpu_props.name}\n")
+                f.write(f"  GPU Total Mem:  {gpu_props.total_memory / (1024**3):.2f} GB\n")
             else:
-                f.write("  GPU: Not available\n\n")
+                f.write("  GPU: Not available\n")
             
-            # 峰值显存使用
-            f.write("─" * 50 + "\n")
-            f.write("  Peak GPU Memory Usage\n")
-            f.write("─" * 50 + "\n")
-            f.write(f"  Initial: {self.initial_gpu_memory:.2f} MB ({self.initial_gpu_memory/1024:.2f} GB)\n")
-            f.write(f"  Peak:    {self.peak_gpu_memory:.2f} MB ({self.peak_gpu_memory/1024:.2f} GB)\n")
-            f.write(f"  Increase: {self.peak_gpu_memory - self.initial_gpu_memory:.2f} MB\n\n")
+            if self.is_tegra:
+                f.write(f"  Platform:       Tegra (Unified Memory Architecture)\n")
+                f.write(f"  Tracking Mode:  Process RSS (/proc/self/status VmRSS)\n")
+                f.write(f"  Note:           On Tegra, GPU shares system RAM. torch.cuda stats\n")
+                f.write(f"                  are unreliable; process RSS is the true indicator.\n")
+            else:
+                mode = "pynvml" if self.nvml_initialized else "torch.cuda"
+                f.write(f"  Platform:       Discrete GPU\n")
+                f.write(f"  Tracking Mode:  {mode}\n")
+            f.write("\n")
+            
+            # 峰值使用
+            f.write("─" * 60 + "\n")
+            f.write("  Peak Memory Usage\n")
+            f.write("─" * 60 + "\n")
+            f.write(f"  Initial:  {self.initial_gpu_memory:>10.2f} MB  ({self.initial_gpu_memory/1024:.2f} GB)\n")
+            f.write(f"  Peak:     {self.peak_gpu_memory:>10.2f} MB  ({self.peak_gpu_memory/1024:.2f} GB)\n")
+            increase = self.peak_gpu_memory - self.initial_gpu_memory
+            f.write(f"  Increase: {increase:>10.2f} MB  ({increase/1024:.2f} GB)\n")
+            
+            if self.is_tegra:
+                # 取最后一条记录的 VmHWM 作为 OS 报告的历史峰值
+                if self.memory_records:
+                    last_hwm = self.memory_records[-1].get("proc_hwm_mb", 0)
+                    f.write(f"\n  [OS Peak (VmHWM)]: {last_hwm:.2f} MB ({last_hwm/1024:.2f} GB)\n")
+            f.write("\n")
             
             # ==================== 按步骤类型统计 ====================
             f.write("=" * 110 + "\n")
-            f.write("                              Average GPU Memory by Step Type\n")
+            f.write("                              Average Memory by Step Type\n")
             f.write("=" * 110 + "\n\n")
             
-            # 按步骤名称分组统计（使用真实显存值）
             step_stats: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: {"real": [], "torch_alloc": []})
             for record in self.memory_records:
                 step_stats[record["step_name"]]["real"].append(record["gpu_real_used_mb"])
                 step_stats[record["step_name"]]["torch_alloc"].append(record["torch_allocated_mb"])
             
-            f.write(f"{'Step':<30} {'Count':>6} {'Real Avg(MB)':>14} {'Real Max(MB)':>14} {'Torch Avg(MB)':>14} {'Torch Max(MB)':>14}\n")
+            col_label = "RSS Avg(MB)" if self.is_tegra else "Real Avg(MB)"
+            col_label2 = "RSS Max(MB)" if self.is_tegra else "Real Max(MB)"
+            f.write(f"{'Step':<30} {'Count':>6} {col_label:>14} {col_label2:>14} {'Torch Avg(MB)':>14} {'Torch Max(MB)':>14}\n")
             f.write("-" * 110 + "\n")
             
             for step_name in sorted(step_stats.keys()):
@@ -337,11 +389,11 @@ class GPUMemoryTracker:
             
             # ==================== 关键步骤增量统计 ====================
             f.write("─" * 60 + "\n")
-            f.write("  Key Step Memory Delta (Real GPU Memory - matches Task Manager)\n")
+            delta_label = "Process RSS Delta" if self.is_tegra else "Real GPU Memory Delta"
+            f.write(f"  Key Step Memory Delta ({delta_label})\n")
             f.write("─" * 60 + "\n\n")
             
             def calc_delta_stats(before_key, after_key, label):
-                """计算步骤前后的显存增量统计"""
                 before_data = step_stats.get(before_key, {"real": []})
                 after_data = step_stats.get(after_key, {"real": []})
                 before_real = before_data["real"]
@@ -351,30 +403,51 @@ class GPUMemoryTracker:
                     num = min(len(before_real), len(after_real))
                     real_deltas = [after_real[i] - before_real[i] for i in range(num)]
                     f.write(f"  [{label}] (Calls: {num})\n")
-                    f.write(f"    Real GPU Delta - Avg: {sum(real_deltas)/num:+.2f} MB, Min: {min(real_deltas):+.2f} MB, Max: {max(real_deltas):+.2f} MB\n\n")
+                    f.write(f"    Delta - Avg: {sum(real_deltas)/num:+.2f} MB, "
+                            f"Min: {min(real_deltas):+.2f} MB, Max: {max(real_deltas):+.2f} MB\n\n")
             
             calc_delta_stats("model_loading_before", "model_loading_after", "Model Loading")
             calc_delta_stats("model_inference_before", "model_inference_after", "Model Inference")
             calc_delta_stats("cuda_cache_before", "cuda_cache_after", "CUDA Cache Cleanup")
             
             # ==================== 详细记录表格 ====================
-            f.write("\n" + "=" * 120 + "\n")
-            f.write("                                    Detailed Memory Records\n")
-            f.write("  Note: 'Real Used' matches Task Manager, 'Torch Alloc/Reserved' are PyTorch internal values\n")
-            f.write("=" * 120 + "\n")
-            f.write(f"{'Timestamp':<20} {'Img':>4} {'Step':<28} {'Real Used(MB)':>14} {'Torch Alloc':>12} {'Torch Rsv':>12} {'Usage%':>8}\n")
-            f.write("-" * 120 + "\n")
-            
-            for record in self.memory_records:
-                f.write(f"{record['timestamp']:<20} "
-                       f"{record['image_idx']:>4} "
-                       f"{record['step_name'][:28]:<28} "
-                       f"{record['gpu_real_used_mb']:>14.2f} "
-                       f"{record['torch_allocated_mb']:>12.2f} "
-                       f"{record['torch_reserved_mb']:>12.2f} "
-                       f"{record['gpu_usage_percent']:>7.1f}%\n")
-            
-            f.write("=" * 120 + "\n")
+            if self.is_tegra:
+                f.write("\n" + "=" * 140 + "\n")
+                f.write("                                    Detailed Memory Records\n")
+                f.write("  Note: Tegra unified memory — 'RSS' = process resident memory, 'HWM' = peak RSS (OS-tracked)\n")
+                f.write("=" * 140 + "\n")
+                f.write(f"{'Timestamp':<20} {'Img':>4} {'Step':<28} {'RSS(MB)':>12} {'HWM(MB)':>12} {'Torch Alloc':>12} {'Torch Rsv':>12} {'Usage%':>8}\n")
+                f.write("-" * 140 + "\n")
+                
+                for record in self.memory_records:
+                    f.write(f"{record['timestamp']:<20} "
+                           f"{record['image_idx']:>4} "
+                           f"{record['step_name'][:28]:<28} "
+                           f"{record['gpu_real_used_mb']:>12.2f} "
+                           f"{record.get('proc_hwm_mb', 0):>12.2f} "
+                           f"{record['torch_allocated_mb']:>12.2f} "
+                           f"{record['torch_reserved_mb']:>12.2f} "
+                           f"{record['gpu_usage_percent']:>7.1f}%\n")
+                
+                f.write("=" * 140 + "\n")
+            else:
+                f.write("\n" + "=" * 120 + "\n")
+                f.write("                                    Detailed Memory Records\n")
+                f.write("  Note: 'Real Used' matches Task Manager, 'Torch Alloc/Reserved' are PyTorch internal values\n")
+                f.write("=" * 120 + "\n")
+                f.write(f"{'Timestamp':<20} {'Img':>4} {'Step':<28} {'Real Used(MB)':>14} {'Torch Alloc':>12} {'Torch Rsv':>12} {'Usage%':>8}\n")
+                f.write("-" * 120 + "\n")
+                
+                for record in self.memory_records:
+                    f.write(f"{record['timestamp']:<20} "
+                           f"{record['image_idx']:>4} "
+                           f"{record['step_name'][:28]:<28} "
+                           f"{record['gpu_real_used_mb']:>14.2f} "
+                           f"{record['torch_allocated_mb']:>12.2f} "
+                           f"{record['torch_reserved_mb']:>12.2f} "
+                           f"{record['gpu_usage_percent']:>7.1f}%\n")
+                
+                f.write("=" * 120 + "\n")
         
         print(f"GPU Memory report saved to: {output_path}")
         return output_path
