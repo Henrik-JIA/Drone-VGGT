@@ -35,11 +35,8 @@ from scipy.spatial import cKDTree
 from merge.merge_confidence_blend import (
     find_common_images,
     build_correspondences_parallel,
-    build_2d_3d_correspondences,
-    build_pixel_to_3d_mapping,
     find_corresponding_3d_points,
     estimate_sim3_ransac,
-    apply_sim3_to_reconstruction,
 )
 
 
@@ -284,15 +281,29 @@ def _process_image_pair_for_merge(
     seen_pixel_idx2 = set()
     radius_stats = {r: 0 for r in match_radii}
     
-    # 确定每个距离对应的半径区间
     radius_arr = np.array(match_radii)
     
-    for order_idx in range(len(sorted_i)):
-        i = sorted_i[order_idx]
-        dist = sorted_dist[order_idx]
-        idx2 = sorted_idx[order_idx]
+    # 预计算所有候选的 radius_bin（向量化，避免循环内逐次 np.searchsorted）
+    bin_indices = np.searchsorted(radius_arr, sorted_dist, side='left')
+    valid_for_radius = bin_indices < len(radius_arr)
+    safe_bins = np.where(valid_for_radius, bin_indices, 0)
+    all_radius_bins = radius_arr[safe_bins]
+    
+    # 预提取为 Python int 数组，避免循环内 numpy scalar 开销
+    sorted_i_list = sorted_i.tolist()
+    sorted_idx_list = sorted_idx.tolist()
+    sorted_dist_list = sorted_dist.tolist()
+    valid_list = valid_for_radius.tolist()
+    radius_bin_list = all_radius_bins.tolist()
+    
+    n_candidates = len(sorted_i_list)
+    for order_idx in range(n_candidates):
+        if not valid_list[order_idx]:
+            continue
         
-        # 跳过已匹配的
+        i = sorted_i_list[order_idx]
+        idx2 = sorted_idx_list[order_idx]
+        
         if i in seen_pixel_idx1 or idx2 in seen_pixel_idx2:
             continue
         
@@ -302,16 +313,9 @@ def _process_image_pair_for_merge(
         if pt3d_id1 in seen_r1 or pt3d_id2 in seen_r2:
             continue
         
-        # 确定这个匹配属于哪个半径区间
-        radius_bin = radius_arr[np.searchsorted(radius_arr, dist, side='left')]
-        if dist > radius_bin:
-            # 找下一个更大的半径
-            larger = radius_arr[radius_arr >= dist]
-            if len(larger) == 0:
-                continue
-            radius_bin = larger[0]
+        dist = sorted_dist_list[order_idx]
+        radius_bin = radius_bin_list[order_idx]
         
-        # 记录匹配
         seen_r1.add(pt3d_id1)
         seen_r2.add(pt3d_id2)
         seen_pixel_idx1.add(i)
@@ -1014,13 +1018,15 @@ def merge_two_reconstructions(
     if verbose:
         print(f"\n  Step 1: Found {len(common_images)} common (overlap) images")
     
-    # 2. 并行建立 2D-3D 对应关系和像素映射
+    # 2. 并行建立 pixel 映射（使用 blend 模块的优化实现：直接构建 pmap，无 corr 中间结构，影像级并行）
     if verbose:
-        print(f"  Step 2: Building 2D-3D correspondences...")
+        print(f"  Step 2: Building pixel mappings (direct, parallel)...")
+    
     corr_r1, corr_r2, pmap_r1, pmap_r2 = build_correspondences_parallel(
         recon1, recon2, common_images,
         include_track_pixels=False,
-        verbose=False
+        verbose=False,
+        max_workers_per_recon=4
     )
     
     # 3. 找到对应的 3D 点对
@@ -1065,7 +1071,7 @@ def merge_two_reconstructions(
     if verbose:
         print(f"    Inliers: {info['num_inliers']}, Scale: {scale:.6f}")
     
-    # 5. 复制 recon2 并应用变换
+    # 5. 复制 recon2 并应用变换（使用 pycolmap 原生 C++ transform，比 Python 循环快数量级）
     if verbose:
         print(f"  Step 5: Applying rotation ({rotation_mode}) + scale + translation to recon2...")
     recon2_aligned = copy.deepcopy(recon2)
@@ -1082,7 +1088,6 @@ def merge_two_reconstructions(
     cr, sr = np.cos(roll), np.sin(roll)
     
     if rotation_mode == 'full':
-        # 使用完整旋转
         R_final = R.copy()
         rot_info = f"Yaw: {np.degrees(yaw):.2f}°, Pitch: {np.degrees(pitch):.2f}°, Roll: {np.degrees(roll):.2f}°"
     elif rotation_mode == 'yaw_roll':
@@ -1110,7 +1115,6 @@ def merge_two_reconstructions(
         ], dtype=np.float64)
         rot_info = f"Yaw: {np.degrees(yaw):.2f}°"
     elif rotation_mode == 'none':
-        # 不旋转
         R_final = np.eye(3, dtype=np.float64)
         rot_info = "No rotation"
     else:
@@ -1122,13 +1126,14 @@ def merge_two_reconstructions(
     tgt_centroid = pts1.mean(axis=0)
     translation_final = tgt_centroid - scale * (R_final @ src_centroid)
     
-    apply_sim3_to_reconstruction(recon2_aligned, R_final, translation_final, scale)
+    sim3_obj = pycolmap.Sim3d(scale, pycolmap.Rotation3d(R_final), translation_final)
+    recon2_aligned.transform(sim3_obj)
     
     if verbose:
         print(f"    {rot_info}, Scale: {scale:.6f}")
     
-    # 输出保存变换后的 recon2（可选）
-    if output_dir is not None:
+    # 中间结果写入（仅 verbose 模式，非关键路径）
+    if output_dir is not None and verbose:
         if start_idx is not None and end_idx is not None:
             subdir_name = f"{start_idx}_{end_idx}"
         else:
@@ -1137,23 +1142,15 @@ def merge_two_reconstructions(
         temp_path.mkdir(parents=True, exist_ok=True)
         recon2_aligned.write_text(str(temp_path))
         recon2_aligned.export_PLY(str(temp_path / "points3D.ply"))
-        if verbose:
-            print(f"    Saved aligned recon2 to: {temp_path}")
+        print(f"    Saved aligned recon2 to: {temp_path}")
     
-    # 6. 重新计算对齐后 recon2 的像素映射（只需共同影像）
-    if verbose:
-        print(f"  Step 6: Rebuilding pixel mappings for aligned recon2...")
+    # Step 6 已消除：Sim3 变换只改变 3D 点坐标和相机位姿，不改变 2D 像素观测，
+    # 因此 pmap_r2（像素→point3D_id 映射）在变换前后完全一致，直接复用 step 2 的结果。
     
-    # recon1 未变化，直接复用 step 2 的 pmap_r1
-    # 只需为对齐后的 recon2 的共同影像重建映射
-    common_ids_r2 = list(common_images.values())
-    corr_r2_aligned = build_2d_3d_correspondences(recon2_aligned, common_ids_r2, verbose=False)
-    pmap_r2_aligned = build_pixel_to_3d_mapping(corr_r2_aligned)
-    
-    # 7. 基于简单置信度合并
+    # 6. 基于简单置信度合并
     if verbose:
         mode_str = "weighted blending" if blend_mode == 'weighted' else "confidence selection"
-        print(f"  Step 7: Merging based on {mode_str}...")
+        print(f"  Step 6: Merging based on {mode_str}...")
         print(f"    Match radii: {match_radii}")
         if blend_mode == 'weighted':
             print(f"    Blend weight: high={blend_weight:.0%}, low={1-blend_weight:.0%}")
@@ -1168,8 +1165,8 @@ def merge_two_reconstructions(
     merged_recon, merge_info = merge_by_simple_confidence(
         recon1,
         recon2_aligned,
-        pmap_r1,           # 复用 step 2 的结果
-        pmap_r2_aligned,   # 对齐后重建的映射
+        pmap_r1,    # 复用 step 2 的结果
+        pmap_r2,    # 直接复用 step 2 的结果（Sim3 不改变 2D 观测）
         common_images,
         prev_recon_conf=prev_recon_conf,
         curr_recon_conf=curr_recon_conf,

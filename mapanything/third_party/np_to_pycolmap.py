@@ -244,7 +244,7 @@ def batch_np_matrix_to_pycolmap(
         # 向量化计算差值，避免中间变量
         projected_diff = np.linalg.norm(projected_points_2d - tracks, axis=-1)
         # 使用 np.where 避免条件赋值的额外内存分配
-        projected_diff = np.where(projected_points_cam[:, -1:, :].transpose(0, 2, 1)[..., 0] <= 0, 1e6, projected_diff)
+        projected_diff = np.where(projected_points_cam[:, 2, :] <= 0, 1e6, projected_diff)
         reproj_mask = projected_diff < max_reproj_error
 
     if masks is not None and reproj_mask is not None:
@@ -689,7 +689,7 @@ def batch_np_matrix_to_pycolmap_with_rename(
             points3d, extrinsics, intrinsics
         )
         projected_diff = np.linalg.norm(projected_points_2d - tracks, axis=-1)
-        projected_diff = np.where(projected_points_cam[:, -1:, :].transpose(0, 2, 1)[..., 0] <= 0, 1e6, projected_diff)
+        projected_diff = np.where(projected_points_cam[:, 2, :] <= 0, 1e6, projected_diff)
         reproj_mask = projected_diff < max_reproj_error
 
     if masks is not None and reproj_mask is not None:
@@ -729,8 +729,8 @@ def batch_np_matrix_to_pycolmap_with_rename(
 
     add_point3D = reconstruction.add_point3D
     Track = pycolmap.Track
-    for i in range(num_points3D):
-        add_point3D(valid_points3d[i], Track(), rgb_array[i])
+    for pt, color in zip(valid_points3d, rgb_array):
+        add_point3D(pt, Track(), color)
 
     # 预计算每帧的有效观测
     masks_valid = masks[:, valid_idx]  # (N, num_points3D)
@@ -738,6 +738,22 @@ def batch_np_matrix_to_pycolmap_with_rename(
     combined_valid = masks_valid & coords_valid_mask
 
     frame_valid_indices = [np.flatnonzero(combined_valid[fidx]) for fidx in range(N)]
+
+    # 批量向量化：一次性完成所有帧的2D坐标变换，避免逐帧 astype + 算术
+    if do_rescale and shift_point2d_to_original_res:
+        tracks_transformed = (
+            (tracks_valid.astype(np.float32) - top_lefts[:, np.newaxis, :])
+            * scale_factors_f32[:, np.newaxis, :]
+        )
+    else:
+        tracks_transformed = tracks_valid
+
+    # 预构建图像名称列表，避免循环内分支判断
+    image_id_base = 1
+    if image_paths is not None:
+        image_names = image_paths
+    else:
+        image_names = [f"image_{fidx + image_id_base}" for fidx in range(N)]
 
     # 缓存字典和track引用
     points3D_dict = reconstruction.points3D
@@ -752,8 +768,6 @@ def batch_np_matrix_to_pycolmap_with_rename(
     ListPoint2D = pycolmap.ListPoint2D
 
     camera = None
-    image_id_base = 1
-    processed_camera_ids = set()
 
     # 遍历每张图像
     for fidx in range(N):
@@ -790,22 +804,15 @@ def batch_np_matrix_to_pycolmap_with_rename(
                 camera_id=camera_id,
             )
             reconstruction.add_camera(camera)
-            processed_camera_ids.add(camera_id)
 
         # 设置图像位姿
         extr = extrinsics[fidx]
         cam_from_world = Rigid3d(Rotation3d(extr[:3, :3]), extr[:3, 3])
 
         image_id = fidx + image_id_base
-        # 直接使用正确的图像名称
-        if image_paths is not None:
-            img_name = image_paths[fidx]
-        else:
-            img_name = f"image_{image_id}"
-            
         image = Image(
             id=image_id,
-            name=img_name,
+            name=image_names[fidx],
             camera_id=camera.camera_id,
             cam_from_world=cam_from_world,
         )
@@ -819,20 +826,12 @@ def batch_np_matrix_to_pycolmap_with_rename(
             reconstruction.add_image(image)
             continue
 
-        # 批量获取2D坐标
-        valid_2d_coords = tracks_valid[fidx, valid_point_indices].copy()  # (num_valid, 2)
+        # 获取已变换的2D坐标（预计算完成，无需逐帧变换）
+        valid_2d_coords = tracks_transformed[fidx, valid_point_indices]
 
-        # ========== 直接变换2D坐标到原始分辨率 ==========
-        if do_rescale and shift_point2d_to_original_res:
-            top_left = top_lefts[fidx]
-            scale_xy = scale_factors_f32[fidx]
-            valid_2d_coords = (valid_2d_coords.astype(np.float32) - top_left) * scale_xy
-
-        # 计算 point3D_id
+        # 计算 point3D_id 并批量创建 Point2D
         point3D_ids = valid_point_indices + 1
-
-        # 创建 Point2D 对象
-        points2D_list = [Point2D(valid_2d_coords[i], point3D_ids[i]) for i in range(num_valid)]
+        points2D_list = [Point2D(xy, pid) for xy, pid in zip(valid_2d_coords, point3D_ids)]
 
         # 添加 track elements
         for local_idx, point_local_idx in enumerate(valid_point_indices):
@@ -845,13 +844,14 @@ def batch_np_matrix_to_pycolmap_with_rename(
 
         reconstruction.add_image(image)
 
-    # 清理无效3D点
-    points_to_remove = [i + 1 for i, track in enumerate(track_refs) if len(track.elements) == 0]
-
-    if points_to_remove:
-        for point3D_id in points_to_remove:
-            del points3D_dict[point3D_id]
-        print(f"Removed {len(points_to_remove)} points without 2D associations")
+    # 清理无效3D点（单次遍历，避免中间列表）
+    n_removed = 0
+    for i, track in enumerate(track_refs):
+        if len(track.elements) == 0:
+            del points3D_dict[i + 1]
+            n_removed += 1
+    if n_removed:
+        print(f"Removed {n_removed} points without 2D associations")
 
     return reconstruction, valid_mask
 

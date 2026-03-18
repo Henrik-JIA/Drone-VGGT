@@ -290,16 +290,16 @@ def estimate_sim3_with_ransac(
     # 预计算平方阈值
     inlier_threshold_sq = inlier_threshold * inlier_threshold
     
-    # 一次性预生成所有随机采样索引（更高效）
-    # 使用 random generator 的 integers 方法批量生成
+    # 一次性向量化生成所有随机索引，避免 Python 循环
     rng = np.random.default_rng()
-    # 生成 (max_iterations, 3) 的随机索引
-    all_indices = np.empty((max_iterations, 3), dtype=np.int64)
-    for i in range(max_iterations):
-        all_indices[i] = rng.choice(n_points, 3, replace=False)
+    all_indices = rng.integers(0, n_points, size=(max_iterations, 3))
     
     for iteration in range(max_iterations):
         sample_idx = all_indices[iteration]
+        # 跳过含重复索引的样本（n_points >> 3 时概率极低，约 3/n_points）
+        if sample_idx[0] == sample_idx[1] or sample_idx[0] == sample_idx[2] or sample_idx[1] == sample_idx[2]:
+            continue
+        
         src_sample = src_points[sample_idx]
         tgt_sample = tgt_points[sample_idx]
         
@@ -307,7 +307,7 @@ def estimate_sim3_with_ransac(
         v1 = src_sample[1] - src_sample[0]
         v2 = src_sample[2] - src_sample[0]
         cross = np.cross(v1, v2)
-        if cross @ cross < 1e-12:  # 使用点积代替 norm
+        if cross @ cross < 1e-12:
             continue
         
         # 估计 Sim3
@@ -377,7 +377,6 @@ def rescale_reconstruction_to_original_size(
     Returns:
         对齐后的 reconstruction
     """
-    # 参数校验
     valid_modes = {'auto', 'pcl_alignment', 'image_alignment'}
     if alignment_mode not in valid_modes:
         raise ValueError(f"alignment_mode 必须是 {valid_modes} 之一，当前为: {alignment_mode}")
@@ -386,8 +385,8 @@ def rescale_reconstruction_to_original_size(
     use_method1 = alignment_mode in ('auto', 'pcl_alignment')
     use_method2 = alignment_mode in ('auto', 'image_alignment')
 
-    # 方法1：直接通过3D点云配准到最新的SfM重建
-    if use_method1 and len(sfm_reconstructions) > 0:
+    # 方法1：通过3D点云配准到最新的SfM重建
+    if use_method1 and sfm_reconstructions:
         if verbose:
             print("  Attempting alignment to latest SfM via 3D point cloud (pcl_alignment)...")
 
@@ -396,45 +395,40 @@ def rescale_reconstruction_to_original_size(
         src_reconstruction = reconstruction
         num_tgt_images = len(tgt_reconstruction.images)
         num_src_images = len(src_reconstruction.images)
-        
-        if num_tgt_images != 0 and num_src_images != 0 and num_tgt_images == num_src_images:
-            # 优化：直接生成选择的图像索引列表
-            if num_tgt_images <= 2:
+
+        if num_tgt_images > 0 and num_src_images > 0 and num_tgt_images == num_src_images:
+            # 选取首、中、末三张影像进行匹配
+            if num_tgt_images <= 3:
                 sel_image_idx = list(range(1, num_tgt_images + 1))
-            elif num_tgt_images == 3:
-                sel_image_idx = [1, 2, 3]
             else:
                 sel_image_idx = [1, (num_tgt_images + 1) // 2, num_tgt_images]
 
-            point_correspondences = []
             pixel_threshold = 3.0
-            
-            # 预缓存字典引用
             tgt_images = tgt_reconstruction.images
             src_images = src_reconstruction.images
-            
+            tgt_points3D = tgt_reconstruction.points3D
+            src_points3D = src_reconstruction.points3D
+
+            # 合并对应关系收集与3D坐标提取（一趟遍历，省去中间 point_correspondences 列表）
+            all_tgt_xyz = []
+            all_src_xyz = []
+
             for index in sel_image_idx:
                 tgt_image_obj = tgt_images[index]
                 src_image_obj = src_images[index]
 
-                # 使用辅助函数提取有效点
                 src_coords, src_pt3d_ids = _extract_valid_points2d(src_image_obj)
-                
                 if not src_coords:
                     continue
-                
+
                 if HAS_KDTREE:
-                    # 使用 KD-Tree 进行快速匹配
                     src_coords_arr = np.asarray(src_coords, dtype=np.float64)
                     correspondences = find_single_images_pair_matches_kdtree(
-                        tgt_image_obj, 
-                        src_image_obj, 
-                        src_coords_arr,
-                        src_pt3d_ids,
-                        pixel_threshold, 
+                        tgt_image_obj, src_image_obj,
+                        src_coords_arr, src_pt3d_ids,
+                        pixel_threshold,
                     )
                 else:
-                    # 回退到网格搜索方法：构建空间索引
                     src_spatial_index = {}
                     for i, (x, y) in enumerate(src_coords):
                         grid_key = (int(round(x)), int(round(y)))
@@ -442,60 +436,43 @@ def rescale_reconstruction_to_original_size(
                             src_spatial_index[grid_key].append((src_pt3d_ids[i], (x, y)))
                         else:
                             src_spatial_index[grid_key] = [(src_pt3d_ids[i], (x, y))]
-
                     correspondences = find_single_images_pair_matches(
-                        tgt_image_obj, 
-                        src_image_obj, 
-                        src_spatial_index, 
-                        pixel_threshold, 
+                        tgt_image_obj, src_image_obj,
+                        src_spatial_index, pixel_threshold,
                     )
-                point_correspondences.extend(correspondences)
 
-            if len(point_correspondences) == 0:
-                print("  Warning: No point correspondences found between overlapping regions")
+                # 直接提取3D坐标，避免存储中间对应关系列表
+                for tgt_pt3d_id, src_pt3d_id, _ in correspondences:
+                    if tgt_pt3d_id in tgt_points3D and src_pt3d_id in src_points3D:
+                        all_tgt_xyz.append(tgt_points3D[tgt_pt3d_id].xyz)
+                        all_src_xyz.append(src_points3D[src_pt3d_id].xyz)
+
+            n_valid = len(all_tgt_xyz)
+            if n_valid == 0:
+                if verbose:
+                    print("  Warning: No point correspondences found between overlapping regions")
+            elif n_valid < 3:
+                if verbose:
+                    print(f"  Warning: Not enough 3D points for Sim3 estimation ({n_valid} pairs)")
             else:
-                # 批量提取3D点坐标
-                tgt_points3D = tgt_reconstruction.points3D
-                src_points3D = src_reconstruction.points3D
-                
-                # 使用列表推导式一次性过滤和提取
-                valid_pairs = [
-                    (tgt_pt3d_id, src_pt3d_id)
-                    for tgt_pt3d_id, src_pt3d_id, _ in point_correspondences
-                    if tgt_pt3d_id in tgt_points3D and src_pt3d_id in src_points3D
-                ]
-                
-                if len(valid_pairs) >= 3:
-                    # 批量提取坐标（使用预分配数组更快）
-                    n_pairs = len(valid_pairs)
-                    tgt_pts3d = np.empty((n_pairs, 3), dtype=np.float64)
-                    src_pts3d = np.empty((n_pairs, 3), dtype=np.float64)
-                    
-                    for i, (tgt_pid, src_pid) in enumerate(valid_pairs):
-                        tgt_pts3d[i] = tgt_points3D[tgt_pid].xyz
-                        src_pts3d[i] = src_points3D[src_pid].xyz
+                tgt_pts3d = np.array(all_tgt_xyz, dtype=np.float64)
+                src_pts3d = np.array(all_src_xyz, dtype=np.float64)
 
-                    # 估计 Sim3（src → tgt）
-                    try:
-                        sim3_transform = estimate_sim3_transform(src_pts3d, tgt_pts3d)
-                        if sim3_transform is not None:
-                            reconstruction.transform(sim3_transform)
-                            alignment_success = True
-                            if verbose:
-                                print(f"  ✓ Reconstruction aligned to latest SfM via 3D point cloud")
-                                print(f"    Scale: {sim3_transform.scale:.6f}")
-                                print(f"    Used 3D points: {len(src_pts3d)}")
-                        else:
-                            if verbose:
-                                print("  Warning: Failed to compute Sim3 transform")
-                    except Exception as e:
+                try:
+                    sim3_transform = estimate_sim3_transform(src_pts3d, tgt_pts3d)
+                    if sim3_transform is not None:
+                        reconstruction.transform(sim3_transform)
+                        alignment_success = True
                         if verbose:
-                            print(f"  Warning: Sim3 estimation failed: {e}")
-                            import traceback
-                            traceback.print_exc()
-                else:
+                            print(f"  ✓ Reconstruction aligned to latest SfM via 3D point cloud")
+                            print(f"    Scale: {sim3_transform.scale:.6f}, Used 3D points: {n_valid}")
+                    elif verbose:
+                        print("  Warning: Failed to compute Sim3 transform")
+                except Exception as e:
                     if verbose:
-                        print(f"  Warning: Not enough 3D points for Sim3 estimation ({len(valid_pairs)} pairs)")
+                        print(f"  Warning: Sim3 estimation failed: {e}")
+                        import traceback
+                        traceback.print_exc()
 
     if not alignment_success and verbose:
         print("  No successful alignment with SfM reconstructions, falling back to GPS-based alignment...")
@@ -504,44 +481,44 @@ def rescale_reconstruction_to_original_size(
     if use_method2 and not alignment_success:
         if verbose:
             print(f"  Using GPS-based alignment...")
-        
-        num_images = end_idx - start_idx
-        
-        if num_images == 0:
+
+        if end_idx - start_idx == 0:
             print("  Warning: No matching images found for alignment")
             return reconstruction
 
-        # 从 reconstruction 中获取实际的图像名称，并与 ori_extrinsics 匹配
-        # 建立 image_name -> extrinsic 的映射
-        extrinsic_by_name = {ext['image_name']: ext for ext in ori_extrinsics}
-        
-        # 收集 reconstruction 中的图像及其对应的 GPS 位置
-        valid_names = []
-        camera_centers_list = []
-        
-        for img_id, image in reconstruction.images.items():
-            img_name = image.name
-            if img_name in extrinsic_by_name:
-                extrinsic_info = extrinsic_by_name[img_name]
-                R_camera = np.asarray(extrinsic_info['R_camera'], dtype=np.float64)
-                t = np.asarray(extrinsic_info['tvec'], dtype=np.float64)
-                if t.ndim == 1:
-                    t = t.reshape(3, 1)
-                # camera_center = -R^T @ t
-                camera_center = -R_camera.T @ t
-                valid_names.append(img_name)
-                camera_centers_list.append(camera_center.flatten())
-        
-        if len(valid_names) < 3:
-            print(f"  Warning: Not enough matching images for alignment ({len(valid_names)} found)")
-            return reconstruction
-        
-        camera_centers = np.array(camera_centers_list, dtype=np.float64)
-        
-        if verbose:
-            print(f"    Found {len(valid_names)} matching images in reconstruction")
+        # 建立 image_name -> (R, t) 映射，预转换为 numpy 数组（避免逐张影像重复转换）
+        extrinsic_by_name = {}
+        for ext in ori_extrinsics:
+            extrinsic_by_name[ext['image_name']] = (
+                np.asarray(ext['R_camera'], dtype=np.float64),
+                np.asarray(ext['tvec'], dtype=np.float64).ravel(),
+            )
 
-        # RANSAC 对齐
+        # 收集匹配的图像名称和 R, t
+        valid_names = []
+        R_list = []
+        t_list = []
+
+        for image in reconstruction.images.values():
+            Rt = extrinsic_by_name.get(image.name)
+            if Rt is not None:
+                valid_names.append(image.name)
+                R_list.append(Rt[0])
+                t_list.append(Rt[1])
+
+        n_valid = len(valid_names)
+        if n_valid < 3:
+            print(f"  Warning: Not enough matching images for alignment ({n_valid} found)")
+            return reconstruction
+
+        # 批量计算相机中心: camera_center_i = -R_i^T @ t_i
+        R_batch = np.stack(R_list)  # (N, 3, 3)
+        t_batch = np.stack(t_list)  # (N, 3)
+        camera_centers = -np.einsum('nji,nj->ni', R_batch, t_batch)
+
+        if verbose:
+            print(f"    Found {n_valid} matching images in reconstruction")
+
         ransac_options = pycolmap.RANSACOptions()
         ransac_options.max_error = image_alignment_max_error
         ransac_options.min_inlier_ratio = image_alignment_min_inlier_ratio
@@ -556,18 +533,16 @@ def rescale_reconstruction_to_original_size(
             )
             if sim3d is not None:
                 reconstruction.transform(sim3d)
-                
                 if verbose:
                     print(f"  ✓ Reconstruction aligned to known poses")
-                    print(f"    Scale: {sim3d.scale}")
-                    print(f"    Number of aligned images: {len(valid_names)}")
+                    print(f"    Scale: {sim3d.scale}, Aligned images: {n_valid}")
             else:
                 print("  Warning: Failed to align reconstruction")
-                
+
         except Exception as e:
             print(f"  Error aligning reconstruction: {e}")
             import traceback
             traceback.print_exc()
-        
+
     return reconstruction
 

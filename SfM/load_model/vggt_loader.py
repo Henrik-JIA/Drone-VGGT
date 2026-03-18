@@ -122,7 +122,9 @@ class VGGTLoader(BaseModelLoader):
                 
                 if self.verbose:
                     print(f"Loading weights from: {model_path}")
-                state_dict = torch.load(str(model_path), map_location='cpu')
+                    
+                device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                state_dict = torch.load(str(model_path), map_location=device)
                 self.model.load_state_dict(state_dict)
             else:
                 try:

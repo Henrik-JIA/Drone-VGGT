@@ -5,6 +5,7 @@
 """
 
 import numpy as np
+import time
 import pycolmap
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple, Set
@@ -2113,16 +2114,12 @@ def find_common_images(
     Returns:
         映射字典 {recon1_image_id: recon2_image_id}
     """
-    # 建立 recon2 的影像名称到 ID 的映射
-    name_to_id2 = {img.name: img_id for img_id, img in recon2.images.items()}
-    
-    # 查找共同影像
-    common_images = {}
-    for img_id1, img1 in recon1.images.items():
-        if img1.name in name_to_id2:
-            common_images[img_id1] = name_to_id2[img1.name]
-    
-    return common_images
+    images1 = recon1.images
+    images2 = recon2.images
+    name_to_id2 = {img.name: img_id for img_id, img in images2.items()}
+    # 单次 .get() 替代 "in" + "[]" 两次哈希查找
+    return {img_id1: id2 for img_id1, img1 in images1.items()
+            if (id2 := name_to_id2.get(img1.name)) is not None}
 
 
 def build_2d_3d_correspondences(
@@ -2436,15 +2433,138 @@ def build_pixel_to_3d_mapping(
     return pixel_mapping
 
 
+def _process_single_image_to_pixel_map(
+    img_id: int,
+    images_map,
+    points3D_map,
+    include_track_pixels: bool
+) -> Optional[Tuple[int, Dict]]:
+    """直接从 reconstruction 构建单张影像的 pixel_map（跳过 correspondence 中间结构）"""
+    if img_id not in images_map:
+        return None
+    image = images_map[img_id]
+    points2D = image.points2D
+    img_pixel_map = {}
+    for pt2d_idx in range(len(points2D)):
+        point2D = points2D[pt2d_idx]
+        pt3d_id = point2D.point3D_id
+        if pt3d_id == -1 or pt3d_id not in points3D_map:
+            continue
+        point3D = points3D_map[pt3d_id]
+        pixel_xy = point2D.xy
+        px = pixel_xy[0] if hasattr(pixel_xy, '__getitem__') else pixel_xy.x
+        py = pixel_xy[1] if hasattr(pixel_xy, '__getitem__') else pixel_xy.y
+        pixel_key = (int(round(px)), int(round(py)))
+        track_elems = point3D.track.elements
+        if include_track_pixels:
+            track_data = []
+            for te in track_elems:
+                if te.image_id in images_map:
+                    te_img = images_map[te.image_id]
+                    track_data.append({
+                        'image_id': te.image_id, 'image_name': te_img.name,
+                        'point2D_idx': te.point2D_idx,
+                        'pixel_xy': te_img.points2D[te.point2D_idx].xy
+                    })
+        else:
+            track_data = [(te.image_id, te.point2D_idx) for te in track_elems]
+        img_pixel_map[pixel_key] = {
+            'point3D_id': pt3d_id,
+            'xyz': point3D.xyz,
+            'color': point3D.color,
+            'error': point3D.error,
+            'track_length': len(track_elems),
+            'track': track_data,
+            'exact_xy': pixel_xy
+        }
+    return (img_id, img_pixel_map)
+
+
+def _build_pixel_map_single(args: Tuple[int, Dict]) -> Tuple[int, Dict]:
+    """处理单张影像的像素映射（内部函数，用于并行）"""
+    img_id, data = args
+    img_pixel_map = {}
+    points3D_info = data['points3D']
+    for pt2d_info in data['points2D']:
+        pt3d_id = pt2d_info['point3D_id']
+        pixel_xy = pt2d_info['pixel_xy']
+        px = pixel_xy[0] if hasattr(pixel_xy, '__getitem__') else pixel_xy.x
+        py = pixel_xy[1] if hasattr(pixel_xy, '__getitem__') else pixel_xy.y
+        pixel_key = (int(round(px)), int(round(py)))
+        pt3d_info = points3D_info[pt3d_id]
+        img_pixel_map[pixel_key] = {
+            'point3D_id': pt3d_id,
+            'xyz': pt3d_info['xyz'],
+            'color': pt3d_info['color'],
+            'error': pt3d_info['error'],
+            'track_length': pt3d_info['track_length'],
+            'track': pt3d_info['track'],
+            'exact_xy': pixel_xy
+        }
+    return img_id, img_pixel_map
+
+
+def build_pixel_to_3d_mapping_parallel(
+    correspondences: Dict[int, Dict],
+    max_workers: int = 4
+) -> Dict[int, Dict[Tuple[int, int], Dict]]:
+    """build_pixel_to_3d_mapping 的并行版本，按影像并行处理"""
+    if len(correspondences) <= 2:
+        return build_pixel_to_3d_mapping(correspondences)
+    items = list(correspondences.items())
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(items))) as executor:
+        results = list(executor.map(_build_pixel_map_single, items))
+    return dict(results)
+
+
+def _build_pixel_map_direct_parallel(
+    recon: pycolmap.Reconstruction,
+    image_ids: List[int],
+    include_track_pixels: bool,
+    max_workers: int
+) -> Dict[int, Dict]:
+    """直接从 reconstruction 并行构建 pixel_map（单次遍历，无 correspondence 中间结构）"""
+    images_map = recon.images
+    points3D_map = recon.points3D
+    n = len(image_ids)
+    if n <= 2:
+        result = {}
+        for img_id in image_ids:
+            r = _process_single_image_to_pixel_map(
+                img_id, images_map, points3D_map, include_track_pixels
+            )
+            if r is not None:
+                result[r[0]] = r[1]
+        return result
+    with ThreadPoolExecutor(max_workers=min(max_workers, n)) as executor:
+        futures = [
+            executor.submit(
+                _process_single_image_to_pixel_map,
+                img_id, images_map, points3D_map, include_track_pixels
+            )
+            for img_id in image_ids
+        ]
+        result = {}
+        for f in futures:
+            r = f.result()
+            if r is not None:
+                result[r[0]] = r[1]
+    return result
+
+
 def build_correspondences_parallel(
     recon1: pycolmap.Reconstruction,
     recon2: pycolmap.Reconstruction,
     common_images: Dict[int, int],
     include_track_pixels: bool = False,
-    verbose: bool = True
+    verbose: bool = True,
+    max_workers_per_recon: int = 4
 ) -> Tuple[Dict[int, Dict], Dict[int, Dict], Dict[int, Dict], Dict[int, Dict]]:
     """
     并行构建两个 reconstruction 的 2D-3D 对应关系和像素映射
+    
+    优化：直接从 reconstruction 单次遍历构建 pixel_map，跳过 corr 中间结构；
+    两个 recon 并行，每个 recon 内影像级并行。
     
     Args:
         recon1: 第一个 reconstruction
@@ -2452,60 +2572,42 @@ def build_correspondences_parallel(
         common_images: 共同影像映射 {recon1_image_id: recon2_image_id}
         include_track_pixels: 是否包含 track 中每个观测的像素坐标
         verbose: 是否打印详细信息
+        max_workers_per_recon: 每个 recon 内影像级并行线程数（默认 4）
         
     Returns:
-        correspondences_recon1: recon1 的 2D-3D 对应关系
-        correspondences_recon2: recon2 的 2D-3D 对应关系
+        correspondences_recon1: 空 dict（API 兼容，find_corresponding_3d_points 不使用）
+        correspondences_recon2: 空 dict
         pixel_map_recon1: recon1 的像素映射
         pixel_map_recon2: recon2 的像素映射
     """
-    import time
-    
     common_ids_recon1 = list(common_images.keys())
     common_ids_recon2 = list(common_images.values())
     
     if verbose:
-        print(f"\nBuilding 2D-3D correspondences (parallel)...")
+        print(f"\nBuilding pixel mappings (direct, parallel)...")
     
     t0 = time.time()
     
-    # 并行构建 2D-3D 对应关系
+    def _build_pmap_only(recon, image_ids):
+        return _build_pixel_map_direct_parallel(
+            recon, image_ids, include_track_pixels, max_workers_per_recon
+        )
+    
     with ThreadPoolExecutor(max_workers=2) as executor:
-        future1 = executor.submit(
-            build_2d_3d_correspondences, 
-            recon1, common_ids_recon1, False, include_track_pixels
-        )
-        future2 = executor.submit(
-            build_2d_3d_correspondences,
-            recon2, common_ids_recon2, False, include_track_pixels
-        )
-        
-        correspondences_recon1 = future1.result()
-        correspondences_recon2 = future2.result()
+        future1 = executor.submit(_build_pmap_only, recon1, common_ids_recon1)
+        future2 = executor.submit(_build_pmap_only, recon2, common_ids_recon2)
+        pixel_map_recon1 = future1.result()
+        pixel_map_recon2 = future2.result()
     
     t1 = time.time()
     
     if verbose:
-        print(f"  Recon1: {len(correspondences_recon1)} images")
-        print(f"  Recon2: {len(correspondences_recon2)} images")
-        print(f"  Time: {t1 - t0:.3f}s")
-        print(f"\nBuilding pixel-to-3D mappings (parallel)...")
+        print(f"  Recon1: {len(pixel_map_recon1)} images")
+        print(f"  Recon2: {len(pixel_map_recon2)} images")
+        print(f"  Total: {t1 - t0:.3f}s")
     
-    # 并行构建像素映射
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        future1 = executor.submit(build_pixel_to_3d_mapping, correspondences_recon1)
-        future2 = executor.submit(build_pixel_to_3d_mapping, correspondences_recon2)
-        
-        pixel_map_recon1 = future1.result()
-        pixel_map_recon2 = future2.result()
-    
-    t2 = time.time()
-    
-    if verbose:
-        print(f"  Time: {t2 - t1:.3f}s")
-        print(f"  Total: {t2 - t0:.3f}s")
-    
-    return correspondences_recon1, correspondences_recon2, pixel_map_recon1, pixel_map_recon2
+    # correspondences 仅用于 API 兼容，find_corresponding_3d_points 不实际使用
+    return {}, {}, pixel_map_recon1, pixel_map_recon2
 
 
 def find_corresponding_3d_points(
@@ -2514,7 +2616,8 @@ def find_corresponding_3d_points(
     common_images: Dict[int, int],
     correspondences_recon1: Dict[int, Dict],
     correspondences_recon2: Dict[int, Dict],
-    verbose: bool = True
+    verbose: bool = True,
+    return_match_info: bool = True
 ) -> Tuple[np.ndarray, np.ndarray, List[Dict]]:
     """
     基于共同像素位置找到两个 reconstruction 中对应的 3D 点对
@@ -2526,28 +2629,29 @@ def find_corresponding_3d_points(
         correspondences_recon1: recon1 的 2D-3D 对应关系
         correspondences_recon2: recon2 的 2D-3D 对应关系
         verbose: 是否打印详细信息
+        return_match_info: 是否返回 match_info（仅需 pts 时设为 False 可节省内存与 CPU）
         
     Returns:
         pts1: recon1 中的 3D 点坐标 (N, 3)
         pts2: recon2 中的 3D 点坐标 (N, 3)
-        match_info: 匹配详细信息列表
+        match_info: 匹配详细信息列表（return_match_info=False 时为空列表）
     """
     pts1_list = []
     pts2_list = []
-    match_info = []
+    match_info = [] if return_match_info else []
     
-    # 用于去重：同一个 3D 点对只记录一次
     seen_pairs = set()
+    seen_add = seen_pairs.add
+    pts1_append = pts1_list.append
+    pts2_append = pts2_list.append
     
     for img_id1, img_id2 in common_images.items():
-        if img_id1 not in pixel_map_recon1 or img_id2 not in pixel_map_recon2:
+        pmap1 = pixel_map_recon1.get(img_id1)
+        pmap2 = pixel_map_recon2.get(img_id2)
+        if pmap1 is None or pmap2 is None:
             continue
         
-        pmap1 = pixel_map_recon1[img_id1]
-        pmap2 = pixel_map_recon2[img_id2]
-        
-        # 找到共同的像素位置
-        common_pixels = set(pmap1.keys()) & set(pmap2.keys())
+        common_pixels = pmap1.keys() & pmap2.keys()
         
         for pixel_key in common_pixels:
             info1 = pmap1[pixel_key]
@@ -2556,37 +2660,40 @@ def find_corresponding_3d_points(
             pt3d_id1 = info1['point3D_id']
             pt3d_id2 = info2['point3D_id']
             
-            # 去重：同一个 3D 点对只记录一次
             pair_key = (pt3d_id1, pt3d_id2)
             if pair_key in seen_pairs:
                 continue
-            seen_pairs.add(pair_key)
+            seen_add(pair_key)
             
-            xyz1 = np.array(info1['xyz'])
-            xyz2 = np.array(info2['xyz'])
+            xyz1 = info1['xyz']
+            xyz2 = info2['xyz']
             
-            pts1_list.append(xyz1)
-            pts2_list.append(xyz2)
+            pts1_append(xyz1)
+            pts2_append(xyz2)
             
-            match_info.append({
-                'pixel': pixel_key,
-                'image_id1': img_id1,
-                'image_id2': img_id2,
-                'point3D_id1': pt3d_id1,
-                'point3D_id2': pt3d_id2,
-                'xyz1': xyz1,
-                'xyz2': xyz2,
-                'error1': info1['error'],
-                'error2': info2['error']
-            })
+            if return_match_info:
+                match_info.append({
+                    'pixel': pixel_key,
+                    'image_id1': img_id1,
+                    'image_id2': img_id2,
+                    'point3D_id1': pt3d_id1,
+                    'point3D_id2': pt3d_id2,
+                    'xyz1': xyz1,
+                    'xyz2': xyz2,
+                    'error1': info1['error'],
+                    'error2': info2['error']
+                })
     
-    pts1 = np.array(pts1_list) if pts1_list else np.zeros((0, 3))
-    pts2 = np.array(pts2_list) if pts2_list else np.zeros((0, 3))
+    if pts1_list:
+        pts1 = np.array(pts1_list, dtype=np.float64)
+        pts2 = np.array(pts2_list, dtype=np.float64)
+    else:
+        pts1 = np.zeros((0, 3))
+        pts2 = np.zeros((0, 3))
     
     if verbose:
         print(f"\nFound {len(pts1)} corresponding 3D point pairs")
         if len(pts1) > 0:
-            # 计算点对之间的距离统计
             dists = np.linalg.norm(pts1 - pts2, axis=1)
             print(f"  Distance stats: min={dists.min():.4f}, max={dists.max():.4f}, "
                   f"mean={dists.mean():.4f}, std={dists.std():.4f}")
