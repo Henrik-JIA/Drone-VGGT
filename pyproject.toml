@@ -1,0 +1,192 @@
+[build-system]
+build-backend = "hatchling.build"
+requires = ["hatchling"]
+
+[project]
+name = "dronemapanything"
+version = "1.1.0"
+description = "Universal Feed-Forward Metric 3D Reconstruction with Drone Mapping"
+authors = [{ name = "Zhihao Jia", email = "jiazhihaojzh@126.com" }]
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = [
+    "3d-reconstruction",
+    "drone-mapping",
+    "photogrammetry",
+    "sfm",
+    "deep-learning",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+dependencies = [
+    # MapAnything 核心依赖
+    "huggingface_hub>=0.20,<1",
+    "hydra-core>=1.3,<2",
+    "natsort>=8.4,<9",
+    "orjson>=3.9,<4",
+    "pillow-heif>=0.13,<1",
+    "plyfile>=1.0,<2",
+    "python-box>=7.1,<8",
+    "requests>=2.31,<3",
+    "safetensors>=0.4,<1",
+    "tensorboard>=2.15,<3",
+    "trimesh>=4.0,<5",
+
+    # 深度学习工具
+    "kornia>=0.7,<1",
+    "timm>=0.9,<1",
+
+    # 可视化
+    "viser>=0.1,<1",
+    "plotly>=5.18",
+    "matplotlib>=3.8,<4",
+
+    # GPS 和坐标转换
+    "pymap3d>=3.0,<4",
+
+    # LAS 文件支持
+    "laspy>=2.5,<3",
+
+    # EXIF 处理
+    "piexif>=1.1,<2",
+
+    # 数据处理
+    "pandas>=2.0,<3",
+    "tqdm>=4.65,<5",
+
+    # 工具
+    "pip",
+    "ruff",
+
+    # 调试
+    "debugpy>=1.8",
+]
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["win-64", "linux-aarch64", "linux-64", "osx-arm64"]
+
+#=========================================================================#
+# conda dependencies
+#=========================================================================#
+[tool.pixi.dependencies]
+python = "3.10.*"
+numpy = ">=1.26.0,<2"
+
+# 科学计算
+scipy = ">=1.11"
+scikit-image = ">=0.21"
+scikit-learn = ">=1.3"
+
+# 点云和 3D 处理
+open3d = ">=0.17"
+
+# 图像处理
+opencv = ">=4.8"
+pillow = ">=10.0"
+
+# 其他工具
+einops = ">=0.7"
+
+# 地理空间
+gdal = ">=3.8"
+rasterio = ">=1.3"
+pyproj = ">=3.6"
+shapely = ">=2.0"
+
+[tool.pixi.target.linux-aarch64.dependencies]
+cuda-version = "==12.6"
+pycolmap = { version = "==3.11.1", build = "cuda126*" }
+
+[tool.pixi.target.linux-64.dependencies]
+cuda-version = "==12.6"
+pycolmap = { version = "==3.11.1", build = "cuda126*" }
+
+[tool.pixi.target.win-64.dependencies]
+cuda-version = "==12.6"
+pycolmap = { version = "==3.11.1", build = "cuda126*" }
+
+[tool.pixi.target.osx-arm64.dependencies]
+pycolmap = { version = "==3.11.1" }
+
+#=========================================================================#
+# pypi dependencies
+#=========================================================================#
+[tool.pixi.pypi-dependencies]
+dronemapanything = { path = ".", editable = true }
+
+[tool.pixi.target.linux-aarch64.pypi-dependencies]
+torch = { url = "https://github.com/ultralytics/assets/releases/download/v0.0.0/torch-2.5.0a0+872d972e41.nv24.08-cp310-cp310-linux_aarch64.whl" }
+torchvision = { url = "https://github.com/ultralytics/assets/releases/download/v0.0.0/torchvision-0.20.0a0+afc54f7-cp310-cp310-linux_aarch64.whl" }
+onnxruntime_gpu = { url = "https://github.com/ultralytics/assets/releases/download/v0.0.0/onnxruntime_gpu-1.20.0-cp310-cp310-linux_aarch64.whl" }
+
+[tool.pixi.target.linux-64.pypi-dependencies]
+torch = ">=2.7.1,<3"
+torchvision = "*"
+onnxruntime-gpu = ">=1.20.0,<2"
+
+[tool.pixi.target.win-64.pypi-dependencies]
+torch = { version = ">=2.7.1,<3", index = "https://download.pytorch.org/whl/cu126" }
+torchvision = { version = "*", index = "https://download.pytorch.org/whl/cu126" }
+onnxruntime-gpu = ">=1.20.0,<2"
+
+[tool.pixi.target.osx-arm64.pypi-dependencies]
+torch = ">=2.0,<3"
+torchvision = ">=0.15,<1"
+torchaudio = ">=2.0,<3"
+onnxruntime = ">=1.20.0,<2"
+
+[tool.pixi.system-requirements]
+cuda = "12.6"
+
+[tool.pixi.environments]
+default = { features = [], solve-group = "default" }
+
+[tool.pixi.tasks]
+# 修复 numpy 版本
+fix-numpy = "pip install 'numpy>=1.26.0,<2' --force-reinstall"
+
+# 安装 LightGlue（两个版本可选）
+install-lightglue = "pip install git+https://github.com/cvg/LightGlue.git --no-deps"
+install-lightglue-jytime = "pip install git+https://github.com/jytime/LightGlue.git#egg=lightglue"
+
+# 安装第三方子模块
+install-vggt = "pip install -e third/vggt --no-deps"
+install-fastvggt = "pip install -e third/fastvggt --no-deps"
+
+# 完整安装
+setup = { depends-on = ["install-lightglue", "install-vggt", "install-fastvggt"] }
+
+# 运行增量 SfM
+run-sfm = "python SfM/incremental_feature_matcher.py"
+
+# 运行 Delaunay 网格化
+run-mesh = "python SfM/delaunay/delaunay_mesh.py"
+
+# 生成 DSM
+run-dsm = "python SfM/delaunay/ply_to_dsm.py"
+
+# 代码格式检查
+lint = "ruff check ."
+format = "ruff format ."
+
+# 显示环境信息
+info = "python -c \"import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA: {torch.cuda.is_available()}'); print(f'Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"CPU\"}')\""
+
+[tool.hatch.build.targets.wheel]
+packages = ["mapanything"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+extend-select = ["I"]
